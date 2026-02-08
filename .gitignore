@@ -1,0 +1,38 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+venv/
+env/
+
+# Node
+node_modules/
+dist/
+.next/
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Project Organization
+temp/
+training_data/
+.gemini/
+.antigravity/
+.cursor/
+backend/verify_production.py
+
+# OS
+.DS_Store
+Thumbs.db
