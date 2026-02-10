@@ -13,9 +13,15 @@ When you run: uvicorn app.main:app --reload
 This file is what actually runs.
 """
 
+import os
+from dotenv import load_dotenv
+
+# Load environment variables FIRST
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, projects, chat, health, uploads
+from app.api import auth, projects, chat, health, uploads, deployments
 from app.core.exceptions import (
     validation_exception_handler,
     database_exception_handler,
@@ -24,17 +30,12 @@ from app.core.exceptions import (
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from app.core.logging_config import setup_logging
-import os
-from dotenv import load_dotenv
 from app.api import websocket
 from app.api.verification import router as verification_router
 from contextlib import asynccontextmanager
 from app.core.redis import verify_redis_connection
 from app.core.config import settings
 
-# Load environment variables from .env file
-# This reads DATABASE_URL, JWT_SECRET, API keys, etc.
-load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -176,6 +177,19 @@ app.include_router(
 # - GET /api/uploads (list user's files)
 # - GET /api/uploads/{id} (get file details)
 # - DELETE /api/uploads/{id} (delete file)
+
+# Include Deployments router
+app.include_router(
+    deployments.router,
+    prefix="/api/projects",
+    tags=["Deployments"]
+)
+# This creates endpoints:
+# - POST /api/projects/{id}/deploy (deploy to GCP Cloud Run)
+# - GET /api/projects/{id}/deployments (list all deployments)
+# - GET /api/projects/{id}/deployments/latest (get latest deployment)
+# - GET /api/projects/{id}/deployments/{deployment_id} (get deployment details)
+
 
 app.include_router(
     verification_router,

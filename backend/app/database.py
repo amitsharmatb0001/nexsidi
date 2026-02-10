@@ -4,11 +4,11 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 import os
 
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://postgres:root@localhost:5432/nexsidi')
+from app.core.config import settings
 
 # Production-grade connection pooling
 engine = create_engine(
-    DATABASE_URL,
+    settings.database_url,
     poolclass=QueuePool,
     pool_size=10,              # 10 permanent connections
     max_overflow=20,           # 20 additional when needed

@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from app.database import get_db, SessionLocal
-from app.models import Project, User
+from app.models import Project, User, Conversation
 from app.services.workspace_manager import workspace_manager
 
 # NEW: Import Arjun instead of individual agents
@@ -85,11 +85,23 @@ class ProjectProcessorV2:
                 user_id=str(project.user_id)
             )
             
-            # 3. Prepare requirements from project description
+            # 3. Prepare requirements from project description + conversation history
+            # Fetch previous messages for this user (pre-project)
+            history = self.db.query(Conversation).filter(
+                Conversation.user_id == project.user_id,
+                Conversation.project_id.is_(None)
+            ).order_by(Conversation.created_at.asc()).all()
+            
+            conversation_history = [
+                {"role": m.role, "content": m.content}
+                for m in history
+            ]
+            
             requirements = {
                 "description": project.description,
                 "title": project.title,
                 "user_id": str(project.user_id),
+                "conversation": conversation_history, # Pass full history!
                 "created_at": project.created_at.isoformat() if project.created_at else None
             }
             

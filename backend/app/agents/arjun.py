@@ -29,6 +29,7 @@ import logging
 import hashlib
 import json
 import httpx
+import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1058,7 +1059,14 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         if agent_name == "saanvi":
             from app.agents.saanvi import Saanvi
             agent = Saanvi(self.project_id, self.user_id)
-            return await agent.analyze_requirements_from_text(input_data.get("description", ""))
+            
+            # Check if we have full conversation history (preferred)
+            if "conversation" in input_data:
+                result = await agent.analyze_requirements(input_data["conversation"])
+                # Ensure we return a dict
+                return result.to_dict() if hasattr(result, "to_dict") else result
+            else:
+                return await agent.analyze_requirements_from_text(input_data.get("description", ""))
         
         elif agent_name == "shubham":
             from app.agents.shubham import Shubham
@@ -1930,10 +1938,11 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         Patent requirement: Query mistake memory before agent execution.
         """
         
-        similar_mistakes = await mistake_memory.query_similar_mistakes(
+        # Query mistake memory (no project_context parameter)
+        similar_mistakes = mistake_memory.query_similar_mistakes(
             agent_name=agent_name,
             task_type=task_type,
-            project_context=self.context_engine.get_full_context(self.project_id)
+            input_data=""  # Empty string for now, can be enhanced later
         )
         
         if similar_mistakes:
@@ -1946,12 +1955,12 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
     async def _record_mistake(self, agent_name: str, error: str, fix: str):
         """Record mistake for future learning"""
         
-        await mistake_memory.record_failure(
+        mistake_memory.record_failure(
             agent_name=agent_name,
             task_type=self.pipeline_state.current_phase.value,
+            input_data="",  # Fixed: removed context parameter, added input_data
             error=error,
-            fix=fix,
-            context=self.context_engine.get_full_context(self.project_id)
+            fix=fix
         )
     
     # =========================================================================
@@ -2017,14 +2026,23 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         self.logger.error(f"Pipeline failed: {error}")
         
         # Store failure context
-        # Store failure context
+        # Convert pipeline state to serializable format
+        state_dict = self.pipeline_state.__dict__.copy()
+        state_dict['current_phase'] = self.pipeline_state.current_phase.value  # Convert enum to string
+        
+        # Convert datetime objects to ISO format strings
+        from datetime import datetime
+        for key, value in state_dict.items():
+            if isinstance(value, datetime):
+                state_dict[key] = value.isoformat()
+        
         await self._store_with_hash(
             "pipeline_failure",
             {
                 "error": str(error),
                 "phase": self.pipeline_state.current_phase.value,
                 "timestamp": time.time(),
-                "state": self.pipeline_state.__dict__
+                "state": state_dict
             }
         )
         

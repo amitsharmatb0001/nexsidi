@@ -47,13 +47,7 @@ class GCPService:
         self.credentials = None
         self.authenticated = False
         
-        # Docker client for building images
-        try:
-            self.docker_client = docker.from_env()
-            logger.info("✅ Docker client initialized")
-        except Exception as e:
-            logger.warning(f"⚠️ Docker not available: {e}")
-            self.docker_client = None
+        logger.info("✅ GCP Service initialized (using Cloud Build - no local Docker needed!)")
     
     def authenticate(self, secret_name: Optional[str] = None) -> bool:
         """
@@ -65,6 +59,7 @@ class GCPService:
         Returns:
             True if authentication successful, False otherwise
         """
+        auth_success = False
         try:
             # Method 0: Use Secret Manager if secret_name is provided or enabled in settings
             secret_manager = get_secret_manager()
@@ -75,46 +70,108 @@ class GCPService:
                 if self.credentials:
                     self.authenticated = True
                     logger.info(f"✅ Authenticated with service account from Secret Manager: {use_secret}")
-                    return True
+                    auth_success = True
 
             # Method 1: JSON key from environment variable
-            key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY")
-            if key_json:
-                try:
-                    # Try parsing as JSON string
-                    key_data = json.loads(key_json)
-                    self.credentials = service_account.Credentials.from_service_account_info(
-                        key_data,
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                    )
-                    self.authenticated = True
-                    logger.info("✅ Authenticated with service account (from env JSON)")
-                    return True
-                except json.JSONDecodeError:
-                    # Try as file path
-                    if os.path.exists(key_json):
-                        self.credentials = service_account.Credentials.from_service_account_file(
-                            key_json,
+            if not auth_success:
+                key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY")
+                if key_json:
+                    try:
+                        # Try parsing as JSON string
+                        key_data = json.loads(key_json)
+                        self.credentials = service_account.Credentials.from_service_account_info(
+                            key_data,
                             scopes=["https://www.googleapis.com/auth/cloud-platform"]
                         )
                         self.authenticated = True
-                        logger.info("✅ Authenticated with service account (from file path)")
-                        return True
+                        logger.info("✅ Authenticated with service account (from env JSON)")
+                        auth_success = True
+                    except json.JSONDecodeError:
+                        # Try as file path
+                        if os.path.exists(key_json):
+                            self.credentials = service_account.Credentials.from_service_account_file(
+                                key_json,
+                                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                            )
+                            self.authenticated = True
+                            logger.info("✅ Authenticated with service account (from file path)")
+                            auth_success = True
             
             # Method 2: Application default credentials
-            self.credentials, project = default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-            if not self.project_id:
-                self.project_id = project
-            self.authenticated = True
-            logger.info("✅ Authenticated with application default credentials")
-            return True
+            if not auth_success:
+                self.credentials, project = default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+                if not self.project_id:
+                    self.project_id = project
+                self.authenticated = True
+                logger.info("✅ Authenticated with application default credentials")
+                auth_success = True
+            
+            # If authentication succeeded, ensure infrastructure is ready
+            if auth_success:
+                self.ensure_infrastructure()
+                return True
+            
+            return False
             
         except Exception as e:
             logger.error(f"❌ GCP authentication failed: {e}")
             self.authenticated = False
             return False
+
+    def ensure_infrastructure(self):
+        """
+        Autonomously verify and setup required GCP infrastructure.
+        - Enables Artifact Registry and Cloud Run APIs
+        - Creates the Docker repository if it doesn't exist
+        """
+        if not self.authenticated:
+            return
+
+        logger.info("🛠️ Agents checking deployment infrastructure...")
+        
+        try:
+            # 1. Enable required APIs (including Cloud Build!)
+            logger.info("🔌 Ensuring GCP APIs are enabled (Artifact Registry, Cloud Run, Cloud Build)...")
+            subprocess.run(
+                ["gcloud", "services", "enable", 
+                 "artifactregistry.googleapis.com", 
+                 "run.googleapis.com",
+                 "cloudbuild.googleapis.com",
+                 f"--project={self.project_id}"],
+                check=True, capture_output=True
+            )
+            
+            # 2. Ensure Repository exists
+            logger.info(f"📦 Checking Artifact Registry for repository: {self.artifact_repo}...")
+            repo_path = f"projects/{self.project_id}/locations/{self.region}/repositories/{self.artifact_repo}"
+            
+            # Use gcloud to check/create repo for simplicity and reliability
+            check_repo = subprocess.run(
+                ["gcloud", "artifacts", "repositories", "describe", self.artifact_repo, f"--project={self.project_id}", f"--location={self.region}"],
+                capture_output=True
+            )
+            
+            if check_repo.returncode != 0:
+                logger.info(f"🆕 Creating new Docker repository: {self.artifact_repo}...")
+                subprocess.run(
+                    [
+                        "gcloud", "artifacts", "repositories", "create", self.artifact_repo,
+                        "--repository-format=docker",
+                        f"--location={self.region}",
+                        f"--project={self.project_id}",
+                        "--description=NexSidi Project Containers"
+                    ],
+                    check=True, capture_output=True
+                )
+                logger.info(f"✅ Repository created: {self.artifact_repo}")
+            else:
+                logger.info(f"✅ Repository ready: {self.artifact_repo}")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Infrastructure check had issues: {e}. Agents will attempt to proceed anyway.")
+    
     
     def build_and_push_image(
         self,
@@ -123,7 +180,8 @@ class GCPService:
         dockerfile_path: Optional[str] = None
     ) -> Optional[str]:
         """
-        Build Docker image and push to Artifact Registry.
+        Build Docker image using GCP Cloud Build (no local Docker required!)
+        and push to Artifact Registry.
         
         Args:
             workspace_path: Path to workspace containing code
@@ -137,52 +195,39 @@ class GCPService:
             logger.error("❌ Not authenticated with GCP")
             return None
         
-        if not self.docker_client:
-            logger.error("❌ Docker client not available")
-            return None
-        
         try:
             # Construct image tag
             image_tag = f"{self.region}-docker.pkg.dev/{self.project_id}/{self.artifact_repo}/{service_name}:latest"
             
-            # Build image
-            logger.info(f"🔨 Building Docker image: {service_name}")
-            dockerfile = dockerfile_path or str(Path(workspace_path) / "Dockerfile")
+            logger.info(f"🔨 Building image using GCP Cloud Build (no local Docker needed!): {service_name}")
             
-            image, build_logs = self.docker_client.images.build(
-                path=workspace_path,
-                dockerfile=dockerfile,
-                tag=image_tag,
-                rm=True
+            # Use gcloud builds submit to build in the cloud
+            # This runs entirely on GCP infrastructure - no local Docker required!
+            build_cmd = [
+                "gcloud", "builds", "submit",
+                workspace_path,
+                f"--tag={image_tag}",
+                f"--project={self.project_id}",
+                "--timeout=10m"
+            ]
+            
+            # Add custom Dockerfile if specified
+            if dockerfile_path:
+                build_cmd.extend([f"--config={dockerfile_path}"])
+            
+            logger.info("☁️ Submitting build to GCP Cloud Build...")
+            result = subprocess.run(
+                build_cmd,
+                capture_output=True,
+                text=True
             )
             
-            # Log build output
-            for log in build_logs:
-                if 'stream' in log:
-                    logger.debug(log['stream'].strip())
-            
-            logger.info(f"✅ Image built: {image_tag}")
-            
-            # Configure Docker for Artifact Registry authentication
-            logger.info("🔐 Configuring Docker authentication for Artifact Registry")
-            self._configure_docker_auth()
-            
-            # Push image
-            logger.info(f"📤 Pushing image to Artifact Registry: {image_tag}")
-            push_logs = self.docker_client.images.push(
-                image_tag,
-                stream=True,
-                decode=True
-            )
-            
-            for log in push_logs:
-                if 'status' in log:
-                    logger.debug(f"{log['status']}: {log.get('progress', '')}")
-                if 'error' in log:
-                    raise Exception(f"Push failed: {log['error']}")
-            
-            logger.info(f"✅ Image pushed: {image_tag}")
-            return image_tag
+            if result.returncode == 0:
+                logger.info(f"✅ Image built and pushed: {image_tag}")
+                return image_tag
+            else:
+                logger.error(f"❌ Cloud Build failed: {result.stderr}")
+                return None
             
         except Exception as e:
             logger.error(f"❌ Failed to build/push image: {e}")

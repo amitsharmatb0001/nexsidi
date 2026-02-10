@@ -96,8 +96,12 @@ class TilotmaMemory:
     
     def _load_memory(self):
         """Load Tilotma's memory from storage"""
+        # FIX: Ensure private memory for pre-project chat (no project_id)
+        # Patent-compliant isolation: Use user_id as partition key if project_id missing
+        storage_key = self.project_id if self.project_id else f"user_context_{self.user_id}"
+        
         memory_data = context_engine.get_context(
-            self.project_id,
+            storage_key,
             "tilotma_private_memory"
         )
         
@@ -155,8 +159,11 @@ class TilotmaMemory:
             "last_updated": time.time()
         }
         
+        # FIX: Consistent storage key for pre-project chat persistence
+        storage_key = self.project_id if self.project_id else f"user_context_{self.user_id}"
+        
         context_engine.store_context(
-            self.project_id,
+            storage_key,
             "tilotma_private_memory",
             memory_data
         )

@@ -184,12 +184,20 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         
         self.logger.info(f"💬 User message: {user_message[:100]}...")
         
-        # Build conversation context
-        recent_conversations = self.memory.get_recent_conversations(count=10)
-        conversation_context = "\n".join([
-            f"User: {conv.user_message}\nTilotma: {conv.tilotma_response}"
-            for conv in recent_conversations
-        ])
+        # Build conversation context (Combine private memory + API context)
+        # 1. Start with messages from API context (replayed from DB)
+        context_msgs = []
+        if hasattr(self, 'context') and self.context.messages:
+            for msg in self.context.messages[-10:]: # Last 10
+                context_msgs.append(f"{msg.role.capitalize()}: {msg.content}")
+        
+        # 2. Add from private memory if context is empty (fallback)
+        if not context_msgs:
+            recent_conversations = self.memory.get_recent_conversations(count=10)
+            for conv in recent_conversations:
+                context_msgs.append(f"User: {conv.user_message}\nTilotma: {conv.tilotma_response}")
+        
+        conversation_context = "\n".join(context_msgs)
         
         # Generate response using AI
         prompt = f"""
@@ -205,16 +213,27 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         {user_message}
         
         YOUR TASK:
-        1. Understand what the user wants
-        2. Ask clarifying questions if needed
-        3. When you have enough information, suggest starting the project
+        1. Understand what the user wants.
+        2. BE PROACTIVE: If the user mentions a common project type (e.g., '3-page website', 'landing page', 'portfolio'), immediately provide a high-quality DEFAULT PROPOSAL based on industry standards.
+        3. Only ask clarifying questions if the request is truly unique or critically underspecified.
+        4. When suggesting a project, provide a structured PROPOSAL:
+           - Features: List of main project features (e.g., Home, About, Contact for a 3-page site).
+           - UI Style: Recommend a modern look (e.g., 'Clean, professional dark mode').
+           - Tech Stack: Recommended frameworks (e.g., React + Vite).
+           - Data Model: Key entities (e.g., 'ContactSubmissions', 'PortfolioItems').
         
         RESPOND IN JSON:
         {{
-            "response": "your response to the user",
-            "understanding": "what you understood from this message",
+            "response": "friendly message to user",
+            "understanding": "technical summary of the project",
+            "proposal": {{
+                "features": ["feature 1", "feature 2"],
+                "ui_style": "description",
+                "tech_stack": "details",
+                "data_model": "details"
+            }},
             "confidence": 0.0-1.0,
-            "missing_info": ["list of missing information"],
+            "missing_info": ["list of missing info"],
             "ready_to_start": true/false,
             "concerns": ["any concerns you have"]
         }}
@@ -239,6 +258,10 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
                 "ready_to_start": False
             }
         
+        # Capture metadata for auditing
+        result["total_tokens"] = ai_response.total_tokens
+        result["cost"] = ai_response.cost_estimate
+        
         # Save to memory
         self.memory.add_conversation(
             user_message=user_message,
@@ -261,7 +284,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
             self.phase = ConversationPhase.READY_FOR_EXECUTION
             result["response"] += "\n\nI'm ready to start! Shall I hand this off to our Project Manager (Arjun) to begin execution?"
         
-        return result["response"]
+        return result
     
     # =========================================================================
     # HANDOFF TO ARJUN

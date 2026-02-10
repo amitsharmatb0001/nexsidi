@@ -547,13 +547,13 @@ FIXED CODE:
                 file_path=request.file_path,
                 content=clean_content,
                 file_type=request.file_type,
-                tokens_used=response.tokens_used,
-                model_used=response.model_name,
+                tokens_used=response.total_tokens,  # Fixed: was tokens_used
+                model_used=response.model_id,  # Fixed: was model_name
                 was_escalated=response.was_escalated,
                 was_split=False,
                 validation_passed=is_valid,
                 syntax_valid=is_valid,
-                cost=response.cost
+                cost=response.cost_estimate  # Fixed: was cost
             )
             
         except Exception as e:

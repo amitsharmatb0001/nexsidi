@@ -41,31 +41,23 @@ class SecretManager:
             try:
                 from google.cloud import secretmanager
                 self.gcp_client = secretmanager.SecretManagerServiceClient()
-                self.logger.info(f"✅ GCP Secret Manager initialized for project: {project_id}")
+                self.logger.info(f"[OK] GCP Secret Manager initialized for project: {project_id}")
             except ImportError:
-                self.logger.error("❌ google-cloud-secret-manager not installed. Run: pip install google-cloud-secret-manager")
+                self.logger.error("[ERROR] google-cloud-secret-manager not installed. Run: pip install google-cloud-secret-manager")
                 self.use_cloud = False
             except Exception as e:
-                self.logger.error(f"❌ Failed to initialize GCP Secret Manager: {e}")
+                self.logger.error(f"[ERROR] Failed to initialize GCP Secret Manager: {e}")
                 self.use_cloud = False
     
     def get_secret(self, name: str, version: str = "latest") -> Optional[str]:
         """
         Retrieve secret from GCP or environment variables.
-        
-        Args:
-            name: Secret name (e.g., "jwt-secret", "anthropic-api-key")
-            version: Secret version (default: "latest")
-        
-        Returns:
-            Secret value or None if not found
         """
         # Check cache first
         cache_key = f"{name}:{version}"
         if cache_key in self._cache:
             cached = self._cache[cache_key]
             if datetime.now() < cached["expires"]:
-                self.logger.debug(f"🔑 Retrieved {name} from cache")
                 return cached["value"]
             else:
                 del self._cache[cache_key]
@@ -83,11 +75,11 @@ class SecretManager:
                     "expires": datetime.now() + self._cache_ttl
                 }
                 
-                self.logger.info(f"🔐 Retrieved {name} from GCP Secret Manager")
+                self.logger.info(f"[SECURE] Retrieved {name} from GCP Secret Manager")
                 return secret_value
                 
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to retrieve {name} from GCP: {e}")
+                self.logger.debug(f"[DEBUG] Failed to retrieve {name} from GCP: {e}")
                 # Fall through to environment variable
         
         # Fallback to environment variable
@@ -95,25 +87,17 @@ class SecretManager:
         env_value = os.getenv(env_name)
         
         if env_value:
-            self.logger.info(f"🔑 Retrieved {name} from environment variable")
+            self.logger.info(f"[INFO] Retrieved {name} from environment variable")
             return env_value
         
-        self.logger.error(f"❌ Secret {name} not found in GCP or environment")
+        self.logger.debug(f"[DEBUG] Secret {name} not found in GCP or environment")
         return None
     
     def set_secret(self, name: str, value: str) -> bool:
         """
         Store secret in GCP Secret Manager.
-        
-        Args:
-            name: Secret name
-            value: Secret value
-        
-        Returns:
-            True if successful, False otherwise
         """
         if not self.use_cloud or not self.gcp_client:
-            self.logger.warning("⚠️ GCP Secret Manager not enabled, cannot store secret")
             return False
         
         try:
@@ -130,9 +114,7 @@ class SecretManager:
                         }
                     }
                 )
-                self.logger.info(f"✅ Created new secret: {name}")
             except Exception:
-                # Secret already exists, that's fine
                 pass
             
             # Add secret version
@@ -144,8 +126,6 @@ class SecretManager:
                 }
             )
             
-            self.logger.info(f"✅ Stored {name} in GCP Secret Manager")
-            
             # Invalidate cache
             cache_key = f"{name}:latest"
             if cache_key in self._cache:
@@ -156,56 +136,13 @@ class SecretManager:
         except Exception as e:
             self.logger.error(f"❌ Failed to store {name} in GCP: {e}")
             return False
-    
-    def rotate_secret(self, name: str, new_value: str) -> bool:
-        """
-        Rotate secret by creating new version.
-        
-        Args:
-            name: Secret name
-            new_value: New secret value
-        
-        Returns:
-            True if successful
-        """
-        return self.set_secret(name, new_value)
-    
-    def list_secrets(self) -> list:
-        """
-        List all secrets in GCP Secret Manager.
-        
-        Returns:
-            List of secret names
-        """
-        if not self.use_cloud or not self.gcp_client:
-            return []
-        
-        try:
-            parent = f"projects/{self.project_id}"
-            secrets = self.gcp_client.list_secrets(request={"parent": parent})
-            
-            secret_names = [secret.name.split("/")[-1] for secret in secrets]
-            self.logger.info(f"📋 Found {len(secret_names)} secrets in GCP")
-            
-            return secret_names
-            
-        except Exception as e:
-            self.logger.error(f"❌ Failed to list secrets: {e}")
-            return []
 
     def get_gcp_credentials(self, secret_name: str) -> Optional[service_account.Credentials]:
         """
         Retrieve GCP service account credentials from Secret Manager.
-        
-        Args:
-            secret_name: Name of the secret containing the JSON key
-            
-        Returns:
-            Credentials object or None if failed
         """
         key_json = self.get_secret(secret_name)
         if not key_json:
-            self.logger.error(f"❌ Could not find secret: {secret_name}")
             return None
             
         try:
@@ -214,10 +151,8 @@ class SecretManager:
                 key_data,
                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
-            self.logger.info(f"✅ Loaded credentials from secret: {secret_name}")
             return credentials
-        except Exception as e:
-            self.logger.error(f"❌ Failed to parse credentials from secret {secret_name}: {e}")
+        except Exception:
             return None
 
 
@@ -230,7 +165,6 @@ def get_secret_manager() -> SecretManager:
     global _secret_manager
     
     if _secret_manager is None:
-        # Check if cloud secrets are enabled
         use_cloud = os.getenv("USE_CLOUD_SECRETS", "false").lower() == "true"
         project_id = os.getenv("GCP_PROJECT_ID")
         

@@ -10,7 +10,8 @@ pip install redis celery --break-system-packages
 Setup:
 1. Install Redis: (Windows: download from GitHub, Linux: apt install redis)
 2. Start Redis: redis-server
-3. Start Celery worker: celery -A app.services.queue_manager worker --loglevel=info
+3. Start Celery worker (Windows): celery -A app.services.queue_manager worker --loglevel=info --pool=solo
+4. Start Celery worker (Linux/Mac): celery -A app.services.queue_manager worker --loglevel=info
 
 Location: backend/app/services/queue_manager.py
 """

@@ -136,7 +136,20 @@ async def send_message(
     
     # EXECUTE CHAT
     # ------------
-    response_text = await tilotma.chat(message_data.content)
+    tilotma_result = await tilotma.chat(message_data.content)
+    
+    # If Tilotma returned an error dictionary, handle it
+    if isinstance(tilotma_result, dict):
+        response_text = tilotma_result.get("response", "I'm sorry, I'm having trouble processing that.")
+        proposal = tilotma_result.get("proposal")
+        understanding = tilotma_result.get("understanding")
+        confidence = tilotma_result.get("confidence", 0.0)
+    else:
+        # Fallback for old implementations
+        response_text = tilotma_result
+        proposal = None
+        understanding = None
+        confidence = 0.0
     
     # SAVE MESSAGES TO DB (Wrapped in transaction for safety)
     # -------------------
@@ -154,8 +167,9 @@ async def send_message(
         db.add(user_msg)
         
         # 2. Save Assistant Response
-        # Get the last message from context (which is the new response)
-        last_msg = tilotma.context.messages[-1]
+        # Extract tokens and cost from Tilotma's result metadata
+        tokens_used = tilotma_result.get("total_tokens", 0) if isinstance(tilotma_result, dict) else 0
+        cost = tilotma_result.get("cost", 0.0) if isinstance(tilotma_result, dict) else 0.0
         
         assistant_msg = Conversation(
             id=uuid4(),
@@ -165,16 +179,18 @@ async def send_message(
             content=response_text,
             agent_name='tilotma',
             created_at=datetime.utcnow(),
-            tokens_used=last_msg.tokens_used,
-            cost=last_msg.cost
+            tokens_used=tokens_used,
+            cost=cost
         )
         db.add(assistant_msg)
         db.commit()
     except Exception as e:
         db.rollback()
+        import logging
+        logging.getLogger("chat").error(f"❌ DATABASE SAVE FAILURE: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save messages to database"
+            detail=f"Failed to save messages to database: {str(e)}"
         )
 
     # PERSIST STATE TO REDIS
@@ -218,19 +234,25 @@ async def send_message(
         
         return {
             'response': response_text,
+            'proposal': proposal,
+            'understanding': understanding,
+            'confidence': confidence,
             'should_create_project': True,
             'project_id': str(new_project.id),
             'queued': True,
             'queue_position': queue_info.get('queue_position', 1),
             'estimated_wait': queue_info.get('estimated_wait', "Starting now"),
-            'cost': last_msg.cost
+            'cost': cost
         }
     
     # Return response to user
     return {
         'response': response_text,
+        'proposal': proposal,
+        'understanding': understanding,
+        'confidence': confidence,
         'should_create_project': False,
-        'cost': last_msg.cost
+        'cost': cost
     }
 
 

@@ -6,7 +6,7 @@ import hashlib
 from app.core.redis import get_redis_client
 from app.core.config import settings
 from datetime import datetime
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 
 

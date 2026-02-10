@@ -1,0 +1,1184 @@
+import axios from 'axios';
+
+const apiClient = axios.create({
+    baseURL: 'http://127.0.0.1:8000/api',
+    withCredentials: true,
+    headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+    }
+});
+
+apiClient.interceptors.request.use(config => {
+    const token = localStorage.getItem('authToken');
+    if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+}, error => {
+    return Promise.reject(error);
+});
+
+export default apiClient;
+
+
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import apiClient from '../api/apiClient';
+
+const LoginPage = ({ onLoginSuccess }) => {
+    const [formData, setFormData] = useState({ email: '', password: '' });
+    const [message, setMessage] = useState('');
+    const navigate = useNavigate();
+
+    const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setMessage('');
+        try {
+            const response = await apiClient.post('/login', formData);
+            onLoginSuccess(response.data.user, response.data.access_token);
+        } catch (error) {
+            setMessage('Invalid email or password. Please try again.');
+        }
+    };
+
+    return (<div className="flex items-center justify-center min-h-[70vh] bg-gray-50"><div className="w-full max-w-md p-8 space-y-6 bg-white rounded-lg shadow-md"><h2 className="text-2xl font-bold text-center">Welcome Back!</h2><form onSubmit={handleSubmit} className="space-y-6"><div><label className="block text-sm font-medium text-gray-700">Email Address</label><input type="email" name="email" value={formData.email} onChange={handleChange} required className="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md focus:outline-none focus:ring-yellow-500 focus:border-yellow-500" /></div><div><label className="block text-sm font-medium text-gray-700">Password</label><input type="password" name="password" value={formData.password} onChange={handleChange} required className="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md focus:outline-none focus:ring-yellow-500 focus:border-yellow-500" /></div><div><button type="submit" className="w-full px-4 py-2 font-bold text-white bg-yellow-500 rounded-md hover:bg-yellow-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-500">Login</button></div></form>{message && <p className="text-center text-red-500">{message}</p>}<p className="text-sm text-center text-gray-600">Don't have an account? <span onClick={() => navigate('/register')} className="font-medium text-yellow-600 hover:underline cursor-pointer">Register</span></p></div></div>);
+};
+
+export default LoginPage;
+
+
+
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import apiClient from '../api/apiClient';
+
+const RegisterPage = () => {
+    const [formData, setFormData] = useState({ name: '', email: '', password: '', password_confirmation: '' });
+    const [errors, setErrors] = useState({});
+    const [message, setMessage] = useState('');
+    const navigate = useNavigate();
+
+    const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
+    
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setErrors({});
+        setMessage('');
+        try {
+            await apiClient.post('/register', formData);
+            setMessage('Registration successful! Redirecting to login...');
+            setTimeout(() => navigate('/login'), 2000);
+        } catch (error) {
+            if (error.response && error.response.status === 422) {
+                setErrors(error.response.data.errors || {});
+            } else {
+                setMessage('An unexpected error occurred. Please try again.');
+            }
+        }
+    };
+
+    return (<div className="flex items-center justify-center min-h-[70vh] bg-gray-50"><div className="w-full max-w-md p-8 space-y-6 bg-white rounded-lg shadow-md"><h2 className="text-2xl font-bold text-center">Create an Account</h2><form onSubmit={handleSubmit} className="space-y-6"><div><label className="block text-sm font-medium text-gray-700">Name</label><input type="text" name="name" value={formData.name} onChange={handleChange} required className="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md focus:outline-none focus:ring-yellow-500 focus:border-yellow-500" />{errors.name && <p className="text-xs text-red-500 mt-1">{errors.name[0]}</p>}</div><div><label className="block text-sm font-medium text-gray-700">Email Address</label><input type="email" name="email" value={formData.email} onChange={handleChange} required className="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md focus:outline-none focus:ring-yellow-500 focus:border-yellow-500" />{errors.email && <p className="text-xs text-red-500 mt-1">{errors.email[0]}</p>}</div><div><label className="block text-sm font-medium text-gray-700">Password</label><input type="password" name="password" value={formData.password} onChange={handleChange} required className="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md focus:outline-none focus:ring-yellow-500 focus:border-yellow-500" />{errors.password && <p className="text-xs text-red-500 mt-1">{errors.password[0]}</p>}</div><div><label className="block text-sm font-medium text-gray-700">Confirm Password</label><input type="password" name="password_confirmation" value={formData.password_confirmation} onChange={handleChange} required className="w-full px-3 py-2 mt-1 border border-gray-300 rounded-md focus:outline-none focus:ring-yellow-500 focus:border-yellow-500" /></div><div><button type="submit" className="w-full px-4 py-2 font-bold text-white bg-yellow-500 rounded-md hover:bg-yellow-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-500">Register</button></div></form>{message && <p className={`text-center ${Object.keys(errors).length > 0 ? 'text-red-500' : 'text-green-500'}`}>{message}</p>}<p className="text-sm text-center text-gray-600">Already have an account? <span onClick={() => navigate('/login')} className="font-medium text-yellow-600 hover:underline cursor-pointer">Login</span></p></div></div>);
+};
+
+export default RegisterPage;
+
+
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+
+const ViewCartBar = ({ cart }) => {
+    const navigate = useNavigate();
+    
+    // This check prevents the crash. If cart is null or empty, render nothing.
+    if (!cart || !cart.items || cart.items.length === 0) {
+        return null;
+    }
+
+    const itemCount = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+    const subtotal = cart.items.reduce((sum, item) => sum + (item.menu_item.price * item.quantity), 0);
+
+    return (
+        <div 
+            onClick={() => navigate('/cart')}
+            className="fixed bottom-4 left-1/2 -translate-x-1/2 w-11/12 max-w-md bg-green-600 text-white rounded-lg shadow-lg p-4 flex justify-between items-center cursor-pointer transform hover:scale-105 transition-transform z-50"
+        >
+            <div className="font-bold">
+                {itemCount} {itemCount > 1 ? 'items' : 'item'} | ₹{subtotal}
+            </div>
+            <div className="font-bold flex items-center">
+                View Cart 
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 ml-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                </svg>
+            </div>
+        </div>
+    );
+};
+
+export default ViewCartBar;
+
+
+import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import apiClient from '../api/apiClient';
+
+const CartPage = ({ cart, onUpdateCart, onPlaceOrder }) => {
+    const navigate = useNavigate();
+    const [addresses, setAddresses] = useState([]);
+    const [selectedAddressId, setSelectedAddressId] = useState('');
+
+    useEffect(() => {
+        const fetchAddresses = async () => {
+            try {
+                const response = await apiClient.get('/addresses');
+                setAddresses(response.data);
+                if (response.data.length > 0) {
+                    setSelectedAddressId(response.data[0].id);
+                }
+            } catch (error) {
+                console.error("Failed to fetch addresses for cart:", error);
+            }
+        };
+        fetchAddresses();
+    }, []);
+    
+    const cartItems = cart?.items || [];
+    const subtotal = cartItems.reduce((sum, item) => sum + (item.menu_item.price * item.quantity), 0);
+    const deliveryFee = 30;
+    const taxes = subtotal * 0.05;
+    const total = subtotal + deliveryFee + taxes;
+
+    const handleProceedToCheckout = () => {
+        if (!selectedAddressId) {
+            alert("Please select a delivery address."); // This can be a toast notification
+            return;
+        }
+        onPlaceOrder(selectedAddressId);
+    };
+
+    return (
+        <div className="container mx-auto px-4 py-8">
+            <h2 className="text-3xl font-bold mb-6">My Cart</h2>
+            {cartItems.length === 0 ? (
+                <div className="text-center py-12 bg-white rounded-lg shadow">
+                    <p className="text-xl text-gray-600">Your cart is empty.</p>
+                    <button onClick={() => navigate('/')} className="mt-4 bg-yellow-500 text-white font-bold py-2 px-6 rounded hover:bg-yellow-600">Start Ordering</button>
+                </div>
+            ) : (
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <div className="lg:col-span-2 space-y-6">
+                        <div className="bg-white rounded-lg shadow p-6 space-y-4">
+                            {cartItems.map(item => (
+                                <div key={item.id} className="flex items-center justify-between border-b pb-4 last:border-b-0">
+                                    <div>
+                                        <p className="font-bold">{item.menu_item.name}</p>
+                                        <p className="text-gray-600">₹{item.menu_item.price}</p>
+                                    </div>
+                                    <div className="flex items-center">
+                                        <button onClick={() => onUpdateCart(item.id, item.quantity - 1)} className="bg-gray-200 px-3 py-1 rounded-l">-</button>
+                                        <span className="px-4">{item.quantity}</span>
+                                        <button onClick={() => onUpdateCart(item.id, item.quantity + 1)} className="bg-gray-200 px-3 py-1 rounded-r">+</button>
+                                    </div>
+                                    <p className="font-bold">₹{item.menu_item.price * item.quantity}</p>
+                                </div>
+                            ))}
+                        </div>
+                        <div className="bg-white rounded-lg shadow p-6">
+                            <h4 className="text-xl font-bold mb-4">Select Delivery Address</h4>
+                            <div className="space-y-3">
+                                {addresses.map(addr => (
+                                    <label key={addr.id} className="flex items-center p-3 border rounded-lg cursor-pointer">
+                                        <input type="radio" name="address" value={addr.id} checked={selectedAddressId === addr.id} onChange={(e) => setSelectedAddressId(Number(e.target.value))} />
+                                        <div className="ml-3"><p className="font-semibold">{addr.type}</p><p className="text-gray-600 text-sm">{addr.address}</p></div>
+                                    </label>
+                                ))}
+                                {addresses.length === 0 && <p className="text-gray-500 text-sm">Please add an address on your profile page.</p>}
+                            </div>
+                        </div>
+                    </div>
+                    <div className="lg:col-span-1 bg-white rounded-lg shadow p-6 h-fit">
+                        <h3 className="text-xl font-bold mb-4">Order Summary</h3>
+                        <div className="space-y-2 text-gray-700">
+                           <div className="flex justify-between"><span>Subtotal</span><span>₹{subtotal.toFixed(2)}</span></div>
+                            <div className="flex justify-between"><span>Delivery Fee</span><span>₹{deliveryFee.toFixed(2)}</span></div>
+                            <div className="flex justify-between"><span>Taxes & Charges</span><span>₹{taxes.toFixed(2)}</span></div>
+                            <div className="border-t my-2"></div>
+                            <div className="flex justify-between font-bold text-lg"><span>Total</span><span>₹{total.toFixed(2)}</span></div>
+                        </div>
+                        <button onClick={handleProceedToCheckout} disabled={!selectedAddressId} className="mt-6 w-full bg-green-600 text-white font-bold py-3 rounded hover:bg-green-700 disabled:bg-gray-400">
+                            Place Order
+                        </button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+export default CartPage;
+
+
+
+
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+
+const Footer = () => {
+  const navigate = useNavigate();
+
+  return (
+    <footer className="bg-base-200 mt-12">
+      <div className="container mx-auto px-4 py-8">
+
+        {/* Standard Footer Content */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-8">
+          <div>
+            <h3 className="font-bold text-lg mb-2 text-primary">TasteBuddy</h3>
+            <p className="text-base-content/80 text-sm">
+              Connecting people through food.
+            </p>
+          </div>
+          
+          <div>
+            <h3 className="font-semibold mb-2 text-base-content">Company</h3>
+            <ul className="text-base-content/80 text-sm space-y-1">
+              <li>About Us</li>
+              <li>Careers</li>
+              <li>Contact</li>
+            </ul>
+          </div>
+          
+          <div>
+            <h3 className="font-semibold mb-2 text-base-content">Legal</h3>
+            <ul className="text-base-content/80 text-sm space-y-1">
+              <li>Terms of Service</li>
+              <li>Privacy Policy</li>
+              <li>Refund Policy</li>
+            </ul>
+          </div>
+          
+          <div>
+            <h3 className="font-semibold mb-2 text-base-content">Feedback</h3>
+            <p className="text-base-content/80 text-sm">
+              Help us improve! Send your feedback to{" "}
+              <span className="text-secondary">feedback@tastebuddy.app</span>
+            </p>
+          </div>
+        </div>
+
+        <div className="text-center text-base-content/60 text-xs pt-8 mt-8 border-t border-base-content/10">
+          © 2025 TasteBuddy Inc. All rights reserved.
+        </div>
+      </div>
+    </footer>
+  );
+};
+
+export default Footer;
+
+
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { ShoppingCartIcon, UserIcon } from './Icons';
+
+const Header = ({ cartCount, isLoggedIn, hideCart }) => {
+    return (
+        <header className="bg-white shadow-md sticky top-0 z-40">
+            <div className="container mx-auto px-4 py-3 flex justify-between items-center">
+                <Link to="/" className="text-2xl font-bold text-yellow-500 cursor-pointer">
+                    TasteBuddy
+                </Link>
+                <div className="flex items-center space-x-6">
+                    {/* This is the key change: The cart icon is only rendered if 'hideCart' is false */}
+                    {!hideCart && (
+                        <Link to="/cart" className="relative cursor-pointer">
+                            <ShoppingCartIcon />
+                            {cartCount > 0 && (
+                                <span className="absolute -top-2 -right-2 bg-red-500 text-white text-xs rounded-full h-5 w-5 flex items-center justify-center">
+                                    {cartCount}
+                                </span>
+                            )}
+                        </Link>
+                    )}
+                    
+                    {isLoggedIn ? (
+                        <Link to="/profile">
+                            <UserIcon className="text-gray-600 cursor-pointer" />
+                        </Link>
+                    ) : (
+                        <div className="flex items-center space-x-4">
+                            <Link to="/login" className="font-semibold text-gray-600 hover:text-yellow-500">Login</Link>
+                            <Link to="/register" className="font-semibold text-white bg-yellow-500 px-4 py-2 rounded-full hover:bg-yellow-600">Register</Link>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </header>
+    );
+};
+
+export default Header;
+
+
+import React from 'react';
+
+export const SearchIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clipRule="evenodd" /></svg>;
+export const MapPinIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 21l-4.95-6.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clipRule="evenodd" /></svg>;
+export const StarIcon = ({ className }) => <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 20 20" fill="currentColor"><path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" /></svg>;
+export const VegIcon = () => <div className="w-4 h-4 border-2 border-green-600 flex items-center justify-center"><div className="w-2 h-2 bg-green-600 rounded-full"></div></div>;
+export const NonVegIcon = () => <div className="w-4 h-4 border-2 border-red-600 flex items-center justify-center"><div className="w-2 h-2 bg-red-600 rounded-full"></div></div>;
+export const BackIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>;
+export const UserIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>;
+export const ShoppingCartIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" /></svg>;
+export const TrashIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" /></svg>;
+export const CheckCircleIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-16 w-16 text-green-500 mx-auto" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" /></svg>;
+
+
+export const mockReviews = {
+    1: [{ id: 1, user: 'Priya S.', rating: 5, comment: 'Absolutely delicious!', photo: 'https://placehold.co/400x300/f5a623/ffffff?text=Food+Photo' },{ id: 2, user: 'Rohan M.', rating: 4, comment: 'Great food and quick delivery.', photo: null },],
+    2: [{ id: 3, user: 'Anjali K.', rating: 5, comment: 'Pizza was hot and fresh.', photo: 'https://placehold.co/400x300/d0021b/ffffff?text=Pizza+Time' },]
+};
+export const moods = [{ name: 'Happy', emoji: '😄', color: 'bg-yellow-400' },{ name: 'Celebratory', emoji: '🎉', color: 'bg-pink-500' },{ name: 'Comfort Food', emoji: '🤗', color: 'bg-blue-500' },{ name: 'Lazy Evening', emoji: '😴', color: 'bg-indigo-500' },{ name: 'Friendship Goals', emoji: '🧑‍🤝‍🧑', color: 'bg-green-500' },];
+
+
+/*
+================================================================================
+| FILE: /src/home/HomePage.jsx (Updated – theme removed, debounce fixed)       |
+================================================================================
+*/
+import React, { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { SearchIcon } from '../components/Icons';
+import RestaurantCard from '../restaurants/components/RestaurantCard';
+import { moods } from '../data/mockData';
+import apiClient from '../api/apiClient';
+import ViewCartBar from '../cart/components/ViewCartBar';
+import debounce from 'lodash/debounce'; // ✅ still keeping debounce fix
+
+const HomePage = ({ cart }) => {
+  const [allRestaurants, setAllRestaurants] = useState([]);
+  const [filteredRestaurants, setFilteredRestaurants] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [filters, setFilters] = useState({ rating: null, veg_only: false });
+  const navigate = useNavigate();
+
+  // Fetch ALL restaurants just once on initial load
+  useEffect(() => {
+    const fetchInitialRestaurants = async () => {
+      setLoading(true);
+      try {
+        const response = await apiClient.get('/restaurants/search'); 
+        setAllRestaurants(response.data);
+        setFilteredRestaurants(response.data);
+      } catch (error) {
+        console.error("Failed to fetch initial restaurants:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+    fetchInitialRestaurants();
+  }, []);
+
+  const applyFilters = useCallback((search, currentFilters) => {
+    let results = [...allRestaurants];
+
+    if (search) {
+      const lowercasedSearch = search.toLowerCase();
+      results = results.filter(restaurant => 
+        restaurant.name.toLowerCase().includes(lowercasedSearch) ||
+        (restaurant.menu_items && restaurant.menu_items.some(item => item.name.toLowerCase().includes(lowercasedSearch)))
+      );
+    }
+
+    if (currentFilters.veg_only) {
+      results = results.filter(restaurant => restaurant.is_veg);
+    }
+
+    if (currentFilters.rating) {
+      results = results.filter(restaurant => restaurant.rating >= currentFilters.rating);
+    }
+
+    setFilteredRestaurants(results);
+  }, [allRestaurants]);
+
+  // ✅ apply debounce to filter handler
+  const debouncedApplyFilters = useCallback(
+    debounce(applyFilters, 300),
+    [applyFilters]
+  );
+
+  useEffect(() => {
+    debouncedApplyFilters(searchTerm, filters);
+  }, [searchTerm, filters, debouncedApplyFilters]);
+
+  const handleFilterChange = (filterName, value) => {
+    setFilters(prev => ({ ...prev, [filterName]: prev[filterName] === value ? null : value }));
+  };
+
+  const handleVegToggle = () => {
+    setFilters(prev => ({ ...prev, veg_only: !prev.veg_only }));
+  };
+
+  const handleMoodClick = (moodSearchTerm) => {
+    setSearchTerm(moodSearchTerm);
+  };
+
+  const hasSearchTerm = searchTerm.length > 0;
+
+  return (
+    <div className="container mx-auto px-4 py-8 pb-24">
+      {/* Heading & Search */}
+      <div className="text-center mb-12">
+        <h2 className="text-4xl font-extrabold text-text-primary">What are you craving today?</h2>
+        <div className="mt-6 max-w-lg mx-auto">
+          <div className="relative flex items-center">
+            <input 
+              type="text" 
+              placeholder="Search for restaurants or dishes..." 
+              className="w-full bg-surface p-4 rounded-full shadow-lg focus:outline-none focus:ring-2 focus:ring-primary transition-shadow text-text-primary"
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+            <button className="absolute right-3 bg-primary text-white rounded-full p-2 hover:opacity-90">
+              <SearchIcon />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Search results */}
+      {hasSearchTerm && (
+        <div className="mb-12">
+          <h3 className="text-2xl font-bold text-text-primary mb-4">Search Results for "{searchTerm}"</h3>
+          {filteredRestaurants.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+              {filteredRestaurants.map(r => <RestaurantCard key={r.id} restaurant={r} />)}
+            </div>
+          ) : (
+            <p className="text-text-secondary text-center py-10">No results found.</p>
+          )}
+        </div>
+      )}
+
+      {/* Filters, Moods & Popular Restaurants */}
+      <div className={`transition-opacity duration-300 ${hasSearchTerm ? 'opacity-25 pointer-events-none' : 'opacity-100'}`}>
+        
+        {/* Filters */}
+        <div className="mb-8 flex items-center space-x-4">
+          <h3 className="text-lg font-semibold text-text-primary">Filters:</h3>
+          <button 
+            onClick={() => handleFilterChange('rating', 4.0)} 
+            className={`px-4 py-2 rounded-full border text-sm font-medium transition-colors ${filters.rating === 4.0 ? 'bg-primary text-white border-primary' : 'bg-surface text-text-primary border-gray-300'}`}
+          >
+            Rating 4.0+
+          </button>
+          <button 
+            onClick={handleVegToggle} 
+            className={`px-4 py-2 rounded-full border text-sm font-medium transition-colors ${filters.veg_only ? 'bg-green-500 text-white border-green-500' : 'bg-surface text-text-primary border-gray-300'}`}
+          >
+            Veg Only
+          </button>
+        </div>
+        
+        {/* Moods */}
+        <div className="mb-12">
+          <h3 className="text-2xl font-bold text-text-primary mb-4">How are you feeling?</h3>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            {moods.map(mood => (
+              <div
+                onClick={() => handleMoodClick(mood.searchTerm)}
+                key={mood.name}
+                className={`p-4 rounded-lg text-white flex flex-col items-center justify-center cursor-pointer ${mood.color} transform hover:scale-105`}
+              >
+                <span className="text-4xl">{mood.emoji}</span>
+                <span className="mt-2 font-semibold">{mood.name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Popular Restaurants */}
+        <div>
+          <h3 className="text-2xl font-bold text-text-primary mb-4">Popular Restaurants</h3>
+          {loading ? <p className="text-text-secondary">Loading...</p> : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+              {allRestaurants.map(r => <RestaurantCard key={r.id} restaurant={r} />)}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <ViewCartBar cart={cart} />
+    </div>
+  );
+};
+
+export default HomePage;
+
+
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { CheckCircleIcon } from '../components/Icons'; // Assuming Icons.jsx is in src/components/
+
+const OrderSuccessPage = () => {
+    const navigate = useNavigate();
+
+    return (
+        <div className="container mx-auto px-4 py-16 text-center">
+            <CheckCircleIcon />
+            <h2 className="text-3xl font-bold mt-4">Order Placed Successfully!</h2>
+            <p className="text-gray-600 mt-2">Thank you for your order. You can track its status on your profile page.</p>
+            <div className="mt-8 space-x-4">
+                <button onClick={() => navigate('/profile')} className="bg-yellow-500 text-white font-bold py-2 px-6 rounded hover:bg-yellow-600">
+                    View Orders
+                </button>
+                <button onClick={() => navigate('/')} className="text-yellow-600 font-bold py-2 px-6 rounded">
+                    Continue Shopping
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default OrderSuccessPage;
+
+
+import React, { useState, useEffect } from 'react';
+import apiClient from '../api/apiClient';
+import { TrashIcon } from '../components/Icons';
+import { notify } from '../utils/notifications';
+
+const ProfilePage = ({ user, onLogout }) => {
+  const [addresses, setAddresses] = useState([]);
+  const [orders, setOrders] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [formAddress, setFormAddress] = useState({ type: 'Home', address: '' });
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      const [addressResponse, orderResponse] = await Promise.all([
+        apiClient.get('/addresses'),
+        apiClient.get('/orders')
+      ]);
+      setAddresses(addressResponse.data);
+      setOrders(orderResponse.data);
+    } catch (error) {
+      console.error("Failed to fetch profile data:", error);
+      notify.error("Could not load your profile data.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      fetchData();
+    }
+  }, [user]);
+
+  const handleFormChange = (e) => {
+    const { name, value } = e.target;
+    setFormAddress(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleAddAddress = async (e) => {
+    e.preventDefault();
+    if (!formAddress.address.trim()) {
+      notify.error("Please enter an address.");
+      return;
+    }
+    try {
+      await apiClient.post('/addresses', formAddress);
+      setFormAddress({ type: 'Home', address: '' });
+      fetchData();
+      notify.success("Address saved successfully!");
+    } catch (error) {
+      console.error("Failed to add address:", error);
+      notify.error("Could not save the address.");
+    }
+  };
+
+  const handleDeleteAddress = async (addressId) => {
+    if (window.confirm("Are you sure you want to delete this address?")) {
+      try {
+        await apiClient.delete(`/addresses/${addressId}`);
+        fetchData();
+        notify.success("Address deleted.");
+      } catch (error) {
+        console.error("Failed to delete address:", error);
+        notify.error("Could not delete the address.");
+      }
+    }
+  };
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <h2 className="text-3xl font-bold mb-6 text-text-primary">My Profile</h2>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+        
+        {/* Profile Info */}
+        <div className="md:col-span-1 bg-surface rounded-lg shadow p-6 text-center h-fit">
+          <img 
+            src={`https://placehold.co/100x100/EFEFEF/333?text=${user.name.charAt(0)}`} 
+            alt={user.name} 
+            className="w-24 h-24 rounded-full mx-auto mb-4" 
+          />
+          <h3 className="text-xl font-bold text-text-primary">{user.name}</h3>
+          <p className="text-text-secondary">{user.email}</p>
+          <button 
+            onClick={onLogout} 
+            className="mt-6 w-full bg-accent text-white font-bold py-2 px-4 rounded hover:opacity-90"
+          >
+            Logout
+          </button>
+        </div>
+
+        {/* Addresses & Orders */}
+        <div className="md:col-span-2 space-y-8">
+
+          {/* Addresses */}
+          <div className="bg-surface rounded-lg shadow p-6">
+            <h4 className="text-xl font-bold mb-4 text-text-primary">My Addresses</h4>
+            <div className="space-y-4 mb-6">
+              {loading ? <p className="text-text-secondary">Loading...</p> : addresses.length > 0 ? (
+                addresses.map(addr => (
+                  <div 
+                    key={addr.id} 
+                    className="border border-gray-200 p-4 rounded-lg flex justify-between items-center group"
+                  >
+                    <div>
+                      <p className="font-bold text-text-primary">{addr.type}</p>
+                      <p className="text-text-secondary">{addr.address}</p>
+                    </div>
+                    <button 
+                      onClick={() => handleDeleteAddress(addr.id)} 
+                      className="text-gray-400 hover:text-accent opacity-0 group-hover:opacity-100"
+                    >
+                      <TrashIcon />
+                    </button>
+                  </div>
+                ))
+              ) : <p className="text-text-secondary">No addresses saved.</p>}
+            </div>
+
+            {/* Add Address Form */}
+            <form onSubmit={handleAddAddress} className="space-y-4 border-t border-gray-200 pt-6">
+              <h5 className="text-lg font-semibold text-text-primary">Add a new address</h5>
+              <div>
+                <label htmlFor="type" className="block text-sm font-medium text-text-secondary">Label</label>
+                <select 
+                  name="type" 
+                  id="type" 
+                  value={formAddress.type} 
+                  onChange={handleFormChange} 
+                  className="mt-1 block w-full py-2 px-3 border border-gray-300 bg-background text-text-primary rounded-md shadow-sm focus:outline-none focus:ring-primary focus:border-primary"
+                >
+                  <option>Home</option>
+                  <option>Work</option>
+                  <option>Other</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="address" className="block text-sm font-medium text-text-secondary">Full Address</label>
+                <textarea 
+                  name="address" 
+                  id="address" 
+                  rows="3" 
+                  value={formAddress.address} 
+                  onChange={handleFormChange} 
+                  className="mt-1 block w-full border border-gray-300 bg-background text-text-primary rounded-md shadow-sm focus:outline-none focus:ring-primary focus:border-primary" 
+                  placeholder="e.g. 123 Sunshine Avenue..."
+                />
+              </div>
+              <button 
+                type="submit" 
+                className="w-full bg-primary text-white font-bold py-2 px-4 rounded hover:opacity-90"
+              >
+                Save Address
+              </button>
+            </form>
+          </div>
+
+          {/* Orders */}
+          <div className="bg-surface rounded-lg shadow p-6">
+            <h4 className="text-xl font-bold mb-4 text-text-primary">Order History</h4>
+            <div className="space-y-4">
+              {loading ? <p className="text-text-secondary">Loading...</p> : orders.length > 0 ? (
+                orders.map(order => (
+                  <div key={order.id} className="border border-gray-200 p-4 rounded-lg">
+                    <div className="flex justify-between items-center mb-2">
+                      <p className="font-bold text-text-primary">Order #{order.id}</p>
+                      <p className="text-sm text-text-secondary">{new Date(order.created_at).toLocaleDateString()}</p>
+                    </div>
+                    <p className="text-sm text-text-primary">Status: <span className="font-semibold capitalize">{order.status}</span></p>
+                    <p className="text-sm text-text-primary">Total: <span className="font-semibold">₹{order.total_amount}</span></p>
+                    <div className="mt-2 border-t border-gray-200 pt-2">
+                      {order.items.map(item => (
+                        <div key={item.id} className="flex justify-between text-sm text-text-secondary">
+                          <span>{item.quantity} x {item.name}</span>
+                          <span>₹{item.price}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              ) : <p className="text-text-secondary">No orders placed yet.</p>}
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ProfilePage;
+
+
+import React from 'react';
+import { VegIcon, NonVegIcon } from '../../components/Icons';
+
+const MenuItemCard = ({ item, cartItem, onAddToCart, onUpdateCart }) => {
+    const cartQuantity = cartItem ? cartItem.quantity : 0;
+
+    const handleInitialAdd = () => {
+        onAddToCart(item.id, 1);
+    };
+
+    return (
+        <div className="flex items-center justify-between border-b py-4">
+            {/* Left Side: Image and Details */}
+            <div className="flex items-center">
+                <img 
+                    src={item.image_url} 
+                    alt={item.name} 
+                    className="w-20 h-20 object-cover rounded-md mr-4"
+                />
+                <div>
+                    <div className="flex items-center mb-1">
+                        {item.is_veg ? <VegIcon /> : <NonVegIcon />}
+                        <h4 className="font-bold ml-2">{item.name}</h4>
+                    </div>
+                    <p className="text-sm text-gray-600">{item.description}</p>
+                    <p className="text-lg font-semibold mt-2">₹{item.price}</p>
+                </div>
+            </div>
+
+            {/* Right Side: The Add/Quantity Button */}
+            <div className="w-28 text-center">
+                {cartQuantity > 0 ? (
+                    // If item is in cart, show the quantity stepper
+                    <div className="flex items-center justify-between border border-gray-300 rounded-lg shadow-sm">
+                        <button 
+                            onClick={() => onUpdateCart(cartItem.id, cartQuantity - 1)} 
+                            className="px-3 py-1 text-lg text-red-500 font-bold"
+                        >
+                            -
+                        </button>
+                        <span className="px-3 font-bold">{cartQuantity}</span>
+                        <button 
+                            onClick={() => onUpdateCart(cartItem.id, cartQuantity + 1)} 
+                            className="px-3 py-1 text-lg text-green-500 font-bold"
+                        >
+                            +
+                        </button>
+                    </div>
+                ) : (
+                    // If item is not in cart, show the ADD button
+                    <button 
+                        onClick={handleInitialAdd} 
+                        className="border border-gray-300 text-green-600 font-bold py-2 px-6 rounded-lg shadow-sm hover:bg-green-50"
+                    >
+                        ADD
+                    </button>
+                )}
+            </div>
+        </div>
+    );
+};
+
+export default MenuItemCard;
+
+
+
+import React from 'react';
+import { SearchIcon } from '../../components/Icons';
+
+const MenuSearch = ({ searchTerm, setSearchTerm }) => {
+    return (
+        <div className="sticky top-0 bg-gray-50 py-4 z-30">
+            <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                    <SearchIcon />
+                </div>
+                <input
+                    type="text"
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    placeholder="Search within menu..."
+                    className="w-full p-3 pl-10 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-500"
+                />
+            </div>
+        </div>
+    );
+};
+
+export default MenuSearch;
+
+
+import React from 'react';
+import { Link } from 'react-router-dom';
+import { StarIcon } from '../../components/Icons';
+
+const RestaurantCard = ({ restaurant }) => (
+    <Link to={`/restaurants/${restaurant.id}`} className="block bg-white rounded-lg shadow-lg overflow-hidden transform hover:-translate-y-1 transition-transform duration-300 cursor-pointer">
+        <img src={restaurant.image_url} alt={restaurant.name} className="w-full h-40 object-cover" />
+        <div className="p-4">
+            <h3 className="text-lg font-bold">{restaurant.name}</h3>
+            <p className="text-gray-600 text-sm">{restaurant.cuisine}</p>
+            <div className="flex justify-between items-center mt-2 text-sm">
+                <div className="flex items-center bg-green-600 text-white px-2 py-0.5 rounded"><StarIcon className="w-4 h-4" /><span className="ml-1 font-bold">{restaurant.rating}</span></div>
+                <span className="text-gray-700">{restaurant.distance}</span>
+                <span className="text-gray-700">₹{restaurant.price_for_two} for two</span>
+            </div>
+        </div>
+    </Link>
+);
+
+export default RestaurantCard;
+
+
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+
+const ViewCartBar = ({ cart }) => {
+    const navigate = useNavigate();
+    
+    // Don't render the bar if the cart is empty
+    if (!cart || cart.items.length === 0) {
+        return null;
+    }
+
+    const itemCount = cart.items.reduce((sum, item) => sum + item.quantity, 0);
+    const subtotal = cart.items.reduce((sum, item) => sum + (item.menu_item.price * item.quantity), 0);
+
+    return (
+        <div 
+            onClick={() => navigate('/cart')}
+            className="fixed bottom-4 left-1/2 -translate-x-1/2 w-11/12 max-w-md bg-green-600 text-white rounded-lg shadow-lg p-4 flex justify-between items-center cursor-pointer transform hover:scale-105 transition-transform z-50"
+        >
+            <div className="font-bold">
+                {itemCount} {itemCount > 1 ? 'items' : 'item'} | ₹{subtotal}
+            </div>
+            <div className="font-bold flex items-center">
+                View Cart 
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 ml-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                </svg>
+            </div>
+        </div>
+    );
+};
+
+export default ViewCartBar;
+
+
+import React, { useState, useEffect } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import apiClient from '../api/apiClient';
+import { BackIcon, MapPinIcon, StarIcon } from '../components/Icons';
+import MenuItemCard from './components/MenuItemCard';
+import ViewCartBar from '../cart/components/ViewCartBar';
+
+const RestaurantDetailPage = ({ cart, onAddToCart, onUpdateCart, user }) => {
+    const { id } = useParams();
+    const navigate = useNavigate();
+    const [restaurant, setRestaurant] = useState(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        const fetchRestaurantDetails = async () => {
+            if (!id) return;
+            setLoading(true);
+            try {
+                const response = await apiClient.get(`/restaurants/${id}`);
+                setRestaurant(response.data);
+            } catch (error) {
+                console.error(`Failed to fetch details for restaurant ${id}:`, error);
+            } finally {
+                setLoading(false);
+            }
+        };
+        fetchRestaurantDetails();
+    }, [id]);
+
+    if (loading) return <div className="container mx-auto px-4 py-8 text-center">Loading...</div>;
+    if (!restaurant) return <div className="container mx-auto px-4 py-8 text-center">Could not load details.</div>;
+
+    const menu = restaurant.menu_items || [];
+    
+    // Create a map for quick lookups of items in the cart
+    const cartItemsMap = cart?.items?.reduce((map, item) => {
+        map[item.menu_item_id] = item;
+        return map;
+    }, {}) || {};
+
+    return (
+        <div className="container mx-auto px-4 py-8 pb-24"> {/* Added padding-bottom for ViewCartBar */}
+            <button onClick={() => navigate(-1)} className="flex items-center text-gray-600 mb-4 hover:text-gray-900">
+                <BackIcon />
+                <span className="ml-2">Back to restaurants</span>
+            </button>
+            <div className="bg-white rounded-lg shadow-md p-6 mb-8">
+                <h2 className="text-3xl font-bold">{restaurant.name}</h2>
+                <p className="text-gray-500">{restaurant.cuisine}</p>
+                <div className="flex items-center space-x-6 mt-2 text-gray-700">
+                    <div className="flex items-center"><StarIcon className="w-5 h-5 text-yellow-500" /><span className="ml-1">{restaurant.rating}</span></div>
+                    <div className="flex items-center"><MapPinIcon /><span className="ml-1">{restaurant.distance}</span></div>
+                    <span>₹{restaurant.price_for_two} for two</span>
+                </div>
+            </div>
+
+            <div>
+                <h3 className="text-2xl font-bold mb-4">Menu</h3>
+                <div className="space-y-4">
+                    {menu.map(item => (
+                        <MenuItemCard 
+                            key={item.id}
+                            item={item}
+                            cartItem={cartItemsMap[item.id]} // Pass the specific cartItem object
+                            onAddToCart={onAddToCart}
+                            onUpdateCart={onUpdateCart}
+                        />
+                    ))}
+                </div>
+            </div>
+
+            <ViewCartBar cart={cart} />
+        </div>
+    );
+};
+
+export default RestaurantDetailPage;
+
+
+import { toast } from 'react-toastify';
+
+// Notification dikhane ke liye default options
+const toastOptions = {
+    position: "bottom-right",
+    autoClose: 4000,
+    hideProgressBar: false,
+    closeOnClick: true,
+    pauseOnHover: true,
+    draggable: true,
+    progress: undefined,
+    theme: "light",
+};
+
+// Alag-alag tarah ke notifications ke liye functions
+export const notify = {
+    success: (message) => {
+        toast.success(message, toastOptions);
+    },
+    error: (message) => {
+        toast.error(message, toastOptions);
+    },
+    info: (message) => {
+        toast.info(message, toastOptions);
+    },
+};
+
+
+import React, { useState, useEffect } from 'react';
+import { Routes, Route, useNavigate, useLocation } from 'react-router-dom';
+import apiClient from './api/apiClient';
+
+// Components & Pages
+import Header from './components/Header';
+import Footer from './components/Footer';
+import HomePage from './home/HomePage';
+import LoginPage from './authentication/LoginPage';
+import RegisterPage from './authentication/RegisterPage';
+import RestaurantDetailPage from './restaurants/RestaurantDetailPage';
+import CartPage from './cart/CartPage';
+import ProfilePage from './profile/ProfilePage';
+import OrderSuccessPage from './orders/OrderSuccessPage';
+
+// Notifications
+import { ToastContainer } from 'react-toastify';
+import 'react-toastify/dist/ReactToastify.css';
+import { notify } from './utils/notifications';
+
+export default function App() {
+    const [cart, setCart] = useState(null);
+    const [user, setUser] = useState(null);
+    const navigate = useNavigate();
+    const location = useLocation();
+
+    // =================================================================
+    // THIS IS THE FIX: This useEffect runs once on app load.
+    // It checks localStorage for a saved session and restores it.
+    // =================================================================
+    useEffect(() => {
+        const bootstrapApp = async () => {
+            const storedToken = localStorage.getItem('authToken');
+            const storedUser = localStorage.getItem('authUser');
+            
+            if (storedToken && storedUser) {
+                // This line is crucial: It sets the auth header for all future API calls
+                apiClient.defaults.headers.common['Authorization'] = `Bearer ${storedToken}`;
+                
+                setUser(JSON.parse(storedUser));
+                try {
+                    // We still fetch the cart to get the latest data
+                    const response = await apiClient.get('/cart');
+                    setCart(response.data);
+                } catch (error) {
+                    console.error("Could not fetch cart on initial load:", error);
+                    // If the token is expired/invalid, the API will likely return a 401
+                    if (error.response && error.response.status === 401) {
+                        handleLogout(); // Log the user out gracefully
+                    }
+                }
+            }
+        };
+        bootstrapApp();
+    }, []); // The empty dependency array [] ensures this runs only once.
+
+    // --- Auth & Cart Handlers ---
+    const handleLoginSuccess = async (userData, authToken) => {
+        localStorage.setItem('authUser', JSON.stringify(userData));
+        localStorage.setItem('authToken', authToken);
+        // This line was missing in your original login handler
+        apiClient.defaults.headers.common['Authorization'] = `Bearer ${authToken}`;
+        setUser(userData);
+        try {
+            const response = await apiClient.get('/cart');
+            setCart(response.data);
+        } catch (error) {
+            console.error("Could not fetch cart after login:", error);
+        }
+        navigate('/');
+    };
+
+    const handleLogout = () => {
+        setUser(null);
+        setCart(null);
+        localStorage.removeItem('authUser');
+        localStorage.removeItem('authToken');
+        delete apiClient.defaults.headers.common['Authorization'];
+        navigate('/');
+    };
+    
+    const handleAddToCart = async (menuItemId, quantity) => {
+        try {
+            const response = await apiClient.post('/cart/add', { menu_item_id: menuItemId, quantity });
+            setCart(response.data.cart);
+            notify.success("Item added to cart!");
+        } catch (error) {
+            console.error("Failed to add item to cart:", error);
+            notify.error(error.response?.data?.message || "Could not add item.");
+        }
+    };
+    
+    const handleUpdateCart = async (cartItemId, newQuantity) => {
+        try {
+            if (newQuantity <= 0) {
+                await apiClient.delete(`/cart/remove/${cartItemId}`);
+            } else {
+                await apiClient.put(`/cart/update/${cartItemId}`, { quantity: newQuantity });
+            }
+            const response = await apiClient.get('/cart');
+            setCart(response.data);
+        } catch (error) {
+            console.error("Failed to update cart:", error);
+            notify.error("Failed to update cart.");
+        }
+    };
+
+    const handlePlaceOrder = async (userAddressId) => {
+        try {
+            await apiClient.post('/orders', { user_address_id: userAddressId });
+            setCart(null);
+            navigate('/order-success');
+        } catch (error) {
+            console.error("Failed to place order:", error);
+            notify.error(error.response?.data?.message || "Could not place order.");
+        }
+    };
+
+    // --- Computed values for header ---
+    const cartCount = cart?.items?.reduce((sum, item) => sum + item.quantity, 0) || 0;
+    const hideHeaderCart = location.pathname.startsWith('/restaurants/') || location.pathname === '/';
+
+    return (
+        <div className="bg-background text-text-primary min-h-screen font-sans">
+            <ToastContainer />
+            <Header cartCount={cartCount} isLoggedIn={!!user} hideCart={hideHeaderCart} />
+            <main>
+                <Routes>
+                    <Route path="/" element={<HomePage cart={cart} />} />
+                    <Route 
+                        path="/restaurants/:id" 
+                        element={
+                            <RestaurantDetailPage 
+                                cart={cart}
+                                onAddToCart={handleAddToCart} 
+                                onUpdateCart={handleUpdateCart}
+                                user={user} 
+                            />
+                        } 
+                    />
+                    <Route 
+                        path="/cart" 
+                        element={
+                            user 
+                            ? <CartPage 
+                                cart={cart} 
+                                onUpdateCart={handleUpdateCart} 
+                                onPlaceOrder={handlePlaceOrder} 
+                            /> 
+                            : <LoginPage onLoginSuccess={handleLoginSuccess} />
+                        } 
+                    />
+                    <Route 
+                        path="/profile" 
+                        element={
+                            user 
+                            ? <ProfilePage 
+                                user={user} 
+                                onLogout={handleLogout} 
+                            /> 
+                            : <LoginPage onLoginSuccess={handleLoginSuccess} />
+                        } 
+                    />
+                    <Route path="/login" element={<LoginPage onLoginSuccess={handleLoginSuccess} />} />
+                    <Route path="/register" element={<RegisterPage />} />
+                    <Route path="/order-success" element={<OrderSuccessPage />} />
+                </Routes>
+            </main>
+            <Footer />
+        </div>
+    );
+}
+
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TASTEBUDDYt</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

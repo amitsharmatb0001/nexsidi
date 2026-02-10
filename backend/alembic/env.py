@@ -9,10 +9,13 @@ from alembic import context
 # access to the values within the .ini file in use.
 config = context.config
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+from app.core.config import settings
+
+# Override sqlalchemy.url with the one from our centralized settings (handles Secret Manager)
+# CRITICAL: Alembic uses ConfigParser which treats '%' as interpolation syntax
+# We must escape it by replacing '%' with '%%' ONLY for Alembic's config
+alembic_safe_url = settings.database_url.replace("%", "%%")
+config.set_main_option("sqlalchemy.url", alembic_safe_url)
 
 # add your model's MetaData object here
 # for 'autogenerate' support

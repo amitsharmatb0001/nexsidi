@@ -15,6 +15,11 @@ import os
 import tempfile
 from app.services.document_generator import document_generator
 from app.services.decision_ledger import decision_ledger
+from app.services.gcp_service import GCPService
+from app.models import Deployment
+from datetime import datetime
+from pydantic import BaseModel
+from typing import Optional
 
 router = APIRouter()
 
@@ -43,13 +48,24 @@ async def create_project(
             user_id=current_user.id,
             title=project_data.title,
             description=project_data.description,
-            status="requirements_gathering",
+            status="queued",  # Start in queued status
             current_agent="saanvi"
         )
         
         db.add(new_project)
         db.commit()
         db.refresh(new_project)
+        
+        # AUTO-ENQUEUE: Trigger building immediately
+        try:
+            queue = QueueManager()
+            await queue.enqueue_project(
+                project_id=str(new_project.id),
+                user_id=str(current_user.id)
+            )
+        except Exception as qe:
+            import logging
+            logging.getLogger("projects").warning(f"⚠️ Auto-enqueue failed: {str(qe)}")
         
         return new_project
     except Exception as e:

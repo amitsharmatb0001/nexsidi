@@ -200,9 +200,9 @@ TASK_MODEL_MAPPING = {
     
     # DEPLOYMENT (Pranav) - Simple and fast
     "deployment": {
-        TaskComplexity.SIMPLE: "gemini-3-flash",
+        TaskComplexity.SIMPLE: "gemini-2.5-pro",
         TaskComplexity.MEDIUM: "gemini-3-flash",
-        TaskComplexity.COMPLEX: "gemini-2.5-pro",
+        TaskComplexity.COMPLEX: "gemini-3-pro",
     },
 }
 
@@ -244,7 +244,8 @@ class AIRouter:
         
         # Load credentials from environment/settings first
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY") or settings.anthropic_api_key
-        self.gcp_project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or settings.gcp_project_id
+        self.gcp_project_id = os.getenv("GCP_PROJECT_ID") or settings.gcp_project_id
+        self.gcp_ai_project_id = os.getenv("GCP_AI_PROJECT_ID") or settings.gcp_ai_project_id
         self.gcp_credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         
         # If cloud secrets enabled, override with latest from GCP
@@ -310,6 +311,11 @@ class AIRouter:
                 self.logger.info("✅ Loaded AI credentials from local file")
             
             # Refresh token
+            if not credentials:
+                self.logger.error("❌ No AI credentials found to refresh")
+                self.has_vertex = False
+                return
+
             auth_req = google.auth.transport.requests.Request()
             credentials.refresh(auth_req)
             
@@ -754,7 +760,7 @@ class AIRouter:
         # Build URL (non-streaming, matches your working test script)
         url = (
             f"https://aiplatform.googleapis.com/v1/"
-            f"projects/{self.gcp_project_id}/"
+            f"projects/{self.gcp_ai_project_id}/"
             f"locations/{location}/"
             f"publishers/google/"
             f"models/{model_id}:generateContent"  # Non-streaming endpoint

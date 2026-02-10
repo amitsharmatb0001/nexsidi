@@ -119,10 +119,9 @@ class ResearchAgent(MistakeMemoryMixin):
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],
             task_type="research",
-            complexity=TaskComplexity.COMPLEX,
-            max_tokens=4000,
-            # This triggers web search in Gemini
-            enable_web_search=True  # New parameter
+            complexity=TaskComplexity.MEDIUM,  # Fixed: was COMPLEX
+            max_tokens=2000  # Fixed: was 4000
+            # Removed: enable_web_search=True (not supported by AIRouter)
         )
         
         self.total_cost += response.cost_estimate

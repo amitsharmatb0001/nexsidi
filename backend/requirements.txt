@@ -17,6 +17,8 @@ httpx>=0.26.0,<1.0.0
 python-dotenv>=1.0.0,<2.0.0
 google-auth>=2.25.2
 google-cloud-aiplatform>=1.38.1
+asyncpg>=0.29.0
+google-cloud-secret-manager>=2.18.0
 
 # Agents & Queueing
 playwright>=1.40.0

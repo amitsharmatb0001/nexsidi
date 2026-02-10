@@ -382,7 +382,10 @@ IMPORTANT:
                 image_url=image_url,
                 env_vars={
                     "ENVIRONMENT": "production",
-                    "PORT": "8080"
+                    "PORT": "8080",
+                    "USE_CLOUD_SECRETS": "true",
+                    "GCP_PROJECT_ID": os.getenv("GCP_PROJECT_ID", "nexsidi-ai"),
+                    "DATABASE_URL": os.getenv("DATABASE_URL", ""),
                 },
                 port=8080,
                 memory="1Gi",

@@ -390,12 +390,15 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         )
         
         try:
-            # Call AI Router with higher complexity
+            # Optimization: Use SIMPLE complexity for short/simple descriptions (Fast-Track)
+            complexity_level = TaskComplexity.SIMPLE if len(conversation_summary) < 200 else TaskComplexity.MEDIUM  # Fixed: was NORMAL
+            
+            # Call AI Router with dynamic complexity
             response = await ai_router.generate(
                 messages=[{"role": "user", "content": prompt}],
                 task_type="analysis",
-                complexity=TaskComplexity.NORMAL, # Increased from SIMPLE
-                max_tokens=2000 # Enough for detailed specs
+                complexity=complexity_level,
+                max_tokens=1000 # Reduced from 2000 for speed
             )
             
             # Parse JSON (H5)
@@ -530,7 +533,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
             response = await ai_router.generate(
                 messages=[{"role": "user", "content": prompt}],
                 task_type="architecture",
-                complexity=TaskComplexity.NORMAL,
+                complexity=TaskComplexity.MEDIUM,  # Fixed: was NORMAL
                 max_tokens=300
             )
             
