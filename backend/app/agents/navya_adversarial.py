@@ -31,12 +31,13 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 import time
 
 
-class NavyaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class NavyaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Adversarial logic error agent with GAN-style learning.
     
@@ -113,6 +114,7 @@ class NavyaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             self.logger.info(f"🔍 Starting review #{self.total_reviews} for {file_type} code")
             
             # Step 1: Check past mistakes (async)
+            await self._send_progress("adversarial_review", 20, "Analyzing logic flows for edge cases and potential null references...")
             past_mistakes = await self.check_past_mistakes(
                 task_type="adversarial_review",
                 context={"file_type": file_type}
@@ -122,6 +124,7 @@ class NavyaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             prompt = self._build_adversarial_prompt(code, file_type, past_mistakes)
             
             # Call AI Router with adversarial_logic task type
+            await self._send_progress("adversarial_review", 60, "Hunting for off-by-one errors and race conditions...")
             response = await self.ai_router.generate(
                 messages=[{"role": "user", "content": prompt}],
                 task_type="adversarial_logic",
@@ -135,7 +138,10 @@ class NavyaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             )
             
             # Parse and validate response
+            await self._send_progress("adversarial_review", 90, "Finalizing logical correctness audit...")
             result = self._parse_response(response.content)
+            
+            await self._send_progress("adversarial_review", 100, f"Logic review complete. Identified {result.get('bugs_found', 0)} potential errors.")
             
             # Update statistics
             bugs_found = result.get("bugs_found", 0)

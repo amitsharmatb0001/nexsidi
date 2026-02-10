@@ -41,7 +41,8 @@ from app.agents.mixins import (
     MistakeMemoryMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 # Setup logging
@@ -109,7 +110,7 @@ class ValidationContext:
 # TILOTMA - CHIEF AI OFFICER
 # =============================================================================
 
-class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Chief AI Officer - User Interface & Final Validator
     
@@ -164,34 +165,20 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
     # CHAT MODULE - User Interaction
     # =========================================================================
     
-    async def chat(self, user_message: str) -> str:
+    async def chat(self, user_message: str) -> Dict:
         """
         Main chat interface - handles user messages.
-        
-        Workflow:
-        1. Add to Tilotma's memory
-        2. Understand user intent
-        3. Determine appropriate response
-        4. Check if ready to hand off to Arjun
-        5. Return response
-        
-        Args:
-            user_message: Message from the user
-        
-        Returns:
-            Tilotma's response
         """
+        await self._send_progress("user_interaction", 50, "Analyzing your request...")
         
         self.logger.info(f"💬 User message: {user_message[:100]}...")
         
-        # Build conversation context (Combine private memory + API context)
-        # 1. Start with messages from API context (replayed from DB)
+        # Build conversation context
         context_msgs = []
         if hasattr(self, 'context') and self.context.messages:
-            for msg in self.context.messages[-10:]: # Last 10
+            for msg in self.context.messages[-10:]:
                 context_msgs.append(f"{msg.role.capitalize()}: {msg.content}")
         
-        # 2. Add from private memory if context is empty (fallback)
         if not context_msgs:
             recent_conversations = self.memory.get_recent_conversations(count=10)
             for conv in recent_conversations:
@@ -207,31 +194,26 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         {conversation_context}
         
         CURRENT UNDERSTANDING:
-        {self.memory.get_context_summary() if self.memory.project_understanding else 'No project understanding yet'}
+        {self.memory.get_context_summary()}
         
         USER'S NEW MESSAGE:
         {user_message}
         
         YOUR TASK:
         1. Understand what the user wants.
-        2. BE PROACTIVE: If the user mentions a common project type (e.g., '3-page website', 'landing page', 'portfolio'), immediately provide a high-quality DEFAULT PROPOSAL based on industry standards.
-        3. Only ask clarifying questions if the request is truly unique or critically underspecified.
-        4. When suggesting a project, provide a structured PROPOSAL:
-           - Features: List of main project features (e.g., Home, About, Contact for a 3-page site).
-           - UI Style: Recommend a modern look (e.g., 'Clean, professional dark mode').
-           - Tech Stack: Recommended frameworks (e.g., React + Vite).
-           - Data Model: Key entities (e.g., 'ContactSubmissions', 'PortfolioItems').
+        2. Determine if we have enough info to START development:
+           - Project Type (e.g., Landing Page, Blog, SaaS)
+           - Key Features (at least 3)
+           - User has confirmed they want to start
         
         RESPOND IN JSON:
         {{
             "response": "friendly message to user",
             "understanding": "technical summary of the project",
-            "proposal": {{
-                "features": ["feature 1", "feature 2"],
-                "ui_style": "description",
-                "tech_stack": "details",
-                "data_model": "details"
-            }},
+            "project_type": "landing_page/blog/ecommerce/saas/social",
+            "key_features": ["feature 1", "feature 2", "feature 3"],
+            "tech_stack": "details (e.g. React + FastAPI)",
+            "user_confirmed": true/false (has the user said 'yes', 'start', 'proceed', etc?),
             "confidence": 0.0-1.0,
             "missing_info": ["list of missing info"],
             "ready_to_start": true/false,
@@ -245,12 +227,10 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
             complexity=TaskComplexity.SIMPLE
         )
         
-        # C8: Robust JSON parsing with fallback (H5)
         result = safe_json_parse(ai_response.content)
         
         if not result:
             self.logger.error("❌ Failed to parse Tilotma response")
-            # Fallback response
             result = {
                 "response": "I'm sorry, I'm having trouble processing that request. Could you rephrase?",
                 "understanding": "Error parsing AI response",
@@ -258,15 +238,11 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
                 "ready_to_start": False
             }
         
-        # Capture metadata for auditing
-        result["total_tokens"] = ai_response.total_tokens
-        result["cost"] = ai_response.cost_estimate
-        
         # Save to memory
         self.memory.add_conversation(
             user_message=user_message,
-            tilotma_response=result["response"],
-            understanding=result["understanding"],
+            tilotma_response=result.get("response", ""),
+            understanding=result.get("understanding", ""),
             concerns=result.get("concerns", []),
             decisions=[]
         )
@@ -276,15 +252,50 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
             self.memory.update_project_understanding(
                 understanding=result["understanding"],
                 confidence=result.get("confidence", 0.5),
+                project_type=result.get("project_type"),
+                key_features=result.get("key_features"),
+                user_confirmed=result.get("user_confirmed", False),
                 missing_info=result.get("missing_info", [])
             )
         
-        # Check if ready to hand off to Arjun
-        if result.get("ready_to_start"):
-            self.phase = ConversationPhase.READY_FOR_EXECUTION
-            result["response"] += "\n\nI'm ready to start! Shall I hand this off to our Project Manager (Arjun) to begin execution?"
+        # Phase 1.5: Proactive Handoff (Check if requirements complete)
+        if await self._check_requirements_complete():
+            self.logger.info("✅ Requirements complete - Starting project auto-handoff")
+            await self._send_progress("handoff", 100, "Requirements satisfied. Handing off to project manager...")
+            handoff_result = await self.handoff_to_arjun()
+            return {
+                "type": "project_started",
+                "message": handoff_result,
+                "understanding": result.get("understanding"),
+                "status": "in_progress"
+            }
         
-        return result
+        # Normal chat response
+        return {
+            "type": "chat_response",
+            "message": result.get("response"),
+            "understanding": result.get("understanding"),
+            "ready_to_start": result.get("ready_to_start"),
+            "missing_info": result.get("missing_info", [])
+        }
+
+    async def _check_requirements_complete(self) -> bool:
+        """
+        Check if we have enough information to start development
+        """
+        if not self.memory.project_understanding:
+            return False
+            
+        understanding = self.memory.project_understanding
+        
+        has_project_type = understanding.project_type is not None
+        has_features = len(understanding.key_features) >= 3
+        user_confirmed = understanding.user_confirmed == True
+        
+        # We also need a minimum confidence
+        high_confidence = understanding.confidence_level >= 0.7
+        
+        return has_project_type and has_features and user_confirmed and high_confidence
     
     # =========================================================================
     # HANDOFF TO ARJUN
@@ -294,57 +305,92 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         """
         Hand off project execution to Arjun (Project Manager).
         Tilotma remains available for monitoring and intervention.
-        
-        Returns:
-            Status message
         """
         
-        self.logger.info("🎯 Handing off to Arjun for project execution...")
+        self.logger.info("🚀 Handing off to Arjun (Project Manager)")
+        
+        # Prepare requirements from Tilotma's understanding
+        understanding = self.memory.project_understanding
+        requirements = {
+            "project_id": self.project_id,
+            "user_id": self.user_id,
+            "project_type": understanding.project_type,
+            "description": understanding.current_understanding,
+            "key_features": understanding.key_features,
+            "tech_preferences": {"recommendation": "standard"},
+            "conversation_history": [c.to_dict() for c in self.memory.conversation_history[-5:]]
+        }
+        
+        # Persist handoff state (for crash recovery)
+        context_engine.store_context(
+            self.project_id,
+            "handoff_state",
+            {
+                "status": "handoff_initiated",
+                "from_agent": "tilotma",
+                "to_agent": "arjun",
+                "requirements": requirements,
+                "timestamp": datetime.now().isoformat()
+            }
+        )
         
         # Create Arjun instance
         from app.agents.arjun import Arjun
         self.arjun = Arjun(self.project_id, self.user_id)
         
-        # Prepare requirements from Tilotma's understanding
-        requirements = {
-            "description": self.memory.project_understanding.current_understanding,
-            "confidence": self.memory.project_understanding.confidence_level,
-            "assumptions": self.memory.project_understanding.assumptions_made,
-            "risks": self.memory.project_understanding.risks_identified
-        }
-        
-        # Start pipeline (async, non-blocking)
+        # Start pipeline in background task
         self.phase = ConversationPhase.MONITORING_ARJUN
-        task = asyncio.create_task(self._monitor_arjun_pipeline(requirements))
+        task = asyncio.create_task(self._execute_arjun_pipeline(requirements))
         
-        # H4: Add task callback for error handling
+        # Error handling for the task
         task.add_done_callback(self._handle_task_result)
+        self.arjun_task = task
         
         return (
-            "I've handed this off to Arjun, our Project Manager. "
-            "He'll coordinate all the specialized agents (Saanvi, Shubham, Aanya, etc.). "
-            "I'll monitor everything and step in if needed. "
-            "I'll keep you updated on progress!"
+            "✅ I've handed this off to Arjun, our Project Manager. "
+            "He'll coordinate the specialized agents to build your project. "
+            "I'll monitor everything and keep you updated on progress!"
         )
     
-    async def _monitor_arjun_pipeline(self, requirements: Dict):
+    async def _execute_arjun_pipeline(self, requirements: Dict):
         """
-        Monitor Arjun's pipeline execution.
-        Receives all reports and can intervene if needed.
+        Execute Arjun's pipeline and handle final validation
         """
-        
         try:
             self.logger.info("👁️ Monitoring Arjun's pipeline...")
             
             # Execute pipeline
             result = await self.arjun.execute_pipeline(requirements)
             
+            # Update handoff state
+            context_engine.store_context(
+                self.project_id,
+                "handoff_state",
+                {
+                    "status": "pipeline_completed",
+                    "result": str(result), # Serialize as much as possible
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+            
             # Pipeline complete - perform final validation
             self.phase = ConversationPhase.FINAL_VALIDATION
             await self._perform_final_validation(result)
             
         except Exception as e:
-            self.logger.error(f"Pipeline monitoring failed: {e}")
+            self.logger.error(f"❌ Pipeline failed: {e}")
+            
+            # Update handoff state with error
+            context_engine.store_context(
+                self.project_id,
+                "handoff_state",
+                {
+                    "status": "failed",
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+            
             await self._notify_user_of_failure(e)
 
     def _handle_task_result(self, task: asyncio.Task):
@@ -515,17 +561,8 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
     async def _perform_final_validation(self, pipeline_result) -> bool:
         """
         Tilotma's final validation with DEEP ANALYSIS.
-        
-        This is the critical quality gate before delivery.
-        Uses extended thinking and full context access.
-        
-        Args:
-            pipeline_result: Result from Arjun's pipeline
-        
-        Returns:
-            True if approved, False if rejected
         """
-        
+        await self._send_progress("final_validation", 20, "Initiating deep quality analysis of all deliverables...")
         self.logger.info("👑 Tilotma performing final validation with deep analysis...")
         
         # Get FULL context (all agent logs, outputs, decisions)
@@ -574,6 +611,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         """
         
         # Use DEEP thinking for critical validation
+        await self._send_progress("final_validation", 60, "Verifying requirement traceability and cross-service logic...")
         response = await ai_router.generate(
             messages=[{"role": "user", "content": validation_prompt}],
             task_type="critical_validation",
@@ -588,8 +626,10 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
             return False
         
         if validation["approved"]:
+            await self._send_progress("final_validation", 100, "Project approved. Prepare for delivery.")
             await self._approve_and_deliver(pipeline_result, validation)
         else:
+            await self._send_progress("final_validation", 0, "Validation failed. Requesting corrections.")
             await self._reject_and_request_fixes(pipeline_result, validation)
         
         return validation["approved"]

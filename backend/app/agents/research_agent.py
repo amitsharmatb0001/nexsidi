@@ -20,10 +20,10 @@ import logging
 from typing import Dict, Any, List
 from app.services.ai_router import ai_router, TaskComplexity
 from app.services.prompt_engine import prompt_engine
-from app.agents.mixins import MistakeMemoryMixin
+from app.agents.mixins import MistakeMemoryMixin, ProgressMixin
 
 
-class ResearchAgent(MistakeMemoryMixin):
+class ResearchAgent(MistakeMemoryMixin, ProgressMixin):
     """
     Research Agent - Web search and learning.
     
@@ -74,11 +74,13 @@ class ResearchAgent(MistakeMemoryMixin):
                 raise ValueError("Query is required")
             
             self.logger.info(f"🔍 Researching: {query}")
+            await self._send_progress("research", 30, f"Searching documentation for: {query}...")
             
             # Perform web search
             findings = await self._web_search(query, task_type, context)
             
             self.total_searches += 1
+            await self._send_progress("research", 100, "Research findings compiled and summarized.")
             
             return {
                 "status": "success",

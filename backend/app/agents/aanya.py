@@ -18,6 +18,9 @@ from app.services.ai_router import ai_router, TaskComplexity
 from app.utils.json_utils import safe_json_parse
 
 # Setup logging
+from app.services.git_service import git_service
+from app.agents.contracts import AanyaOutput
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,11 +33,12 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 
-class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Frontend Developer Agent - React/TypeScript Specialist.
 
@@ -123,8 +127,13 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             generated_files = []
             context = []
             
-            for file_spec in file_plan["files"]:
-                self.logger.info(f"📝 Generating {file_spec['path']}...")
+            total_files = len(file_plan["files"])
+            for i, file_spec in enumerate(file_plan["files"]):
+                await self._send_progress(
+                    "generating_frontend",
+                    int((i / total_files) * 100),
+                    f"Generating {file_spec['path']}..."
+                )
                 
                 file_result = await self._generate_frontend_file(
                     file_spec,
@@ -137,21 +146,23 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 context.append(file_result)
                 self.files_generated += 1
             
+            await self._send_progress("generating_frontend", 100, "Frontend generation complete.")
+            
             self.logger.info(
                 f"✅ Frontend generation complete: {len(generated_files)} files, "
                 f"₹{self.total_cost:.2f}"
             )
             
-            result = {
-                "status": "success",
-                "files": generated_files,
-                "total_files": len(generated_files),
-                "cost": self.total_cost
+            # Re-confirm files written
+            files_written = all(os.path.exists(os.path.join(self.workspace['code_dir'], f['path'])) for f in file_plan["files"])
+            
+            return {
+                "project_id": self.project_id,
+                "files_written": files_written,
+                "frontend_url": "", # Will be set by Arjun if starting server
+                "build_status": "success",
+                "workspace_path": self.workspace['code_dir']
             }
-            
-            # Arjun handles all context storage with SHA-256 verification
-            
-            return result
             
         except Exception as e:
             self.logger.error(f"❌ Frontend generation failed: {e}")
@@ -287,6 +298,28 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             # Just validate required fields
             if "file_content" not in result:
                 raise ValueError("Missing file_content in AI response")
+            
+            # WRITE TO DISK (BUG #3 Fix)
+            full_path = os.path.join(
+                self.workspace['code_dir'],
+                file_spec['path']
+            )
+            
+            # Create directories if needed
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            
+            # Write file
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(result["file_content"])
+            
+            self.logger.info(f"✅ Written: {full_path}")
+            
+            # Commit to git
+            git_service.commit_agent_work(
+                self.workspace['code_dir'],
+                "aanya",
+                f"Generated {file_spec['path']}"
+            )
             
             return result  # Return as-is
             

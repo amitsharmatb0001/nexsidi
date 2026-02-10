@@ -21,11 +21,12 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 
-class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Mobile App Developer Agent
     
@@ -96,6 +97,7 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
             self.logger.info(f"🎯 Framework selected: {framework}")
             
             # Generate based on framework
+            await self._send_progress("mobile_generation", 20, f"Generating {framework} project structure...")
             if framework == "flutter":
                 result = await self._generate_flutter_app(input_data)
             elif framework == "pwa":
@@ -104,6 +106,8 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
                 result = await self._generate_react_native_app(input_data)
             else:
                 raise ValueError(f"Unknown framework: {framework}")
+                
+            await self._send_progress("mobile_generation", 100, f"Mobile app ({framework}) generation complete.")
             
             self.apps_generated += 1
             result["cost"] = self.total_cost

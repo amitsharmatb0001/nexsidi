@@ -54,7 +54,8 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 from app.utils.json_utils import safe_json_parse
 
@@ -191,12 +192,33 @@ class RequirementsSpec:
             "approved": self.approved
         }
 
+    def to_contract_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary matching SaanviOutput contract"""
+        return {
+            "project_id": self.project_id,
+            "requirements": {
+                "type": self.project_type.value,
+                "functional": [f.name for f in self.functional_requirements],
+                "non_functional": self.non_functional_requirements
+            },
+            "complexity_score": self.pricing.complexity_score,
+            "estimated_cost": int(self.pricing.total_price),
+            "estimated_hours": sum(f.estimated_hours for f in self.functional_requirements) or 40,
+            "recommended_tech_stack": {
+                "frontend": self.tech_stack.frontend,
+                "backend": self.tech_stack.backend,
+                "database": self.tech_stack.database
+            },
+            "database_requirements": [self.tech_stack.database],
+            "api_endpoints_needed": [f.name for f in self.functional_requirements if "api" in f.name.lower() or "endpoint" in f.name.lower()] or ["/api/health"]
+        }
+
 
 # =============================================================================
 # SAANVI AGENT CLASS
 # =============================================================================
 
-class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Requirements Analyst Agent
     
@@ -279,31 +301,40 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         self.logger.info("🔍 Starting requirements analysis...")
         
         # Step 1: Summarize conversation (keep it short!)
+        await self._send_progress("requirements_analysis", 10, "Summarizing conversation history...")
         summary = self._summarize_conversation(conversation)
         
         # Step 2: Extract requirements
+        await self._send_progress("requirements_analysis", 30, "Extracting functional requirements...")
         self.logger.info("📝 Extracting requirements...")
         requirements = await self._extract_requirements(summary)
         
         # Step 3: Detect project type
+        await self._send_progress("requirements_analysis", 50, "Determining project architecture type...")
         self.logger.info("🎯 Detecting project type...")
         project_type = self._detect_project_type(requirements)
         
         # Step 4: Calculate complexity
+        await self._send_progress("requirements_analysis", 60, "Assessing project complexity...")
         self.logger.info("📊 Calculating complexity...")
         complexity = await self._calculate_complexity(requirements, project_type)
         
         # Step 5: Recommend tech stack
+        await self._send_progress("requirements_analysis", 70, "Selecting optimal tech stack...")
         self.logger.info("⚙️ Recommending technology stack...")
         tech_stack = await self._recommend_tech_stack(project_type, complexity, requirements)
         
         # Step 6: Calculate pricing
+        await self._send_progress("requirements_analysis", 85, "Calculating cost estimates...")
         self.logger.info("💰 Calculating pricing...")
         pricing = self._calculate_pricing(complexity, requirements)
         
         # Step 7: Estimate timeline
+        await self._send_progress("requirements_analysis", 95, "Estimating development timeline...")
         self.logger.info("📅 Estimating timeline...")
         timeline = self._estimate_timeline(complexity, project_type)
+        
+        await self._send_progress("requirements_analysis", 100, "Requirements specification generated.")
         
         # Step 8: Generate specification
         spec = RequirementsSpec(

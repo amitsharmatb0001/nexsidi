@@ -34,12 +34,13 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 import time
 
 
-class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Adversarial performance issue agent with GAN-style learning.
     
@@ -101,6 +102,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             self.logger.info(f"⚡ Starting performance review #{self.total_reviews} for {file_type} code")
             
             # Step 1: Check past mistakes (async)
+            await self._send_progress("adversarial_review", 20, "Analyzing scalability patterns and identifying n+1 query risks...")
             past_mistakes = await self.check_past_mistakes(
                 task_type="adversarial_performance",
                 context={"file_type": file_type}
@@ -110,6 +112,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             prompt = self._build_adversarial_prompt(code, file_type, past_mistakes)
             
             # Call AI Router
+            await self._send_progress("adversarial_review", 60, "Hunting for algorithmic complexity bottlenecks and O(n²) issues...")
             response = await self.ai_router.generate(
                  messages=[{"role": "user", "content": prompt}],
                  task_type="adversarial_performance",
@@ -123,7 +126,10 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             )
             
             # Parse and validate response
+            await self._send_progress("adversarial_review", 90, "Finalizing performance optimization report...")
             result = self._parse_response(response.content)
+            
+            await self._send_progress("adversarial_review", 100, f"Performance review complete. Found {result.get('issues_found', 0)} potential bottlenecks.")
             
             # Update statistics
             issues_found = result.get("issues_found", 0)

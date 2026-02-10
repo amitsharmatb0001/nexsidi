@@ -19,6 +19,8 @@ google-auth>=2.25.2
 google-cloud-aiplatform>=1.38.1
 asyncpg>=0.29.0
 google-cloud-secret-manager>=2.18.0
+google-api-python-client>=2.116.0
+google-auth-oauthlib>=1.2.0
 
 # Agents & Queueing
 playwright>=1.40.0

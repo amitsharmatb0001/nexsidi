@@ -62,6 +62,9 @@ class ProjectUnderstanding:
     initial_request: str
     current_understanding: str
     confidence_level: float  # 0.0 to 1.0
+    project_type: Optional[str] = None  # NEW
+    key_features: List[str] = field(default_factory=list)  # NEW
+    user_confirmed: bool = False  # NEW
     missing_information: List[str] = field(default_factory=list)
     assumptions_made: List[str] = field(default_factory=list)
     risks_identified: List[str] = field(default_factory=list)
@@ -195,6 +198,9 @@ class TilotmaMemory:
         self,
         understanding: str,
         confidence: float,
+        project_type: str = None,
+        key_features: List[str] = None,
+        user_confirmed: bool = False,
         missing_info: List[str] = None,
         assumptions: List[str] = None,
         risks: List[str] = None
@@ -205,11 +211,20 @@ class TilotmaMemory:
                 project_id=self.project_id,
                 initial_request=understanding,
                 current_understanding=understanding,
-                confidence_level=confidence
+                confidence_level=confidence,
+                project_type=project_type,
+                key_features=key_features or [],
+                user_confirmed=user_confirmed
             )
         else:
             self.project_understanding.current_understanding = understanding
             self.project_understanding.confidence_level = confidence
+            if project_type:
+                self.project_understanding.project_type = project_type
+            if key_features:
+                self.project_understanding.key_features = key_features
+            if user_confirmed:
+                self.project_understanding.user_confirmed = user_confirmed
         
         if missing_info:
             self.project_understanding.missing_information = missing_info

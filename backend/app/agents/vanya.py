@@ -25,11 +25,12 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 
-class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     UI/UX Design Agent - Creates mockups and design systems.
     
@@ -79,19 +80,24 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             audience = input_data.get("target_audience", "general")
             
             # Generate design system
+            await self._send_progress("ui_ux_design", 20, "Generating design system tokens (colors, typography)...")
             design_system = await self._generate_design_system(
                 requirements, style, audience
             )
             
             # Generate page mockups
+            await self._send_progress("ui_ux_design", 50, "Creating page layouts and navigation structures...")
             page_mockups = await self._generate_page_mockups(
                 requirements, design_system
             )
             
             # Generate component library
+            await self._send_progress("ui_ux_design", 80, "Designing reusable UI components...")
             components = await self._generate_component_library(
                 requirements, design_system
             )
+            
+            await self._send_progress("ui_ux_design", 100, "UI/UX design system and mockups generated.")
             
             self.mockups_generated += 1
             

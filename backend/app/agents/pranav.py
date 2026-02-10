@@ -32,11 +32,12 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 
-class Pranav(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Pranav(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     DevOps Engineer Agent - Deployment Specialist.
     
@@ -215,31 +216,40 @@ IMPORTANT:
         
         Args:
             input_data: Contains:
-                - backend_files: Approved backend code
-                - frontend_files: Approved frontend code
-                - architecture: Deployment decisions from Saanvi
-        
-        Returns:
-            Dict containing:
-                - success: Boolean
-                - deployment: Backend and frontend deployment info
-                - config_files: Generated configuration files
-                - urls: Live application URLs
+                - project_id: Project identifier
+                - backend_path: Path to backend code
+                - frontend_path: Path to frontend code
+                - gcp_project_id: GCP project ID
         """
         try:
             self.logger.info("🚀 Starting GCP Cloud Run deployment...")
             
-            architecture = input_data.get("architecture", {})
+            project_id = input_data.get("project_id", self.project_id)
+            backend_path = input_data.get("backend_path", self.workspace['code_dir'])
+            frontend_path = input_data.get("frontend_path", os.path.join(self.workspace['code_dir'], "frontend"))
+            
+            # Use requirements context for architecture if not provided
+            requirements_context = context_engine.get_context(project_id, "requirements")
+            architecture = {}
+            if requirements_context and "spec" in requirements_context:
+                architecture = requirements_context["spec"].get("tech_stack", {})
             
             if not architecture:
-                raise ValueError("Architecture is required for deployment")
+                # Mock architecture if none found for now
+                architecture = {
+                    "backend": "python",
+                    "frontend": "react",
+                    "database": "postgresql"
+                }
             
             # Authenticate with GCP
+            await self._send_progress("deployment", 10, "Authenticating with Google Cloud Platform...")
             self.logger.info("🔐 Authenticating with GCP...")
             if not gcp_service.authenticate():
                 raise RuntimeError("GCP authentication failed. Please configure service account credentials.")
             
             # Phase 1: Generate deployment configurations (Dockerfiles, etc.)
+            await self._send_progress("deployment", 30, "Generating Dockerfiles and IaC configurations...")
             self.logger.info("📦 Generating deployment configurations...")
             config_files = await self._generate_deployment_configs(architecture)
             
@@ -247,15 +257,19 @@ IMPORTANT:
             await self._write_dockerfiles_to_workspace(config_files)
             
             # Phase 2: Deploy backend to Cloud Run
+            await self._send_progress("deployment", 60, "Building and deploying backend container to Cloud Run...")
             self.logger.info("☁️ Deploying backend to GCP Cloud Run...")
             backend_deployment = await self._deploy_backend_to_gcp(self.project_id)
             
             # Phase 3: Deploy frontend to Cloud Run
+            await self._send_progress("deployment", 85, "Building and deploying frontend container to Cloud Run...")
             self.logger.info("🎨 Deploying frontend to GCP Cloud Run...")
             frontend_deployment = await self._deploy_frontend_to_gcp(
                 self.project_id,
                 backend_deployment.get("url", "")
             )
+            
+            await self._send_progress("deployment", 100, "Production deployment complete.")
             
             self.deployments_executed += 1
             

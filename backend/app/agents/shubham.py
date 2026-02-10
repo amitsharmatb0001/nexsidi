@@ -29,6 +29,8 @@ import uuid
 from app.services.ai_router import ai_router, TaskComplexity
 from app.services.workspace_manager import workspace_manager
 from app.services.adversarial_trainer import adversarial_trainer
+from app.services.git_service import git_service
+from app.agents.contracts import ShubhamOutput
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +43,8 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 from app.utils.json_utils import safe_json_parse
 import time
@@ -155,7 +158,7 @@ FILE_COMPLEXITY = {
 # SHUBHAM AGENT CLASS
 # =============================================================================
 
-class Shubham(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class Shubham(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Backend Developer Agent - FastAPI/Node.js Specialist.
 
@@ -403,24 +406,29 @@ FIXED CODE:
             # We could merge requirements data here if needed
             
         # Generate all files
-        results = await self.generate_multiple_files(requests)
+        results = []
+        total_files = len(requests)
+        for i, request in enumerate(requests):
+            await self._send_progress(
+                "generating_backend", 
+                int((i / total_files) * 100), 
+                f"Generating {request.file_path}..."
+            )
+            result = await self.generate_file(request)
+            results.append(result)
         
-        backend_result = {
-            "status": "success",
-            "files": [
-                {
-                    "path": r.file_path,
-                    "content": r.content,
-                    "tokens": r.tokens_used,
-                    "cost": r.cost
-                }
-                for r in results
-            ],
-            "total_tokens": sum(r.tokens_used for r in results),
-            "total_cost": sum(r.cost for r in results)
+        await self._send_progress("generating_backend", 100, "Backend generation complete.")
+        
+        # Re-confirm files written (BUG #3 Fix)
+        files_written = all(os.path.exists(os.path.join(self.workspace['code_dir'], r.file_path)) for r in results)
+        
+        return {
+            "project_id": self.project_id,
+            "files_written": files_written,
+            "backend_url": "", # Will be set by Arjun if starting server
+            "api_architecture": architecture.get("api", {}),
+            "workspace_path": self.workspace['code_dir']
         }
-
-        return backend_result
 
     # =========================================================================
     # MAIN GENERATION METHODS
@@ -543,59 +551,38 @@ FIXED CODE:
                     # Can't split this file type
                     self.logger.error(f"❌ File {request.file_path} too large and not splittable")
             
-            return GeneratedFile(
-                file_path=request.file_path,
-                content=clean_content,
-                file_type=request.file_type,
-                tokens_used=response.total_tokens,  # Fixed: was tokens_used
-                model_used=response.model_id,  # Fixed: was model_name
-                was_escalated=response.was_escalated,
-                was_split=False,
-                validation_passed=is_valid,
-                syntax_valid=is_valid,
-                cost=response.cost_estimate  # Fixed: was cost
+            # Step 7: WRITE TO DISK (BUG #3 Fix)
+            full_path = os.path.join(
+                self.workspace['code_dir'],
+                request.file_path
             )
             
-        except Exception as e:
-            self.logger.error(f"❌ Error generating {request.file_path}: {e}")
-            await self.record_failure(
-                task_type="code_generation",
-                error=str(e),
-                context={"file_path": request.file_path, "file_type": request.file_type.value}
+            # Create directories if needed
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            
+            # Write file
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(clean_content)
+            
+            self.logger.info(f"✅ Written: {full_path}")
+            
+            # Commit to git
+            git_service.commit_agent_work(
+                self.workspace['code_dir'],
+                "shubham",
+                f"Generated {request.file_path}"
             )
-            # Return failed object or re-raise? 
-            # Subclasses usually expect an object, but let's re-raise to be handled by Arjun
-            raise e
             
-            # Step 6.5: Validate models file has all required classes
-            if request.file_type == FileType.MODELS and is_valid:
-                self.logger.info(f"🔍 Validating all models are present...")
-                missing_models = self._validate_all_models_present(
-                    clean_content,
-                    request.architecture
-                )
-                
-                self.logger.info(f"📊 Validation result: missing_models={missing_models}")
-                
-                if missing_models:
-                    self.logger.warning(
-                        f"⚠️ Models missing for tables: {missing_models}. "
-                        "Regenerating with explicit class names..."
-                    )
-                    # Retry with even more explicit prompt including missing models
-                    return await self._regenerate_with_missing_models(
-                        request,
-                        missing_models
-                    )
-                else:
-                    self.logger.info(f"✅ All models validated successfully")
-            
-            # Step 7: Create result
+            # Verify file exists
+            if not os.path.exists(full_path):
+                raise FileNotFoundError(f"❌ File was not written: {full_path}")
+
+            # Step 8: Create result
             result = GeneratedFile(
                 file_path=request.file_path,
                 content=clean_content,
                 file_type=request.file_type,
-                tokens_used=response.output_tokens,
+                tokens_used=response.total_tokens,
                 model_used=response.model_id,
                 was_escalated=response.was_escalated,
                 was_split=False,
@@ -607,7 +594,7 @@ FIXED CODE:
             if is_valid:
                 self.logger.info(
                     f"✅ Generated {request.file_path}: "
-                    f"{response.output_tokens} tokens, "
+                    f"{response.total_tokens} tokens, "
                     f"₹{response.cost_estimate:.4f}"
                 )
             else:

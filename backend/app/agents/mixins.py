@@ -361,3 +361,45 @@ class SearchCapableMixin:
             findings[tech] = result.get("summary", "")
         
         return findings
+
+class ProgressMixin:
+    """
+    Mixin to add real-time WebSocket progress updates to agents.
+    """
+    
+    async def _send_progress(self, phase: str, percentage: int, message: str = None):
+        """
+        Send progress update via WebSocket.
+        
+        Args:
+            phase: Current execution phase
+            percentage: Completion percentage (0-100)
+            message: Optional status message
+        """
+        # Lazy import to avoid circular dependencies
+        from app.api.websocket import notify_agent_progress
+        
+        project_id = getattr(self, "project_id", None)
+        # Use agent_name attribute if available, otherwise lowercase class name
+        agent_name = getattr(self, "agent_name", self.__class__.__name__.lower())
+        
+        if project_id:
+            try:
+                await notify_agent_progress(
+                    project_id=project_id,
+                    agent_name=agent_name,
+                    phase=phase,
+                    percentage=percentage,
+                    message=message
+                )
+                
+                # Also log to standard logger if available
+                if hasattr(self, "logger"):
+                    self.logger.info(f"📊 [{percentage}%] {phase}: {message or ''}")
+            except Exception as e:
+                if hasattr(self, "logger"):
+                    self.logger.error(f"Error sending websocket progress: {e}")
+        else:
+            # Fallback to just logging if no project_id
+            if hasattr(self, "logger"):
+                self.logger.debug(f"Progress skipped (no project_id): {phase} {percentage}%")

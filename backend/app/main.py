@@ -21,7 +21,7 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api import auth, projects, chat, health, uploads, deployments
+from app.api import auth, projects, chat, health, uploads, deployments, approvals
 from app.core.exceptions import (
     validation_exception_handler,
     database_exception_handler,
@@ -195,6 +195,13 @@ app.include_router(
     verification_router,
     prefix="/api/verification",
     tags=["Verification"]
+)
+
+
+app.include_router(
+    approvals.router,
+    prefix="/api/approvals",
+    tags=["Approvals"]
 )
 
 

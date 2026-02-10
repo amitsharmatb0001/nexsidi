@@ -30,11 +30,12 @@ from app.agents.mixins import (
     MistakeMemoryMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 
-class BrandAgent(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class BrandAgent(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Visual design evaluator using screenshot analysis.
     
@@ -204,6 +205,7 @@ IMPORTANT: Return ONLY valid JSON."""
             self.logger.info(f"🎨 Starting visual evaluation #{self.total_evaluations}")
             
             # Load and encode screenshots
+            await self._send_progress("design_validation", 20, "Loading screenshots and preparing visual analysis pipeline...")
             encoded_screenshots = {}
             for size, path in screenshots.items():
                 if path and Path(path).exists():
@@ -214,6 +216,7 @@ IMPORTANT: Return ONLY valid JSON."""
                 raise ValueError("No valid screenshots provided")
             
             # Build visual evaluation prompt
+            await self._send_progress("design_validation", 50, "Evaluating visual clarity, uniqueness, and brand trust indicators...")
             prompt = self._build_visual_prompt(
                 business_description,
                 target_audience,
@@ -237,7 +240,10 @@ IMPORTANT: Return ONLY valid JSON."""
             )
             
             # Parse and validate response
+            await self._send_progress("design_validation", 90, f"Finalizing design quality score (Pass threshold: 35/40)...")
             result = self._parse_response(response.content)
+            
+            await self._send_progress("design_validation", 100, f"Design evaluation complete. Score: {result.get('overall_score', 0)}/40. Result: {'PASS' if result.get('passed') else 'FAIL'}")
             
             # Add screenshot paths to result
             result["screenshots_evaluated"] = list(screenshots.keys())

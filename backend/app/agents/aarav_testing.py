@@ -18,13 +18,14 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     PermanentMemoryMixin,
     ContextManagementMixin,
-    DecisionLedgerMixin
+    DecisionLedgerMixin,
+    ProgressMixin
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class AaravTesting(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin):
+class AaravTesting(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, DecisionLedgerMixin, SearchCapableMixin, ProgressMixin):
     """
     Browser Testing Agent - Automated UI/UX Testing.
     Managed by Arjun Orchestrator.
@@ -78,10 +79,14 @@ Task: Generate comprehensive browser test strategies."""
                 return self._mock_test_results(tests)
             
             # Generate test strategy
+            await self._send_progress("testing", 20, "Analyzing application structure for test strategy...")
             test_strategy = await self._generate_test_strategy(url, tests)
             
             # Execute tests
+            await self._send_progress("testing", 40, f"Executing {len(tests)} automated tests...")
             results = await self._execute_tests(url, test_strategy, browser)
+            
+            await self._send_progress("testing", 100, f"Testing complete. {results['tests_passed']} passed.")
             
             self.tests_executed += len(tests)
             self.logger.info(f"✅ Testing complete: {results['tests_passed']}/{len(tests)} passed")
