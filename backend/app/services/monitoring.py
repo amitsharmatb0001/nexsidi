@@ -43,13 +43,13 @@ class SystemMonitor:
         alerts = []
         
         if health['queue_size'] >= 8:
-            alerts.append("⚠️ Queue nearly full (8/10)")
+            alerts.append("[WARN] Queue nearly full (8/10)")
         if health['memory_usage'] >= 80:
-            alerts.append("⚠️ Memory usage critical (>80%)")
+            alerts.append("[WARN] Memory usage critical (>80%)")
         if health['cpu_usage'] >= 90:
-            alerts.append("⚠️ CPU usage critical (>90%)")
+            alerts.append("[WARN] CPU usage critical (>90%)")
         if health['disk_usage'] >= 85:
-            alerts.append("⚠️ Disk usage critical (>85%)")
+            alerts.append("[WARN] Disk usage critical (>85%)")
         
         health['alerts'] = alerts
         health['status'] = 'healthy' if not alerts else 'warning'

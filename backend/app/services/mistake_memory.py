@@ -18,7 +18,7 @@ class MistakeMemory:
         """
         Store mistake in per-agent permanent memory.
         """
-        self.logger.info(f"💾 Recording failure for {agent_name} - {task_type}...")
+        self.logger.info(f"[SAVE] Recording failure for {agent_name} - {task_type}...")
         try:
             agent_memory.store_mistake(
                 agent_name=agent_name,
@@ -28,7 +28,7 @@ class MistakeMemory:
                 fix=fix or "Retry attempted"
             )
         except Exception as e:
-            self.logger.error(f"❌ Failed to record failure: {e}")
+            self.logger.error(f"[ERROR] Failed to record failure: {e}")
     
     def query_similar_mistakes(self, task_type: str, 
                                input_data: str, 
@@ -45,7 +45,7 @@ class MistakeMemory:
                 n_results=n_results
             )
         except Exception as e:
-            self.logger.error(f"❌ Failed to query mistakes: {e}")
+            self.logger.error(f"[ERROR] Failed to query mistakes: {e}")
             return {"ids": [], "metadatas": [], "documents": []}
     
     def modify_prompt_with_lessons(self, base_prompt: str, 
@@ -66,7 +66,7 @@ class MistakeMemory:
         
         if lessons_list:
             lessons_text = "\n".join(lessons_list)
-            self.logger.info(f"🧠 Injecting {len(lessons_list)} lessons into prompt for {agent_name}:{task_type}")
+            self.logger.info(f"[AI] Injecting {len(lessons_list)} lessons into prompt for {agent_name}:{task_type}")
             return f"{base_prompt}\n\n### LEARNED FROM PAST MISTAKES (DO NOT REPEAT):\n{lessons_text}"
         
         return base_prompt

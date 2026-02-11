@@ -53,9 +53,9 @@ class AdversarialTrainer:
             self.redis = get_redis_client()
             self.redis.ping()
             self.connected = True
-            self.logger.info("✅ Connected to Redis (shared pool)")
+            self.logger.info("[OK] Connected to Redis (shared pool)")
         except Exception as e:
-            self.logger.warning(f"⚠️ Redis unavailable: {e}")
+            self.logger.warning(f"[WARN] Redis unavailable: {e}")
             self.redis = None
             self.connected = False
             self._memory_weights = {}
@@ -374,7 +374,7 @@ class AdversarialTrainer:
             code = sample.get("code", "")
             file_type = sample.get("file_type", "python")
             
-            self.logger.info(f"📝 Processing sample {i+1}/{len(code_samples)}")
+            self.logger.info(f"[LOG] Processing sample {i+1}/{len(code_samples)}")
             
             # Run reviewers in parallel
             try:
@@ -389,15 +389,15 @@ class AdversarialTrainer:
                 
                 # Handle exceptions
                 if isinstance(deepika_result, Exception):
-                    self.logger.error(f"❌ Deepika failed: {deepika_result}")
+                    self.logger.error(f"[ERROR] Deepika failed: {deepika_result}")
                     deepika_result = {"issues_found": 0, "details": []}
                 
                 if isinstance(karan_result, Exception):
-                    self.logger.error(f"❌ Karan failed: {karan_result}")
+                    self.logger.error(f"[ERROR] Karan failed: {karan_result}")
                     karan_result = {"vulnerabilities_found": 0, "details": []}
                 
                 if isinstance(navya_result, Exception):
-                    self.logger.error(f"❌ Navya failed: {navya_result}")
+                    self.logger.error(f"[ERROR] Navya failed: {navya_result}")
                     navya_result = {"bugs_found": 0, "details": []}
                 
                 # Calculate competitive losses
@@ -417,7 +417,7 @@ class AdversarialTrainer:
                 epoch_results["unique_issues"] += sample_losses["unique_issues"]
                 
             except Exception as e:
-                self.logger.error(f"❌ Sample processing failed: {e}")
+                self.logger.error(f"[ERROR] Sample processing failed: {e}")
                 continue
         
         # Average losses across samples
@@ -444,7 +444,7 @@ class AdversarialTrainer:
         epoch_results["convergence"] = convergence
         
         self.logger.info(
-            f"✅ Epoch {self.epoch} complete: "
+            f"[OK] Epoch {self.epoch} complete: "
             f"Gen Loss={epoch_results['generator_loss']:.3f}, "
             f"Issues={epoch_results['total_issues_found']}, "
             f"Convergence={convergence['rate']:.3f}"
@@ -536,7 +536,7 @@ class AdversarialTrainer:
         )
         
         self.logger.info(
-            f"🧠 Updated strategies: "
+            f"[AI] Updated strategies: "
             f"Deepika={deepika_reward:.2f}, "
             f"Karan={karan_reward:.2f}, "
             f"Navya={navya_reward:.2f}"
@@ -581,7 +581,7 @@ class AdversarialTrainer:
         with open(history_file, 'w') as f:
             json.dump(self.training_history, f, indent=2)
         
-        self.logger.debug(f"💾 Saved training history to {history_file}")
+        self.logger.debug(f"[SAVE] Saved training history to {history_file}")
     
     def _load_training_history(self):
         """Load training history from disk."""
@@ -648,7 +648,7 @@ if __name__ == "__main__":
             outcome="rejected"
         )
         
-        print("\n📊 After rejection:")
+        print("\n[STATS] After rejection:")
         gen_suggestions = adversarial_trainer.get_generator_suggestions("shubham")
         print(f"Generator confidence: {gen_suggestions['confidence']:.2f}")
         print(f"Patterns to avoid: {len(gen_suggestions['avoid_patterns'])}")
@@ -670,11 +670,11 @@ if __name__ == "__main__":
             outcome="accepted"
         )
         
-        print("\n📊 After acceptance:")
+        print("\n[STATS] After acceptance:")
         gen_suggestions = adversarial_trainer.get_generator_suggestions("shubham")
         print(f"Generator confidence: {gen_suggestions['confidence']:.2f}")
         print(f"Success patterns: {len(gen_suggestions['success_patterns'])}")
         
-        print("\n✅ AdversarialTrainer test complete!")
+        print("\n[OK] AdversarialTrainer test complete!")
     
     asyncio.run(test())

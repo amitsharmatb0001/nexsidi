@@ -46,6 +46,19 @@ class SaanviOutput:
 
 
 @dataclass
+class VikramOutput:
+    """What Vikram gives to Vanya/Shubham (Architectural Blueprint)"""
+    project_id: str
+    blueprint: Dict
+    tech_stack: Dict
+    database_schema: Dict
+    api_contracts: List[Dict]
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
 class ShubhamInput:
     """What Shubham needs to generate backend"""
     project_id: str
@@ -62,10 +75,12 @@ class ShubhamInput:
 class ShubhamOutput:
     """What Shubham produces"""
     project_id: str
-    files_generated: List[str]  # Paths to generated files
     files_written: bool  # Were they actually saved?
     workspace_path: str
-    backend_framework: str
+    backend_url: Optional[str] = None
+    api_architecture: Optional[Dict] = None
+    files_generated: List[str] = None  # Optional list of paths
+    backend_framework: Optional[str] = None
     
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -88,10 +103,12 @@ class AanyaInput:
 class AanyaOutput:
     """What Aanya produces"""
     project_id: str
-    files_generated: List[str]
     files_written: bool
     workspace_path: str
-    frontend_framework: str
+    frontend_url: Optional[str] = None
+    build_status: Optional[str] = None
+    files_generated: List[str] = None
+    frontend_framework: Optional[str] = None
     
     def to_dict(self) -> Dict:
         return asdict(self)

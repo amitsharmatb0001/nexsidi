@@ -53,7 +53,7 @@ class EmailService:
         """
         EMAIL 1: Send SDD document after user approves design
         """
-        subject = f"✅ {project_name} - Project Started!"
+        subject = f"[OK] {project_name} - Project Started!"
         
         html_body = f"""
         <html>
@@ -67,7 +67,7 @@ class EmailService:
                 <p>Great news! Your project <strong>{project_name}</strong> has officially entered development.</p>
                 
                 <div style="background: #f8fafc; padding: 20px; border-radius: 8px; margin: 20px 0; border: 1px solid #e2e8f0;">
-                    <h3 style="margin-top:0; color: #475569;">📊 Project Summary</h3>
+                    <h3 style="margin-top:0; color: #475569;">[STATS] Project Summary</h3>
                     <p><strong>Investment:</strong> ₹{project_details.get('cost', 0):,}</p>
                     <p><strong>Estimated Timeline:</strong> {project_details.get('timeline_hours', 0)} hours</p>
                 </div>
@@ -178,7 +178,7 @@ class EmailService:
                 </div>
                 
                 <div style="background: #fffbef; padding: 20px; border-radius: 8px; border-left: 4px solid #f59e0b; margin: 20px 0;">
-                    <h3 style="margin-top:0; color: #92400e;">🔐 Admin Credentials</h3>
+                    <h3 style="margin-top:0; color: #92400e;">[SECURE] Admin Credentials</h3>
                     <p><strong>Email:</strong> {login_credentials.get('admin_email')}</p>
                     <p><strong>Password:</strong> {login_credentials.get('admin_password')}</p>
                 </div>
@@ -197,7 +197,7 @@ class EmailService:
     async def _send_smtp_message(self, msg: EmailMessage):
         """Send via smtplib (ZeptoMail SMTP)"""
         if not self.password:
-            self.logger.error("❌ ZEPTOMAIL_PASSWORD not found in Secret Manager. Cannot send email.")
+            self.logger.error("[ERROR] ZEPTOMAIL_PASSWORD not found in Secret Manager. Cannot send email.")
             return
 
         try:
@@ -212,12 +212,12 @@ class EmailService:
                     server.login(self.username, self.password)
                     server.send_message(msg)
             else:
-                self.logger.error(f"❌ Invalid SMTP port: {self.port}")
+                self.logger.error(f"[ERROR] Invalid SMTP port: {self.port}")
                 return
                 
             self.logger.info(f"📧 Email successfully sent to {msg['To']} via ZeptoMail")
         except Exception as e:
-            self.logger.error(f"❌ SMTP Error: {e}")
+            self.logger.error(f"[ERROR] SMTP Error: {e}")
 
 
 # Global instance

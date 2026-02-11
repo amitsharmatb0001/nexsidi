@@ -73,7 +73,7 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             }
         """
         try:
-            self.logger.info("🎨 Starting UI/UX design generation...")
+            self.logger.info("[DESIGN] Starting UI/UX design generation...")
             
             requirements = input_data.get("requirements", {})
             style = input_data.get("style_preference", "modern")
@@ -97,6 +97,17 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 requirements, design_system
             )
             
+            # Generate mockup HTML (Task 1.1)
+            await self._send_progress("ui_ux_design", 90, "Generating interactive HTML mockup...")
+            mockup_html = await self.create_mockup_html(requirements, design_system)
+
+            # Generate Design PDF (Task 2.3)
+            from app.services.document_generator import document_generator
+            design_pdf_path = await document_generator.generate_design_pdf(
+                self.project_id, 
+                {"design_system": design_system}
+            )
+
             await self._send_progress("ui_ux_design", 100, "UI/UX design system and mockups generated.")
             
             self.mockups_generated += 1
@@ -106,18 +117,21 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 "design_system": design_system,
                 "page_mockups": page_mockups,
                 "component_library": components,
+                "mockup_html": mockup_html,
+                "design_pdf_path": design_pdf_path,
+                "mockup_url": f"https://preview.nexsidi.com/{self.project_id}", # Placeholder
                 "cost": self.total_cost
             }
             
             self.logger.info(
-                f"✅ UI/UX design complete: {len(page_mockups)} pages, "
+                f"[OK] UI/UX design complete: {len(page_mockups)} pages, "
                 f"₹{self.total_cost:.2f}"
             )
             
             return result
             
         except Exception as e:
-            self.logger.error(f"❌ UI/UX design failed: {e}")
+            self.logger.error(f"[ERROR] UI/UX design failed: {e}")
             await self.record_failure(
                 task_type="ui_ux_design",
                 error=str(e),
@@ -154,7 +168,7 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for design system")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for design system")
         
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],
@@ -201,7 +215,7 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for mockups")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for mockups")
         
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],
@@ -245,7 +259,7 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for components")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for components")
         
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],
@@ -298,6 +312,54 @@ class Vanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             }
         }
     
+    async def select_color_palette(self, project_type: str) -> Dict:
+        """Choose colors based on project type (Task 1.1)"""
+        prompt = f"Choose a professional color palette for a {project_type} application in JSON format (primary, secondary, accent, background, text)."
+        
+        response = await self.ai_router.generate(
+            messages=[{"role": "user", "content": prompt}],
+            task_type="ui_design",
+            complexity=TaskComplexity.SIMPLE,
+            max_tokens=500
+        )
+        try:
+            return json.loads(response.content)
+        except:
+            return self._default_design_system()["colors"]
+
+    async def create_mockup_html(self, blueprint: Dict, design_system: Dict) -> str:
+        """Generate actual HTML preview (Task 1.1)"""
+        colors = design_system.get("colors", {})
+        typography = design_system.get("typography", {})
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ 
+                    font-family: {typography.get('font_family', 'Inter')}, sans-serif; 
+                    background: {colors.get('background', '#ffffff')};
+                    color: {colors.get('text', '#111827')};
+                }}
+                .header {{ background: {colors.get('primary', '#3B82F6')}; color: white; padding: 20px; }}
+                .btn {{ background: {colors.get('accent', '#F59E0B')}; color: white; border: none; padding: 10px 20px; border-radius: 4px; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>{blueprint.get('project_name', 'Mockup Preview')}</h1>
+            </div>
+            <div style="padding: 40px;">
+                <h2>Welcome to your new application</h2>
+                <p>This is a live preview of the design system generated by Vanya.</p>
+                <button class="btn">Click Me</button>
+            </div>
+        </body>
+        </html>
+        """
+        return html
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get generation statistics"""
         return {

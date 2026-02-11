@@ -42,7 +42,7 @@ class WorkspaceManager:
         for path in directories.values():
             path.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"✅ Workspace created for {project_id}")
+        logger.info(f"[OK] Workspace created for {project_id}")
         return {k: str(v) for k, v in directories.items()}
     
     def cleanup_workspace(self, project_id: str):

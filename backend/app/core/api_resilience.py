@@ -158,7 +158,7 @@ class APIResilience:
             # Check circuit breaker
             if not circuit.can_attempt():
                 self.logger.warning(
-                    f"⚠️ Circuit breaker OPEN for {current_provider}, "
+                    f"[WARN] Circuit breaker OPEN for {current_provider}, "
                     f"state={circuit.state.value}, failures={circuit.failure_count}"
                 )
                 continue
@@ -177,7 +177,7 @@ class APIResilience:
                 circuit.record_success()
                 
                 self.logger.info(
-                    f"✅ {current_provider} succeeded "
+                    f"[OK] {current_provider} succeeded "
                     f"(latency={latency_ms:.0f}ms, success_rate={circuit.get_success_rate():.2%})"
                 )
                 
@@ -189,7 +189,7 @@ class APIResilience:
                 circuit.record_failure()
                 
                 self.logger.error(
-                    f"❌ {current_provider} failed: {type(e).__name__}: {e} "
+                    f"[ERROR] {current_provider} failed: {type(e).__name__}: {e} "
                     f"(failures={circuit.failure_count}/{circuit.failure_threshold})"
                 )
                 
@@ -199,7 +199,7 @@ class APIResilience:
                 continue
         
         # All providers failed
-        self.logger.error("❌ All API providers failed!")
+        self.logger.error("[ERROR] All API providers failed!")
         raise Exception(f"All API providers failed. Last error: {last_exception}")
     
     def _record_success(self, provider: str, latency_ms: float):

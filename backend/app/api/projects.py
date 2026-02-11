@@ -9,17 +9,10 @@ from app.dependencies import get_current_user
 from app.services.queue_manager import QueueManager
 from app.agents.arjun import Arjun
 from app.services.workspace_manager import workspace_manager
-from fastapi.responses import FileResponse
-import shutil
-import os
-import tempfile
-from app.services.document_generator import document_generator
-from app.services.decision_ledger import decision_ledger
-from app.services.gcp_service import GCPService
-from app.models import Deployment
-from datetime import datetime
-from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any, List
+from fastapi.responses import FileResponse, StreamingResponse
+import asyncio
+import json
 
 router = APIRouter()
 
@@ -65,7 +58,7 @@ async def create_project(
             )
         except Exception as qe:
             import logging
-            logging.getLogger("projects").warning(f"⚠️ Auto-enqueue failed: {str(qe)}")
+            logging.getLogger("projects").warning(f"[WARN] Auto-enqueue failed: {str(qe)}")
         
         return new_project
     except Exception as e:
@@ -212,7 +205,7 @@ async def get_project_status(
         
         # Get queue status if queued/processing
         queue = QueueManager()
-        queue_status = await queue.get_project_status(str(project_id))
+        queue_status = await queue.get_project_status(str(project_id)) or {}
         
         return {
             "project_id": str(project_id),
@@ -220,6 +213,7 @@ async def get_project_status(
             "current_agent": project.current_agent,
             "queue_position": queue_status.get("queue_position"),
             "estimated_wait": queue_status.get("estimated_wait"),
+            "error": queue_status.get("error")  # Added: Reveal error for debugging
         }
     except HTTPException:
         raise
@@ -311,3 +305,152 @@ async def download_project(
         raise HTTPException(status_code=404, detail="Project source code not found. Has it been generated yet?")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create download: {str(e)}")
+@router.get("/{project_id}/code/stream")
+async def stream_code_generation(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Task 2.2: Stream code generation in real-time via SSE"""
+    async def event_generator():
+        workspace = workspace_manager.get_workspace(str(project_id))
+        workspace_path = workspace['code_dir']
+        seen_files = set()
+        
+        while True:
+            if os.path.exists(workspace_path):
+                for root, dirs, files in os.walk(workspace_path):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(full_path, workspace_path)
+                        
+                        if relative_path not in seen_files:
+                            seen_files.add(relative_path)
+                            try:
+                                with open(full_path, 'r', encoding='utf-8') as f:
+                                    content = f.read()
+                                yield f"data: {json.dumps({'type': 'file_created', 'path': relative_path, 'content': content[:1000], 'size': len(content)})}\n\n"
+                            except: pass
+            await asyncio.sleep(2)
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.get("/{project_id}/files")
+async def get_file_tree(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Task 2.3: Get project file tree structure"""
+    workspace = workspace_manager.get_workspace(str(project_id))
+    workspace_path = workspace['code_dir']
+    
+    if not os.path.exists(workspace_path):
+        raise HTTPException(404, "Project workspace not found")
+    
+    def build_tree(path: str, relative_to: str) -> List[Dict]:
+        items = []
+        try:
+            for item in os.listdir(path):
+                if item in ['.git', 'venv', '__pycache__']: continue
+                item_path = os.path.join(path, item)
+                rel_path = os.path.relpath(item_path, relative_to)
+                if os.path.isdir(item_path):
+                    items.append({"name": item, "type": "folder", "path": rel_path, "children": build_tree(item_path, relative_to)})
+                else:
+                    items.append({"name": item, "type": "file", "path": rel_path, "size": os.path.getsize(item_path)})
+        except: pass
+        return items
+    
+    return {"project_id": str(project_id), "tree": build_tree(workspace_path, workspace_path)}
+
+
+@router.get("/{project_id}/code/{filepath:path}")
+async def get_file_content(
+    project_id: UUID,
+    filepath: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Task 2.4: Read any generated file"""
+    workspace = workspace_manager.get_workspace(str(project_id))
+    workspace_path = workspace['code_dir']
+    full_path = os.path.abspath(os.path.join(workspace_path, filepath))
+    
+    if not full_path.startswith(os.path.abspath(workspace_path)):
+        raise HTTPException(403, "Access denied")
+    
+    if not os.path.exists(full_path):
+        raise HTTPException(404, "File not found")
+    
+    try:
+        with open(full_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return {"path": filepath, "content": content, "size": len(content), "lines": len(content.split('\n'))}
+    except:
+        raise HTTPException(400, "Cannot read file (might be binary)")
+
+
+@router.get("/{project_id}/agent-logs")
+async def get_agent_logs(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Task 2.5: Get agent conversation and activity logs"""
+    from app.services.context_engine import context_engine
+    logs = context_engine.get_context(str(project_id), "agent_logs") or []
+    return {"project_id": str(project_id), "logs": logs}
+
+
+@router.post("/{project_id}/pause")
+async def pause_project(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Task 4.3: Pause project execution"""
+    from app.services.queue_manager import QueueManager
+    queue = QueueManager()
+    arjun = queue.get_active_arjun(str(project_id))
+    
+    if arjun:
+        await arjun.pause_pipeline()
+        return {"status": "paused"}
+    
+    raise HTTPException(404, "Project not actively running")
+
+
+@router.post("/{project_id}/resume")
+async def resume_project(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user)
+):
+    """Task 4.3: Resume paused project"""
+    from app.services.queue_manager import QueueManager
+    queue = QueueManager()
+    arjun = queue.get_active_arjun(str(project_id))
+    
+    if arjun:
+        await arjun.resume_pipeline()
+        return {"status": "resumed"}
+    
+    raise HTTPException(404, "Project not actively running")
+
+
+@router.post("/{project_id}/cancel")
+async def cancel_project(
+    project_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Task 4.3: Cancel project execution"""
+    project = db.query(Project).filter(Project.id == project_id, Project.user_id == current_user.id).first()
+    if not project:
+        raise HTTPException(404, "Project not found")
+        
+    project.status = "cancelled"
+    db.commit()
+    
+    from app.services.queue_manager import QueueManager
+    queue = QueueManager()
+    # Note: queue.cancel_project should be implemented in QueueManager if it doesn't exist
+    await queue.cancel_project(str(project_id))
+    
+    return {"status": "cancelled"}

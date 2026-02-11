@@ -55,7 +55,7 @@ class AIRateLimiter:
                 wait_time = (oldest + window) - current_time
                 
                 if wait_time > 0:
-                    logger.info(f"⏳ Rate limit for {provider}. Waiting {wait_time:.1f}s...")
+                    logger.info(f"[WAIT] Rate limit for {provider}. Waiting {wait_time:.1f}s...")
                     await asyncio.sleep(wait_time)
             
             # Record this call

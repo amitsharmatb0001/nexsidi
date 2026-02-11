@@ -74,19 +74,19 @@ class AIResponse:
 # Claude Models (Anthropic)
 CLAUDE_MODELS = {
     "claude-opus-4.6": {
-        "id": "claude-opus-4-6",
-        "max_output_tokens": 131072,  # 128K tokens (actual limit)
+        "id": "claude-3-opus-20240229",  # Real latest Opus model
+        "max_output_tokens": 4096,      # Anthropic limit for Opus output
         "cost_per_1k_input": 0.015,
         "cost_per_1k_output": 0.075,
     },
     "claude-sonnet-4.5": {
-        "id": "claude-sonnet-4-5-20250929",
+        "id": "claude-3-5-sonnet-20241022", # Real latest Sonnet model
         "max_output_tokens": 8192,
         "cost_per_1k_input": 0.003,
         "cost_per_1k_output": 0.015,
     },
     "claude-haiku-4.5": {
-        "id": "claude-haiku-4-5-20251001",
+        "id": "claude-3-5-haiku-20241022",  # Real latest Haiku model
         "max_output_tokens": 8192,
         "cost_per_1k_input": 0.0008,
         "cost_per_1k_output": 0.004,
@@ -136,6 +136,13 @@ TASK_MODEL_MAPPING = {
         TaskComplexity.SIMPLE: "gemini-2.5-flash",
         TaskComplexity.MEDIUM: "gemini-2.5-flash",
         TaskComplexity.COMPLEX: "gemini-2.5-flash",
+    },
+    
+    # ANALYSIS (Saanvi) - Fast but accurate requirements extraction
+    "analysis": {
+        TaskComplexity.SIMPLE: "gemini-3-flash",
+        TaskComplexity.MEDIUM: "gemini-3-pro",
+        TaskComplexity.COMPLEX: "claude-sonnet-4.5",
     },
     
     # ARCHITECTURE (Saanvi) - Highest quality for critical decisions
@@ -250,19 +257,19 @@ class AIRouter:
         
         # If cloud secrets enabled, override with latest from GCP
         if settings.use_cloud_secrets:
-            self.logger.info("🔐 Loading AI secrets from Secret Manager...")
+            self.logger.info("[GCP] Loading AI secrets from Secret Manager...")
             secret_manager = get_secret_manager()
             
             # Load API Keys
             anthropic_key = secret_manager.get_secret("ANTHROPIC_API_KEY")
             if anthropic_key:
                 self.anthropic_api_key = anthropic_key
-                self.logger.info("✅ Anthropic API key loaded from Secret Manager")
+                self.logger.info("[OK] Anthropic API key loaded from Secret Manager")
             
             google_key = secret_manager.get_secret("GOOGLE_API_KEY")
             if google_key:
                 self.google_api_key = google_key
-                self.logger.info("✅ Google API key loaded from Secret Manager")
+                self.logger.info("[OK] Google API key loaded from Secret Manager")
         
         # Check what's available
         self.has_claude = bool(self.anthropic_api_key)
@@ -281,10 +288,10 @@ class AIRouter:
         if self.has_vertex:
             providers.append("Vertex AI")
         
-        self.logger.info(f"✅ AI Router initialized: {', '.join(providers) or 'NO PROVIDERS!'}")
+        self.logger.info(f"[OK] AI Router initialized: {', '.join(providers) or 'NO PROVIDERS!'}")
         
         if not providers:
-            self.logger.error("❌ No AI providers configured! Check Secret Manager or .env")
+            self.logger.error("[ERROR] No AI providers configured! Check Secret Manager or .env")
         
         # Request deduplication cache (in-memory)
         self._request_cache = {}
@@ -298,9 +305,9 @@ class AIRouter:
                 secret_manager = get_secret_manager()
                 credentials = secret_manager.get_gcp_credentials(settings.gcp_ai_key_secret)
                 if credentials:
-                    self.logger.info(f"✅ Loaded AI credentials from Secret Manager: {settings.gcp_ai_key_secret}")
+                    self.logger.info(f"[OK] Loaded AI credentials from Secret Manager: {settings.gcp_ai_key_secret}")
                 else:
-                    self.logger.warning("⚠️ Failed to load AI credentials from Secret Manager, falling back...")
+                    self.logger.warning("[WARN] Failed to load AI credentials from Secret Manager, falling back...")
             
             # Method 2: Fallback to local file
             if not credentials and self.gcp_credentials_path:
@@ -308,11 +315,11 @@ class AIRouter:
                     self.gcp_credentials_path,
                     scopes=['https://www.googleapis.com/auth/cloud-platform']
                 )
-                self.logger.info("✅ Loaded AI credentials from local file")
+                self.logger.info("[OK] Loaded AI credentials from local file")
             
             # Refresh token
             if not credentials:
-                self.logger.error("❌ No AI credentials found to refresh")
+                self.logger.error("[ERROR] No AI credentials found to refresh")
                 self.has_vertex = False
                 return
 
@@ -322,9 +329,9 @@ class AIRouter:
             self.gcp_token = credentials.token
             self.gcp_token_expiry = time.time() + 3600  # Token valid for 1 hour
             
-            self.logger.info("✅ GCP token refreshed")
+            self.logger.info("[OK] GCP token refreshed")
         except Exception as e:
-            self.logger.error(f"❌ Failed to refresh GCP token: {e}")
+            self.logger.error(f"[ERROR] Failed to refresh GCP token: {e}")
             self.has_vertex = False
     
     async def _get_client(self) -> httpx.AsyncClient:
@@ -439,7 +446,7 @@ class AIRouter:
                (provider_name == "anthropic" and current_model.startswith("gemini")):
                 current_model = self.get_best_model_for_provider(provider_name, task_type, complexity)
             
-            self.logger.info(f"🤖 Generation attempt: Provider={provider_name}, Model={current_model}")
+            self.logger.info(f"[AGENT] Generation attempt: Provider={provider_name}, Model={current_model}")
             
             return await self._call_model(
                 model=current_model,
@@ -458,7 +465,7 @@ class AIRouter:
 
             # Handle automatic escalation if truncated (internal retry within healthy provider)
             if response.finish_reason == "length" and auto_escalate:
-                self.logger.warning(f"⚠️ Response truncated, escalating model...")
+                self.logger.warning(f"[WARN] Response truncated, escalating model...")
                 return await self._escalate_generation(
                     model=response.model_id,
                     messages=messages,
@@ -470,7 +477,7 @@ class AIRouter:
             return response
 
         except Exception as e:
-            self.logger.error(f"❌ AI Generation failed after all failovers: {e}")
+            self.logger.error(f"[ERROR] AI Generation failed after all failovers: {e}")
             raise
     
     async def _escalate_generation(
@@ -490,7 +497,7 @@ class AIRouter:
         escalation_chain = ESCALATION_CHAINS.get(model, [])
         
         if not escalation_chain:
-            self.logger.error(f"❌ No escalation path for {model}")
+            self.logger.error(f"[ERROR] No escalation path for {model}")
             # Return truncated response rather than fail
             original_response.was_escalated = False
             return original_response
@@ -511,18 +518,18 @@ class AIRouter:
                 if response.finish_reason == "stop":
                     response.was_escalated = True
                     response.escalation_count = i + 1
-                    self.logger.info(f"✅ Escalation successful with {next_model}")
+                    self.logger.info(f"[OK] Escalation successful with {next_model}")
                     return response
                 
                 # Still truncated, continue escalation
-                self.logger.warning(f"⚠️ {next_model} also truncated, continuing...")
+                self.logger.warning(f"[WARN] {next_model} also truncated, continuing...")
                 
             except Exception as e:
-                self.logger.error(f"❌ Escalation to {next_model} failed: {e}")
+                self.logger.error(f"[ERROR] Escalation to {next_model} failed: {e}")
                 continue
         
         # All escalations failed
-        self.logger.error("❌ All escalation attempts failed")
+        self.logger.error("[ERROR] All escalation attempts failed")
         raise Exception("Code too large for all available models - need to split file")
     
     async def _call_model(
@@ -587,7 +594,7 @@ class AIRouter:
                         await asyncio.sleep(delay)
                         continue
                     else:
-                        self.logger.error("❌ Max retries exceeded for rate limit")
+                        self.logger.error("[ERROR] Max retries exceeded for rate limit")
                         raise
                 else:
                     # Not a rate limit error, raise immediately

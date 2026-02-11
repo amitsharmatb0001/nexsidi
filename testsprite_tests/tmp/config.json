@@ -1,0 +1,18 @@
+{
+  "status": "commited",
+  "type": "backend",
+  "scope": "codebase",
+  "localEndpoint": "http://localhost:8000",
+  "backendAuthType": "public",
+  "executionArgs": {
+    "projectName": "nexsidi",
+    "projectPath": "E:\\nexsidi",
+    "testIds": [],
+    "additionalInstruction": "",
+    "envs": {
+      "API_KEY": "sk-user-I78F3KyjE53YLHvkG3VIQCA4AZnc8SijxueB75tMiyjgH7JWck_A4dVegaKRB-fxpUFkWculM6RD1uelsvu2T77niB4dVz7-5UAT56wRQRxl317JPr_JNRZOGyCayUfvmXQ"
+    }
+  },
+  "serverPort": 50330,
+  "proxy": "http://386f03ab-6ad4-4358-be51-e4d76d0eb755:LT28k6ZdWNCrS3wj08E9t9IJd8XboA5q@tun.testsprite.com:8080"
+}

@@ -96,7 +96,7 @@ class BrandAgent(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixi
         """
         try:
             self.total_evaluations += 1
-            self.logger.info(f"🎨 Starting brand evaluation #{self.total_evaluations} (HTML mode)")
+            self.logger.info(f"[DESIGN] Starting brand evaluation #{self.total_evaluations} (HTML mode)")
             
             # Build text-based evaluation prompt
             prompt = f"""You are BRAND AGENT evaluating HTML/code design quality.
@@ -145,7 +145,7 @@ IMPORTANT: Return ONLY valid JSON."""
             )
             
             self.logger.info(
-                f"✅ {response.output_tokens} tokens, "
+                f"[OK] {response.output_tokens} tokens, "
                 f"₹{response.cost_estimate:.4f}"
             )
             
@@ -175,11 +175,11 @@ IMPORTANT: Return ONLY valid JSON."""
             return result
             
         except json.JSONDecodeError as e:
-            self.logger.error(f"❌ Invalid JSON response: {e}")
+            self.logger.error(f"[ERROR] Invalid JSON response: {e}")
             return self._error_response("Failed to parse AI response")
             
         except Exception as e:
-            self.logger.error(f"❌ Brand evaluation failed: {e}")
+            self.logger.error(f"[ERROR] Brand evaluation failed: {e}")
             raise
     
     async def evaluate_screenshots(
@@ -202,7 +202,7 @@ IMPORTANT: Return ONLY valid JSON."""
         """
         try:
             self.total_evaluations += 1
-            self.logger.info(f"🎨 Starting visual evaluation #{self.total_evaluations}")
+            self.logger.info(f"[DESIGN] Starting visual evaluation #{self.total_evaluations}")
             
             # Load and encode screenshots
             await self._send_progress("design_validation", 20, "Loading screenshots and preparing visual analysis pipeline...")
@@ -235,7 +235,7 @@ IMPORTANT: Return ONLY valid JSON."""
             
             # Log cost
             self.logger.info(
-                f"✅ {response.output_tokens} tokens, "
+                f"[OK] {response.output_tokens} tokens, "
                 f"₹{response.cost_estimate:.4f}"
             )
             
@@ -272,11 +272,11 @@ IMPORTANT: Return ONLY valid JSON."""
             return result
             
         except json.JSONDecodeError as e:
-            self.logger.error(f"❌ Invalid JSON response: {e}")
+            self.logger.error(f"[ERROR] Invalid JSON response: {e}")
             return self._error_response("Failed to parse AI response")
             
         except Exception as e:
-            self.logger.error(f"❌ Brand evaluation failed: {e}")
+            self.logger.error(f"[ERROR] Brand evaluation failed: {e}")
             raise
     
     def _encode_image(self, image_path: str) -> str:
@@ -373,11 +373,11 @@ EVALUATION CRITERIA (Score each 0-10):
    - Would you recognize this brand if you saw it again?
    
    Red Flags (reduce score):
-   ❌ Generic stock photos (overused business imagery)
-   ❌ Default template colors (Bootstrap blue, grey, white only)
-   ❌ Standard navbar + hero + 3-column features layout
-   ❌ Generic icons without customization
-   ❌ Lorem ipsum or placeholder content visible
+   [ERROR] Generic stock photos (overused business imagery)
+   [ERROR] Default template colors (Bootstrap blue, grey, white only)
+   [ERROR] Standard navbar + hero + 3-column features layout
+   [ERROR] Generic icons without customization
+   [ERROR] Lorem ipsum or placeholder content visible
    
    Green Flags (increase score):
    ✓ Custom color palette (distinctive brand colors)

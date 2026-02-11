@@ -64,7 +64,7 @@ class ProjectBrain:
         - Hot spots (frequently modified)
         """
         
-        self.logger.info(f"🧠 Analyzing project: {self.code_dir}")
+        self.logger.info(f"[AI] Analyzing project: {self.code_dir}")
         
         # Find all code files
         code_files = self._find_code_files()
@@ -89,7 +89,7 @@ class ProjectBrain:
         }
         
         self.logger.info(
-            f"✅ Analysis complete: {analysis['total_files']} files, "
+            f"[OK] Analysis complete: {analysis['total_files']} files, "
             f"{analysis['total_dependencies']} dependencies"
         )
         
@@ -283,7 +283,7 @@ class ProjectBrain:
                 self._parse_javascript(filepath, content, rel_path)
             
         except Exception as e:
-            self.logger.warning(f"⚠️ Failed to parse {filepath}: {e}")
+            self.logger.warning(f"[WARN] Failed to parse {filepath}: {e}")
     
     def _parse_python(self, filepath: Path, content: str, rel_path: str):
         """Parse Python file for imports"""
@@ -428,7 +428,7 @@ class ProjectBrain:
 
 if __name__ == "__main__":
     # Test project brain
-    print("🧠 Testing ProjectBrain...")
+    print("[AI] Testing ProjectBrain...")
     
     # Create test project structure
     test_dir = Path("/tmp/test_project")
@@ -458,7 +458,7 @@ class User:
     brain = ProjectBrain("test-001", str(test_dir))
     analysis = brain.analyze_project()
     
-    print(f"\n📊 Analysis:")
+    print(f"\n[STATS] Analysis:")
     print(f"  Files: {analysis['total_files']}")
     print(f"  Dependencies: {analysis['total_dependencies']}")
     print(f"  Complexity: {analysis['complexity_score']}")
@@ -474,4 +474,4 @@ class User:
     print(f"  Affected files: {impact['affected_files']}")
     print(f"  Risk level: {impact['risk_level']}")
     
-    print("\n✅ ProjectBrain test complete!")
+    print("\n[OK] ProjectBrain test complete!")

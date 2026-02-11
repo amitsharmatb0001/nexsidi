@@ -134,7 +134,7 @@ class SecretManager:
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to store {name} in GCP: {e}")
+            self.logger.error(f"[ERROR] Failed to store {name} in GCP: {e}")
             return False
 
     def get_gcp_credentials(self, secret_name: str) -> Optional[service_account.Credentials]:

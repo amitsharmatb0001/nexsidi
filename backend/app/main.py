@@ -54,22 +54,22 @@ async def lifespan(app: FastAPI):
     rate_limiter.start_cleanup()
     
     print("=" * 60)
-    print("🚀 NexSidi API Starting Up...")
+    print("NexSidi API Starting Up...")
     print("=" * 60)
-    print(f"📊 Database: {os.getenv('DATABASE_URL', 'Not configured')[:50]}...")
-    print(f"🔐 JWT Secret: {'Configured' if os.getenv('JWT_SECRET') else 'Using default (NOT SECURE!)'}")
-    print(f"🤖 Anthropic API: {'Configured' if os.getenv('ANTHROPIC_API_KEY') else 'Not configured'}")
-    print(f"🤖 Google API: {'Configured' if os.getenv('GOOGLE_API_KEY') else 'Not configured'}")
+    print(f"DB: {os.getenv('DATABASE_URL', 'Not configured')[:50]}...")
+    print(f"JWT: {'Configured' if os.getenv('JWT_SECRET') else 'Using default (NOT SECURE!)'}")
+    print(f"Anthropic: {'Configured' if os.getenv('ANTHROPIC_API_KEY') else 'Not configured'}")
+    print(f"Google: {'Configured' if os.getenv('GOOGLE_API_KEY') else 'Not configured'}")
     print("=" * 60)
-    print("✅ Server Ready!")
-    print("📚 API Documentation: http://localhost:8000/docs")
+    print("Server Ready!")
+    print("Docs: http://localhost:8000/docs")
     print("=" * 60)
     
     yield
     
     # SHUTDOWN
     print("\n" + "=" * 60)
-    print("👋 NexSidi API Shutting Down...")
+    print("NexSidi API Shutting Down...")
     print("=" * 60)
 
 # Create FastAPI application with lifespan

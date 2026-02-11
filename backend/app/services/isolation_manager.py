@@ -21,10 +21,10 @@ class IsolationManager:
         try:
             self.docker_client = docker.from_env()
             self.docker_client.ping()
-            self.logger.info("✅ Connected to Docker daemon")
+            self.logger.info("[OK] Connected to Docker daemon")
             self.connected = True
         except Exception as e:
-            self.logger.warning(f"⚠️ Docker unavailable: {e}")
+            self.logger.warning(f"[WARN] Docker unavailable: {e}")
             self.docker_client = None
             self.connected = False
     
@@ -84,7 +84,7 @@ class IsolationManager:
             # Check if container already exists
             try:
                 existing = self.docker_client.containers.get(container_name)
-                self.logger.warning(f"⚠️ Container {container_name} already exists, removing...")
+                self.logger.warning(f"[WARN] Container {container_name} already exists, removing...")
                 existing.remove(force=True)
             except docker.errors.NotFound:
                 pass
@@ -101,7 +101,7 @@ class IsolationManager:
                 security_opt.append(f"seccomp={seccomp_profile_path.absolute()}")
                 self.logger.info("🔒 Seccomp-bpf filter enabled")
             else:
-                self.logger.warning("⚠️ Seccomp profile not found, using default")
+                self.logger.warning("[WARN] Seccomp profile not found, using default")
             
             # Docker with enhanced security constraints
             container = self.docker_client.containers.run(
@@ -146,7 +146,7 @@ class IsolationManager:
             }
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to create isolated environment: {e}")
+            self.logger.error(f"[ERROR] Failed to create isolated environment: {e}")
             return {"status": "error", "error": str(e)}
 
     def execute_in_container(self, container_id: str, command: str, timeout: int = 300) -> Dict[str, Any]:
@@ -186,7 +186,7 @@ class IsolationManager:
             }
             
         except Exception as e:
-            self.logger.error(f"❌ Execution failed: {e}")
+            self.logger.error(f"[ERROR] Execution failed: {e}")
             return {"status": "error", "error": str(e)}
     
     def start_service(self, container_id: str, command: str, port: int) -> Dict[str, Any]:
@@ -203,7 +203,7 @@ class IsolationManager:
             except docker.errors.NotFound:
                 container = self.docker_client.containers.get(f"nexsidi-{container_id}")
             
-            self.logger.info(f"🚀 Starting service in {container.name}: {command}")
+            self.logger.info(f"[START] Starting service in {container.name}: {command}")
             
             # Execute in background
             container.exec_run(
@@ -218,7 +218,7 @@ class IsolationManager:
                 "url": f"http://localhost:{port}"
             }
         except Exception as e:
-            self.logger.error(f"❌ Failed to start service: {e}")
+            self.logger.error(f"[ERROR] Failed to start service: {e}")
             return {"status": "error", "error": str(e)}
     
     def destroy_environment(self, project_id: str) -> bool:
@@ -232,7 +232,7 @@ class IsolationManager:
             True if successful, False otherwise
         """
         if not self.connected:
-            self.logger.warning("⚠️ Docker not available, skipping container cleanup")
+            self.logger.warning("[WARN] Docker not available, skipping container cleanup")
             return False
         
         container_name = f"nexsidi-{project_id}"
@@ -253,10 +253,10 @@ class IsolationManager:
             return True
             
         except docker.errors.NotFound:
-            self.logger.warning(f"⚠️ Container not found: {container_name}")
+            self.logger.warning(f"[WARN] Container not found: {container_name}")
             return False
         except Exception as e:
-            self.logger.error(f"❌ Failed to destroy environment: {e}")
+            self.logger.error(f"[ERROR] Failed to destroy environment: {e}")
             return False
     
     def get_container_stats(self, project_id: str) -> Optional[Dict[str, Any]]:
@@ -298,10 +298,10 @@ class IsolationManager:
             }
             
         except docker.errors.NotFound:
-            self.logger.error(f"❌ Container not found: {container_name}")
+            self.logger.error(f"[ERROR] Container not found: {container_name}")
             return None
         except Exception as e:
-            self.logger.error(f"❌ Failed to get stats: {e}")
+            self.logger.error(f"[ERROR] Failed to get stats: {e}")
             return None
 
 # Global instance

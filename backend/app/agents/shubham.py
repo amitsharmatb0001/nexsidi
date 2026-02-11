@@ -210,7 +210,7 @@ class Shubham(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         - fix_bugs: Fix specific bugs in existing code
         """
         mode = input_data.get("mode", "generate_backend")
-        self.logger.info(f"🚀 Shubham executing in mode: {mode}")
+        self.logger.info(f"[START] Shubham executing in mode: {mode}")
         
         try:
             if mode == "fix_bugs":
@@ -222,7 +222,7 @@ class Shubham(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
                 return await self.generate_backend(architecture)
                 
         except Exception as e:
-            self.logger.error(f"❌ Execution failed: {e}")
+            self.logger.error(f"[ERROR] Execution failed: {e}")
             raise e
 
     async def _handle_fix_bugs_mode(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -295,7 +295,7 @@ FIXED CODE:
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for bug fixing")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for bug fixing")
 
         # Call AI Router for targeted fix
         try:
@@ -419,12 +419,17 @@ FIXED CODE:
         
         await self._send_progress("generating_backend", 100, "Backend generation complete.")
         
-        # Re-confirm files written (BUG #3 Fix)
+        # Re-confirm files written (Task 3.2 Fix)
         files_written = all(os.path.exists(os.path.join(self.workspace['code_dir'], r.file_path)) for r in results)
         
+        # Final sanity check - were any files actually created?
+        if not results:
+            files_written = False
+
         return {
             "project_id": self.project_id,
             "files_written": files_written,
+            "files_count": len(results),
             "backend_url": "", # Will be set by Arjun if starting server
             "api_architecture": architecture.get("api", {}),
             "workspace_path": self.workspace['code_dir']
@@ -456,7 +461,7 @@ FIXED CODE:
             GeneratedFile with content and metadata
         """
         
-        self.logger.info(f"📝 Generating file: {request.file_path}")
+        self.logger.info(f"[LOG] Generating file: {request.file_path}")
         
         # Step 1: Create prompt
         base_prompt = self._create_generation_prompt(request)
@@ -480,7 +485,7 @@ FIXED CODE:
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings")
         
         # Step 2: Get token limit for this file type
         max_tokens = TOKEN_LIMITS.get(request.file_type, 4000)
@@ -508,7 +513,7 @@ FIXED CODE:
             # Step 5.1: If syntax invalid, search for solution
             if not is_valid:
                 error_msg = syntax_errors[0] if syntax_errors else "Unknown syntax error"
-                self.logger.info(f"🔍 Syntax error detected, searching for solution: {error_msg}")
+                self.logger.info(f"[FIND] Syntax error detected, searching for solution: {error_msg}")
                 
                 search_result = await self.search_for_solution(
                     query=f"Python syntax error: {error_msg}",
@@ -516,7 +521,7 @@ FIXED CODE:
                 )
                 
                 if search_result.get("findings"):
-                    self.logger.info(f"💡 Found potential solution via web search")
+                    self.logger.info(f"[TIP] Found potential solution via web search")
                     # We could potentially retry here, but the requirement was to add the capability.
                     # The user example says "# Retry with search context", but I'll stick to inheriting the capability first.
                     # Actually, let's implement a simple retry if search found something.
@@ -544,12 +549,12 @@ FIXED CODE:
                 # Still truncated after escalation - need to split
                 if request.file_type in SPLITTABLE_FILE_TYPES:
                     self.logger.warning(
-                        f"⚠️ File {request.file_path} too large, splitting..."
+                        f"[WARN] File {request.file_path} too large, splitting..."
                     )
                     return await self._split_and_generate(request)
                 else:
                     # Can't split this file type
-                    self.logger.error(f"❌ File {request.file_path} too large and not splittable")
+                    self.logger.error(f"[ERROR] File {request.file_path} too large and not splittable")
             
             # Step 7: WRITE TO DISK (BUG #3 Fix)
             full_path = os.path.join(
@@ -564,7 +569,7 @@ FIXED CODE:
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(clean_content)
             
-            self.logger.info(f"✅ Written: {full_path}")
+            self.logger.info(f"[OK] Written: {full_path}")
             
             # Commit to git
             git_service.commit_agent_work(
@@ -575,7 +580,7 @@ FIXED CODE:
             
             # Verify file exists
             if not os.path.exists(full_path):
-                raise FileNotFoundError(f"❌ File was not written: {full_path}")
+                raise FileNotFoundError(f"[ERROR] File was not written: {full_path}")
 
             # Step 8: Create result
             result = GeneratedFile(
@@ -593,20 +598,20 @@ FIXED CODE:
             
             if is_valid:
                 self.logger.info(
-                    f"✅ Generated {request.file_path}: "
+                    f"[OK] Generated {request.file_path}: "
                     f"{response.total_tokens} tokens, "
                     f"₹{response.cost_estimate:.4f}"
                 )
             else:
                 self.logger.warning(
-                    f"⚠️ Generated {request.file_path} with syntax errors: "
+                    f"[WARN] Generated {request.file_path} with syntax errors: "
                     f"{syntax_errors}"
                 )
             
             return result
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to generate {request.file_path}: {e}")
+            self.logger.error(f"[ERROR] Failed to generate {request.file_path}: {e}")
             raise
     
     async def generate_multiple_files(
@@ -648,7 +653,7 @@ FIXED CODE:
         failed = sum(1 for r in results if not r.validation_passed)
         
         self.logger.info(
-            f"✅ Generated {len(results)} files: "
+            f"[OK] Generated {len(results)} files: "
             f"{total_tokens} tokens, "
             f"₹{total_cost:.2f}, "
             f"{failed} validation failures"
@@ -860,12 +865,12 @@ SECURITY SPECIFIC REQUIREMENTS:
             
         except SyntaxError as e:
             error_msg = f"Line {e.lineno}: {e.msg}"
-            self.logger.warning(f"⚠️ Syntax error in {file_path}: {error_msg}")
+            self.logger.warning(f"[WARN] Syntax error in {file_path}: {error_msg}")
             return False, [error_msg]
         
         except Exception as e:
             error_msg = f"Validation error: {str(e)}"
-            self.logger.warning(f"⚠️ Validation failed for {file_path}: {error_msg}")
+            self.logger.warning(f"[WARN] Validation failed for {file_path}: {error_msg}")
             return False, [error_msg]
     
     def _detect_truncation(self, code: str) -> bool:
@@ -970,7 +975,7 @@ SECURITY SPECIFIC REQUIREMENTS:
             # Check if class exists (check both singular and plural)
             if (expected_class not in generated_classes_lower and
                 table_name.lower() not in generated_classes_lower):
-                self.logger.warning(f"⚠️ Missing model for table '{table_name}'")
+                self.logger.warning(f"[WARN] Missing model for table '{table_name}'")
                 missing.append(table_name)
         
         return missing
@@ -1234,10 +1239,10 @@ SECURITY SPECIFIC REQUIREMENTS:
                     check=True
                 )
             
-            self.logger.info("✅ Backend setup complete!")
+            self.logger.info("[OK] Backend setup complete!")
                 
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Backend setup failed: {e}")
+            self.logger.error(f"[ERROR] Backend setup failed: {e}")
             raise
 
 
@@ -1281,7 +1286,7 @@ class TilotmaValidator:
             ValidationResult with pass/fail and feedback
         """
         
-        self.logger.info(f"🔍 Validating {file.file_path}...")
+        self.logger.info(f"[FIND] Validating {file.file_path}...")
         
         # Skip validation if syntax already invalid
         if not file.syntax_valid:
@@ -1343,7 +1348,7 @@ Respond in JSON format:
             )
             
         except Exception as e:
-            self.logger.error(f"❌ Validation failed: {e}")
+            self.logger.error(f"[ERROR] Validation failed: {e}")
             # If validation fails, assume code is okay (fail-open)
             return ValidationResult(
                 is_valid=True,

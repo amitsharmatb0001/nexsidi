@@ -1,0 +1,52 @@
+[
+  {
+    "id": "TC001",
+    "title": "test_root_endpoint_returns_api_information",
+    "description": "Verify that the root endpoint returns a welcome message along with API version, status, documentation URL, and description as expected."
+  },
+  {
+    "id": "TC002",
+    "title": "test_health_check_endpoint_returns_system_status",
+    "description": "Verify that the /health endpoint returns the current health status, queue size, and any alerts in the system."
+  },
+  {
+    "id": "TC003",
+    "title": "test_user_signup_with_valid_and_duplicate_email",
+    "description": "Test the user signup endpoint to ensure new users can register with valid email and password, and that duplicate email registration is rejected with appropriate error."
+  },
+  {
+    "id": "TC004",
+    "title": "test_user_login_with_valid_and_invalid_credentials",
+    "description": "Test the user login endpoint to verify that valid credentials return an access token and invalid credentials return an unauthorized error."
+  },
+  {
+    "id": "TC005",
+    "title": "test_create_project_with_valid_data",
+    "description": "Verify that a new project can be created successfully when valid title and description are provided by an authenticated user."
+  },
+  {
+    "id": "TC006",
+    "title": "test_send_message_to_tilotma_agent_and_receive_response",
+    "description": "Test sending a message to the Tilotma AI agent via the chat send endpoint and verify that a valid AI response is returned including flags for project creation and cost."
+  },
+  {
+    "id": "TC007",
+    "title": "test_file_upload_single_and_multiple_files",
+    "description": "Verify that single and multiple file upload endpoints accept files correctly and associate them with the specified project."
+  },
+  {
+    "id": "TC008",
+    "title": "test_deploy_project_and_check_deployment_status",
+    "description": "Test the project deployment endpoint to ensure deployment to GCP Cloud Run is initiated and that deployment status can be retrieved correctly."
+  },
+  {
+    "id": "TC009",
+    "title": "test_approve_reject_and_request_changes_on_checkpoints",
+    "description": "Verify the checkpoint approval workflow endpoints to approve, reject with feedback, and request changes with required feedback on project checkpoints."
+  },
+  {
+    "id": "TC010",
+    "title": "test_websocket_connection_for_real_time_project_updates",
+    "description": "Test establishing a WebSocket connection to receive real-time updates on project status and activities for a given project ID."
+  }
+]

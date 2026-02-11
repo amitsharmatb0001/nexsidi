@@ -121,7 +121,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             
             # Log cost
             self.logger.info(
-                f"✅ {response.output_tokens} tokens, "
+                f"[OK] {response.output_tokens} tokens, "
                 f"₹{response.cost_estimate:.4f}"
             )
             
@@ -152,11 +152,11 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             return result
             
         except json.JSONDecodeError as e:
-            self.logger.error(f"❌ Invalid JSON response: {e}")
+            self.logger.error(f"[ERROR] Invalid JSON response: {e}")
             return self._error_response("Failed to parse AI response")
             
         except Exception as e:
-            self.logger.error(f"❌ Performance review failed: {e}")
+            self.logger.error(f"[ERROR] Performance review failed: {e}")
             await self.record_failure(
                 task_type="adversarial_performance",
                 error=str(e),
@@ -176,7 +176,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             reward: Reward score (issue count + impact weighting)
             strategy: "maximization" (find more performance issues)
         """
-        self.logger.info(f"📚 Learning from feedback: reward={reward}, strategy={strategy}")
+        self.logger.info(f"[LOAD] Learning from feedback: reward={reward}, strategy={strategy}")
         
         # Track learning history
         self.learning_history.append({
@@ -192,7 +192,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             if reward >= 6:
                 # Excellent performance analysis
                 self.current_strategy_score += 2.0
-                self.logger.info("✅ Excellent - identified major bottlenecks!")
+                self.logger.info("[OK] Excellent - identified major bottlenecks!")
                 
             elif reward >= 3:
                 # Good analysis
@@ -202,7 +202,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
             else:
                 # Need deeper analysis
                 self.current_strategy_score -= 0.5
-                self.logger.info("⚠️ Low reward - think about scalability more!")
+                self.logger.info("[WARN] Low reward - think about scalability more!")
         
         # Store learning in mistake memory
         mistake_memory.record_failure(
@@ -214,7 +214,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
         
         # Log current learning state
         self.logger.info(
-            f"📊 Learning state: strategy_score={self.current_strategy_score:.2f}, "
+            f"[STATS] Learning state: strategy_score={self.current_strategy_score:.2f}, "
             f"critical_issues={self.critical_impact_count}, history_size={len(self.learning_history)}"
         )
     
@@ -254,7 +254,7 @@ class DeepikaAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManage
         # Step 2: Incorporate past mistakes (from MistakeMemoryMixin)
         if past_mistakes:
             base_prompt = self.incorporate_past_learnings(past_mistakes, base_prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past mistakes into performance review prompt")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past mistakes into performance review prompt")
         
         return base_prompt
 

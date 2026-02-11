@@ -109,7 +109,7 @@ class TilotmaMemory:
         )
         
         if memory_data:
-            self.logger.info("📚 Loading Tilotma's existing memory...")
+            self.logger.info("[LOAD] Loading Tilotma's existing memory...")
             
             # Load conversation history
             if "conversation_history" in memory_data:
@@ -171,7 +171,7 @@ class TilotmaMemory:
             memory_data
         )
         
-        self.logger.info("💾 Tilotma's memory saved")
+        self.logger.info("[SAVE] Tilotma's memory saved")
     
     def add_conversation(
         self,

@@ -35,7 +35,34 @@ from fastapi import Request
 # Create router
 # A "router" is like a section of your restaurant's menu
 # This router handles all /api/chat/* URLs
+# Create router
 router = APIRouter()
+
+
+@router.get("/", response_model=List[dict])
+async def list_chats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Task 4.1: List all user chats"""
+    from app.models import Chat
+    chats = db.query(Chat).filter(Chat.user_id == current_user.id).order_by(Chat.updated_at.desc()).all()
+    return [{"id": str(c.id), "title": c.title, "updated_at": c.updated_at} for c in chats]
+
+
+@router.post("/new", response_model=dict)
+async def create_chat(
+    title: str = "New Project Chat",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Task 4.1: Create a new chat session"""
+    from app.models import Chat
+    chat = Chat(user_id=current_user.id, title=title)
+    db.add(chat)
+    db.commit()
+    db.refresh(chat)
+    return {"id": str(chat.id), "title": chat.title}
 
 
 @router.post("/send", response_model=dict)
@@ -93,11 +120,25 @@ async def send_message(
     await rate_limiter.check(request)
     
     # Create Tilotma agent (Stateless initialization)
-    # We must manually restore context from DB because agent is ephemeral
     tilotma = Tilotma(
         project_id=str(message_data.project_id) if message_data.project_id else str(uuid4()),
         user_id=str(current_user.id)
     )
+    
+    # Task 4.1 Handle Chat ID (if provided) or create default
+    chat_id = getattr(message_data, 'chat_id', None)
+    if not chat_id and not message_data.project_id:
+        from app.models import Chat
+        # Find latest or create
+        latest_chat = db.query(Chat).filter(Chat.user_id == current_user.id).order_by(Chat.updated_at.desc()).first()
+        if latest_chat:
+            chat_id = latest_chat.id
+        else:
+            new_chat = Chat(user_id=current_user.id, title="Default Chat")
+            db.add(new_chat)
+            db.commit()
+            db.refresh(new_chat)
+            chat_id = new_chat.id
     
     # RESTORE CONTEXT FROM DB
     # -----------------------
@@ -159,12 +200,18 @@ async def send_message(
             id=uuid4(),
             user_id=current_user.id,
             project_id=message_data.project_id,
+            chat_id=chat_id,
             role='user',
             content=message_data.content,
             agent_name='tilotma',
             created_at=datetime.utcnow()
         )
         db.add(user_msg)
+        
+        # Update Chat timestamp
+        if chat_id:
+            from app.models import Chat
+            db.query(Chat).filter(Chat.id == chat_id).update({"updated_at": datetime.utcnow()})
         
         # 2. Save Assistant Response
         # Extract tokens and cost from Tilotma's result metadata
@@ -187,7 +234,7 @@ async def send_message(
     except Exception as e:
         db.rollback()
         import logging
-        logging.getLogger("chat").error(f"❌ DATABASE SAVE FAILURE: {str(e)}", exc_info=True)
+        logging.getLogger("chat").error(f"[ERROR] DATABASE SAVE FAILURE: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save messages to database: {str(e)}"
@@ -209,7 +256,7 @@ async def send_message(
     # Using Tilotma's internal state detection
     should_create = (
         hasattr(tilotma, 'phase') and 
-        tilotma.phase == ConversationPhase.READY_FOR_EXECUTION
+        (tilotma.phase == ConversationPhase.READY_FOR_EXECUTION or tilotma.phase.value == "ready_for_execution")
     )
     
     if should_create:

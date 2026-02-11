@@ -47,7 +47,7 @@ class PromptEngine:
             task_prompts = agent_prompts.get(task_type, {})
             
             if not task_prompts:
-                self.logger.warning(f"⚠️ Prompt not found: {agent_name}/{task_type}")
+                self.logger.warning(f"[WARN] Prompt not found: {agent_name}/{task_type}")
                 return f"Error: Prompt template not found for {agent_name}/{task_type}"
                 
             if version == "latest":
@@ -57,7 +57,7 @@ class PromptEngine:
                 template = task_prompts.get(version)
 
         if not template:
-            self.logger.warning(f"⚠️ Prompt version not found: {agent_name}/{task_type} v{version}")
+            self.logger.warning(f"[WARN] Prompt version not found: {agent_name}/{task_type} v{version}")
             return f"Error: Prompt version {version} not found"
             
         # Inject context
@@ -90,7 +90,7 @@ class PromptEngine:
             return prompt_template.format(**safe_context)
             
         except Exception as e:
-            self.logger.error(f"❌ formatting failed: {e}")
+            self.logger.error(f"[ERROR] formatting failed: {e}")
             return prompt_template
     
     def register_prompt(self, agent_name: str, task_type: str, 
@@ -113,7 +113,7 @@ class PromptEngine:
             metadata={"version_name": version}
         )
         
-        self.logger.info(f"📝 Registered prompt: {agent_name}/{task_type} v{version} (ID: {version_id})")
+        self.logger.info(f"[LOG] Registered prompt: {agent_name}/{task_type} v{version} (ID: {version_id})")
     
     def load_default_prompts(self):
         """Load default prompts for all agents"""

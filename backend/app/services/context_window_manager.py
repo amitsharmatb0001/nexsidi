@@ -76,7 +76,7 @@ class ContextWindowManager:
             }
         
         self.logger.warning(
-            f"⚠️ Context window at {token_count}/{limit} tokens "
+            f"[WARN] Context window at {token_count}/{limit} tokens "
             f"({token_count/limit*100:.0f}%) for {agent_name}. "
             f"Triggering auto-summarize."
         )
@@ -143,7 +143,7 @@ CRITICAL STATE:
 """
         
         self.logger.info(
-            f"✅ Context summarized for {agent_name}: "
+            f"[OK] Context summarized for {agent_name}: "
             f"{self.count_tokens(current_context)} → {self.count_tokens(fresh_context)} tokens"
         )
         

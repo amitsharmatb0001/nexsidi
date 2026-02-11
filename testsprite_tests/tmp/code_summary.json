@@ -1,0 +1,1105 @@
+{
+  "tech_stack": [
+    "Python",
+    "FastAPI",
+    "PostgreSQL",
+    "SQLite",
+    "Redis",
+    "Celery",
+    "SQLAlchemy",
+    "Anthropic API",
+    "Google Generative AI",
+    "JWT Authentication",
+    "WebSocket",
+    "GCP Cloud Run",
+    "Docker"
+  ],
+  "features": [
+    {
+      "name": "Root Endpoint",
+      "description": "Welcome endpoint that returns API information",
+      "files": ["backend/app/main.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/": {
+            "get": {
+              "summary": "Root endpoint",
+              "description": "Returns welcome message and API information",
+              "responses": {
+                "200": {
+                  "description": "Success",
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "type": "object",
+                        "properties": {
+                          "message": {"type": "string"},
+                          "version": {"type": "string"},
+                          "status": {"type": "string"},
+                          "docs": {"type": "string"},
+                          "description": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Health Check",
+      "description": "Health check endpoint for monitoring",
+      "files": ["backend/app/main.py", "backend/app/api/health.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/health": {
+            "get": {
+              "summary": "Health check",
+              "description": "Quick health check endpoint",
+              "responses": {
+                "200": {
+                  "description": "Health status",
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "type": "object",
+                        "properties": {
+                          "status": {"type": "string"},
+                          "queue_size": {"type": "integer"},
+                          "alerts": {"type": "array"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "/api/health/detailed": {
+            "get": {
+              "summary": "Detailed health check",
+              "description": "Detailed system health information",
+              "responses": {
+                "200": {
+                  "description": "Detailed health data"
+                }
+              }
+            }
+          },
+          "/api/health/system": {
+            "get": {
+              "summary": "System statistics",
+              "description": "System resource statistics",
+              "responses": {
+                "200": {
+                  "description": "System stats"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Authentication",
+      "description": "User authentication endpoints for signup, login, and user info",
+      "files": ["backend/app/api/auth.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/auth/signup": {
+            "post": {
+              "summary": "User signup",
+              "description": "Register a new user account",
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["email", "password"],
+                      "properties": {
+                        "email": {"type": "string", "format": "email"},
+                        "password": {"type": "string"},
+                        "name": {"type": "string"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "201": {
+                  "description": "User created successfully"
+                },
+                "400": {
+                  "description": "Email already exists"
+                }
+              }
+            }
+          },
+          "/api/auth/login": {
+            "post": {
+              "summary": "User login",
+              "description": "Authenticate user and return access token",
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["email", "password"],
+                      "properties": {
+                        "email": {"type": "string", "format": "email"},
+                        "password": {"type": "string"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "Login successful",
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "type": "object",
+                        "properties": {
+                          "access_token": {"type": "string"},
+                          "token_type": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                },
+                "401": {
+                  "description": "Invalid credentials"
+                }
+              }
+            }
+          },
+          "/api/auth/me": {
+            "get": {
+              "summary": "Get current user",
+              "description": "Get currently authenticated user's information",
+              "security": [{"bearerAuth": []}],
+              "responses": {
+                "200": {
+                  "description": "User information"
+                },
+                "401": {
+                  "description": "Unauthorized"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Projects",
+      "description": "Project management endpoints for creating, listing, getting, deleting projects and managing project status",
+      "files": ["backend/app/api/projects.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/projects": {
+            "post": {
+              "summary": "Create project",
+              "description": "Create a new project",
+              "security": [{"bearerAuth": []}],
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["title", "description"],
+                      "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "201": {
+                  "description": "Project created"
+                }
+              }
+            },
+            "get": {
+              "summary": "List projects",
+              "description": "Get all projects for current user",
+              "security": [{"bearerAuth": []}],
+              "responses": {
+                "200": {
+                  "description": "List of projects"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}": {
+            "get": {
+              "summary": "Get project",
+              "description": "Get specific project details",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Project details"
+                },
+                "404": {
+                  "description": "Project not found"
+                }
+              }
+            },
+            "delete": {
+              "summary": "Delete project",
+              "description": "Delete a project and all related data",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "204": {
+                  "description": "Project deleted"
+                },
+                "404": {
+                  "description": "Project not found"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/status": {
+            "get": {
+              "summary": "Get project status",
+              "description": "Get project processing status and queue position",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Project status"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/download": {
+            "get": {
+              "summary": "Download project",
+              "description": "Download complete project package as ZIP",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "ZIP file download"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/code/stream": {
+            "get": {
+              "summary": "Stream code generation",
+              "description": "Stream code generation in real-time via SSE",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Event stream"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/files": {
+            "get": {
+              "summary": "Get file tree",
+              "description": "Get project file tree structure",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "File tree structure"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/code/{filepath}": {
+            "get": {
+              "summary": "Get file content",
+              "description": "Read any generated file",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                },
+                {
+                  "name": "filepath",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "File content"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/agent-logs": {
+            "get": {
+              "summary": "Get agent logs",
+              "description": "Get agent conversation and activity logs",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Agent logs"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/pause": {
+            "post": {
+              "summary": "Pause project",
+              "description": "Pause project execution",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Project paused"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/resume": {
+            "post": {
+              "summary": "Resume project",
+              "description": "Resume paused project",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Project resumed"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/cancel": {
+            "post": {
+              "summary": "Cancel project",
+              "description": "Cancel project execution",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Project cancelled"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Chat",
+      "description": "Chat endpoints for communicating with Tilotma AI agent, managing chat history, and creating chat sessions",
+      "files": ["backend/app/api/chat.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/chat": {
+            "get": {
+              "summary": "List chats",
+              "description": "List all user chats",
+              "security": [{"bearerAuth": []}],
+              "responses": {
+                "200": {
+                  "description": "List of chats"
+                }
+              }
+            }
+          },
+          "/api/chat/new": {
+            "post": {
+              "summary": "Create chat",
+              "description": "Create a new chat session",
+              "security": [{"bearerAuth": []}],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "title": {"type": "string", "default": "New Project Chat"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "Chat created"
+                }
+              }
+            }
+          },
+          "/api/chat/send": {
+            "post": {
+              "summary": "Send message",
+              "description": "Send message to Tilotma AI agent",
+              "security": [{"bearerAuth": []}],
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["content"],
+                      "properties": {
+                        "content": {"type": "string"},
+                        "project_id": {"type": "string", "format": "uuid"},
+                        "chat_id": {"type": "string", "format": "uuid"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "AI response",
+                  "content": {
+                    "application/json": {
+                      "schema": {
+                        "type": "object",
+                        "properties": {
+                          "response": {"type": "string"},
+                          "should_create_project": {"type": "boolean"},
+                          "project_id": {"type": "string"},
+                          "cost": {"type": "number"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "/api/chat/history": {
+            "get": {
+              "summary": "Get chat history",
+              "description": "Get conversation history",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "query",
+                  "schema": {"type": "string", "format": "uuid"}
+                },
+                {
+                  "name": "limit",
+                  "in": "query",
+                  "schema": {"type": "integer", "default": 50}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Chat history"
+                }
+              }
+            }
+          },
+          "/api/chat/history/{message_id}": {
+            "delete": {
+              "summary": "Delete message",
+              "description": "Delete a specific message from chat history",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "message_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "204": {
+                  "description": "Message deleted"
+                }
+              }
+            }
+          },
+          "/api/chat/clear": {
+            "post": {
+              "summary": "Clear chat history",
+              "description": "Clear all messages in a conversation",
+              "security": [{"bearerAuth": []}],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "project_id": {"type": "string", "format": "uuid"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "204": {
+                  "description": "Chat history cleared"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "File Uploads",
+      "description": "File upload endpoints for uploading images, audio, video, archives, and documents",
+      "files": ["backend/app/api/uploads.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/uploads/upload": {
+            "post": {
+              "summary": "Upload file",
+              "description": "Upload a file for use in project requirements",
+              "security": [{"bearerAuth": []}],
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "multipart/form-data": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["file"],
+                      "properties": {
+                        "file": {
+                          "type": "string",
+                          "format": "binary"
+                        },
+                        "project_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "File uploaded successfully"
+                }
+              }
+            }
+          },
+          "/api/uploads/upload/multiple": {
+            "post": {
+              "summary": "Upload multiple files",
+              "description": "Upload multiple files at once",
+              "security": [{"bearerAuth": []}],
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "multipart/form-data": {
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "files": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "format": "binary"
+                          }
+                        },
+                        "project_id": {
+                          "type": "string",
+                          "format": "uuid"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "Files uploaded"
+                }
+              }
+            }
+          },
+          "/api/uploads/{file_id}": {
+            "get": {
+              "summary": "Get file",
+              "description": "Retrieve an uploaded file",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "file_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "File content"
+                }
+              }
+            },
+            "delete": {
+              "summary": "Delete file",
+              "description": "Delete an uploaded file",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "file_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "File deleted"
+                }
+              }
+            }
+          },
+          "/api/uploads/project/{project_id}/files": {
+            "get": {
+              "summary": "List project files",
+              "description": "List all files uploaded for a project",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "List of files grouped by category"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Deployments",
+      "description": "Deployment endpoints for deploying projects to GCP Cloud Run and managing deployments",
+      "files": ["backend/app/api/deployments.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/projects/{project_id}/deploy": {
+            "post": {
+              "summary": "Deploy project",
+              "description": "Deploy project to GCP Cloud Run",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Deployment initiated"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/deployments": {
+            "get": {
+              "summary": "List deployments",
+              "description": "Get all deployments for a project",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "List of deployments"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/deployments/latest": {
+            "get": {
+              "summary": "Get latest deployment",
+              "description": "Get the most recent deployment status",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Latest deployment details"
+                }
+              }
+            }
+          },
+          "/api/projects/{project_id}/deployments/{deployment_id}": {
+            "get": {
+              "summary": "Get deployment details",
+              "description": "Get specific deployment details",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                },
+                {
+                  "name": "deployment_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string", "format": "uuid"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Deployment details"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Verification",
+      "description": "Verification endpoints for cryptographic verification of projects and audit trails",
+      "files": ["backend/app/api/verification.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/verification/{project_id}": {
+            "get": {
+              "summary": "Verify project integrity",
+              "description": "Complete cryptographic verification of project",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Verification result"
+                }
+              }
+            }
+          },
+          "/api/verification/{project_id}/audit-trail": {
+            "get": {
+              "summary": "Get audit trail",
+              "description": "Get complete audit trail for project",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Audit trail"
+                }
+              }
+            }
+          },
+          "/api/verification/{project_id}/export": {
+            "get": {
+              "summary": "Export ledger",
+              "description": "Export ledger in JSON or CSV format",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                },
+                {
+                  "name": "format",
+                  "in": "query",
+                  "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Exported ledger"
+                }
+              }
+            }
+          },
+          "/api/verification/agent/{agent_name}/public-key": {
+            "get": {
+              "summary": "Get agent public key",
+              "description": "Get agent's public key for external verification",
+              "parameters": [
+                {
+                  "name": "agent_name",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Public key information"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Approvals",
+      "description": "Approval endpoints for managing project checkpoints and approvals",
+      "files": ["backend/app/api/approvals.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/approvals/{project_id}/approve/{checkpoint_id}": {
+            "post": {
+              "summary": "Approve checkpoint",
+              "description": "User approved a checkpoint",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                },
+                {
+                  "name": "checkpoint_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "responses": {
+                "200": {
+                  "description": "Checkpoint approved"
+                }
+              }
+            }
+          },
+          "/api/approvals/{project_id}/reject/{checkpoint_id}": {
+            "post": {
+              "summary": "Reject checkpoint",
+              "description": "User rejected a checkpoint",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                },
+                {
+                  "name": "checkpoint_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "requestBody": {
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "properties": {
+                        "feedback": {"type": "string"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "Checkpoint rejected"
+                }
+              }
+            }
+          },
+          "/api/approvals/{project_id}/request-changes/{checkpoint_id}": {
+            "post": {
+              "summary": "Request changes",
+              "description": "User requested changes to a checkpoint",
+              "security": [{"bearerAuth": []}],
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                },
+                {
+                  "name": "checkpoint_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "requestBody": {
+                "required": true,
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["feedback"],
+                      "properties": {
+                        "feedback": {"type": "string"}
+                      }
+                    }
+                  }
+                }
+              },
+              "responses": {
+                "200": {
+                  "description": "Changes requested"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "WebSocket",
+      "description": "WebSocket endpoint for real-time project monitoring and updates",
+      "files": ["backend/app/api/websocket.py"],
+      "api_doc": {
+        "openapi": "3.0.0",
+        "paths": {
+          "/api/ws/projects/{project_id}": {
+            "get": {
+              "summary": "WebSocket connection",
+              "description": "WebSocket endpoint for real-time project updates",
+              "parameters": [
+                {
+                  "name": "project_id",
+                  "in": "path",
+                  "required": true,
+                  "schema": {"type": "string"}
+                }
+              ],
+              "responses": {
+                "101": {
+                  "description": "Switching Protocols"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

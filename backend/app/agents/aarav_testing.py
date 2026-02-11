@@ -61,7 +61,7 @@ Task: Generate comprehensive browser test strategies."""
             import playwright
             return True
         except ImportError:
-            self.logger.warning("⚠️ Playwright not installed.")
+            self.logger.warning("[WARN] Playwright not installed.")
             return False
     
     async def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -89,7 +89,7 @@ Task: Generate comprehensive browser test strategies."""
             await self._send_progress("testing", 100, f"Testing complete. {results['tests_passed']} passed.")
             
             self.tests_executed += len(tests)
-            self.logger.info(f"✅ Testing complete: {results['tests_passed']}/{len(tests)} passed")
+            self.logger.info(f"[OK] Testing complete: {results['tests_passed']}/{len(tests)} passed")
             
             return {
                 "status": "success",
@@ -99,7 +99,7 @@ Task: Generate comprehensive browser test strategies."""
             }
             
         except Exception as e:
-            self.logger.error(f"❌ Browser testing failed: {e}")
+            self.logger.error(f"[ERROR] Browser testing failed: {e}")
             await self.record_failure(
                 task_type="browser_testing_execution",
                 error=str(e),
@@ -121,7 +121,7 @@ Task: Generate comprehensive browser test strategies."""
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for testing")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for testing")
         
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],

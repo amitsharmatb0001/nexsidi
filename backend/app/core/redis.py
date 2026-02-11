@@ -38,10 +38,12 @@ redis_client = get_redis_client()
 def verify_redis_connection():
     """Verify that Redis is reachable."""
     try:
-        client = get_redis_client()
+        print(f"DEBUG: Verifying Redis connection to: {settings.redis_url}")
+        # Use a separate client with short timeout for verification
+        client = redis.Redis.from_url(settings.redis_url, socket_timeout=5, socket_connect_timeout=5)
         client.ping()
-        logger.info("✅ Redis connection pool verified")
+        logger.info("[OK] Redis connection pool verified")
         return True
     except Exception as e:
-        logger.error(f"❌ Redis connection failed: {e}")
+        logger.error(f"[ERROR] Redis connection failed: {e}")
         return False

@@ -22,9 +22,9 @@ class AgentPermanentMemory:
         self.logger = logging.getLogger("agent_memory")
         try:
             self.client = chromadb.PersistentClient(path=persist_directory)
-            self.logger.info(f"✅ AgentPermanentMemory initialized at {persist_directory}")
+            self.logger.info(f"[OK] AgentPermanentMemory initialized at {persist_directory}")
         except Exception as e:
-            self.logger.error(f"❌ Failed to initialize ChromaDB: {e}")
+            self.logger.error(f"[ERROR] Failed to initialize ChromaDB: {e}")
             self.client = chromadb.Client()
         self._collections = {}
     

@@ -298,7 +298,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
             Complete RequirementsSpec
         """
         
-        self.logger.info("🔍 Starting requirements analysis...")
+        self.logger.info("[FIND] Starting requirements analysis...")
         
         # Step 1: Summarize conversation (keep it short!)
         await self._send_progress("requirements_analysis", 10, "Summarizing conversation history...")
@@ -306,7 +306,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         
         # Step 2: Extract requirements
         await self._send_progress("requirements_analysis", 30, "Extracting functional requirements...")
-        self.logger.info("📝 Extracting requirements...")
+        self.logger.info("[LOG] Extracting requirements...")
         requirements = await self._extract_requirements(summary)
         
         # Step 3: Detect project type
@@ -316,7 +316,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         
         # Step 4: Calculate complexity
         await self._send_progress("requirements_analysis", 60, "Assessing project complexity...")
-        self.logger.info("📊 Calculating complexity...")
+        self.logger.info("[STATS] Calculating complexity...")
         complexity = await self._calculate_complexity(requirements, project_type)
         
         # Step 5: Recommend tech stack
@@ -356,7 +356,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
             {"spec": spec.to_dict(), "timestamp": datetime.now().timestamp()}
         )
         
-        self.logger.info(f"✅ Requirements analysis complete!")
+        self.logger.info(f"[OK] Requirements analysis complete!")
         self.logger.info(f"   Complexity: {complexity}/10")
         self.logger.info(f"   Pricing: ₹{pricing.total_price:,.0f}")
         self.logger.info(f"   Timeline: {timeline.total_days} days")
@@ -391,7 +391,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
                 key_points.append(content)
         
         summary = " | ".join(key_points)
-        return summary[:500]  # Max 500 chars
+        return summary[:2000]  # Increased from 500 to 2000 for complex suites
     
     async def _extract_requirements(
         self,
@@ -710,7 +710,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         otp = str(random.randint(100000, 999999))
         spec.approval_otp = otp
         
-        self.logger.info(f"🔐 Generated approval OTP: {otp}")
+        self.logger.info(f"[SECURE] Generated approval OTP: {otp}")
         
         return otp
     
@@ -732,10 +732,10 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         
         if spec.approval_otp == otp:
             spec.approved = True
-            self.logger.info("✅ Specification approved!")
+            self.logger.info("[OK] Specification approved!")
             return True
         else:
-            self.logger.warning("❌ Invalid OTP")
+            self.logger.warning("[ERROR] Invalid OTP")
             return False
     
     # =========================================================================
@@ -769,7 +769,7 @@ class Saanvi(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
 **Project ID:** {spec.project_id}  
 **Type:** {spec.project_type.value}  
 **Created:** {spec.created_at.strftime("%Y-%m-%d %H:%M")}  
-**Status:** {'✅ Approved' if spec.approved else '⏳ Pending Approval'}
+**Status:** {'[OK] Approved' if spec.approved else '[WAIT] Pending Approval'}
 
 ---
 
@@ -877,11 +877,11 @@ if __name__ == "__main__":
         
         # Generate OTP
         otp = saanvi.generate_approval_otp(spec)
-        print(f"\n🔐 Approval OTP: {otp}")
+        print(f"\n[SECURE] Approval OTP: {otp}")
         
         # Verify OTP
         approved = saanvi.verify_approval_otp(spec, otp)
-        print(f"✅ Approved: {approved}")
+        print(f"[OK] Approved: {approved}")
         
         print("\n" + "="*60)
         print("TEST COMPLETE")

@@ -57,7 +57,7 @@ class CircuitBreaker:
             
             if self.failure_count >= self.failure_threshold:
                 if self.state != CircuitState.OPEN:
-                    logger.error(f"⚠️ Circuit breaker: OPEN after {self.failure_count} failures")
+                    logger.error(f"[WARN] Circuit breaker: OPEN after {self.failure_count} failures")
                     self.state = CircuitState.OPEN
             
             raise

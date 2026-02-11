@@ -47,7 +47,7 @@ class GCPService:
         self.credentials = None
         self.authenticated = False
         
-        logger.info("✅ GCP Service initialized (using Cloud Build - no local Docker needed!)")
+        logger.info("[OK] GCP Service initialized (using Cloud Build - no local Docker needed!)")
     
     def authenticate(self, secret_name: Optional[str] = None) -> bool:
         """
@@ -69,7 +69,7 @@ class GCPService:
                 self.credentials = secret_manager.get_gcp_credentials(use_secret)
                 if self.credentials:
                     self.authenticated = True
-                    logger.info(f"✅ Authenticated with service account from Secret Manager: {use_secret}")
+                    logger.info(f"[OK] Authenticated with service account from Secret Manager: {use_secret}")
                     auth_success = True
 
             # Method 1: JSON key from environment variable
@@ -84,7 +84,7 @@ class GCPService:
                             scopes=["https://www.googleapis.com/auth/cloud-platform"]
                         )
                         self.authenticated = True
-                        logger.info("✅ Authenticated with service account (from env JSON)")
+                        logger.info("[OK] Authenticated with service account (from env JSON)")
                         auth_success = True
                     except json.JSONDecodeError:
                         # Try as file path
@@ -94,7 +94,7 @@ class GCPService:
                                 scopes=["https://www.googleapis.com/auth/cloud-platform"]
                             )
                             self.authenticated = True
-                            logger.info("✅ Authenticated with service account (from file path)")
+                            logger.info("[OK] Authenticated with service account (from file path)")
                             auth_success = True
             
             # Method 2: Application default credentials
@@ -105,7 +105,7 @@ class GCPService:
                 if not self.project_id:
                     self.project_id = project
                 self.authenticated = True
-                logger.info("✅ Authenticated with application default credentials")
+                logger.info("[OK] Authenticated with application default credentials")
                 auth_success = True
             
             # If authentication succeeded, ensure infrastructure is ready
@@ -116,7 +116,7 @@ class GCPService:
             return False
             
         except Exception as e:
-            logger.error(f"❌ GCP authentication failed: {e}")
+            logger.error(f"[ERROR] GCP authentication failed: {e}")
             self.authenticated = False
             return False
 
@@ -165,12 +165,12 @@ class GCPService:
                     ],
                     check=True, capture_output=True
                 )
-                logger.info(f"✅ Repository created: {self.artifact_repo}")
+                logger.info(f"[OK] Repository created: {self.artifact_repo}")
             else:
-                logger.info(f"✅ Repository ready: {self.artifact_repo}")
+                logger.info(f"[OK] Repository ready: {self.artifact_repo}")
 
         except Exception as e:
-            logger.warning(f"⚠️ Infrastructure check had issues: {e}. Agents will attempt to proceed anyway.")
+            logger.warning(f"[WARN] Infrastructure check had issues: {e}. Agents will attempt to proceed anyway.")
     
     
     def build_and_push_image(
@@ -192,14 +192,14 @@ class GCPService:
             Full image URL or None if failed
         """
         if not self.authenticated:
-            logger.error("❌ Not authenticated with GCP")
+            logger.error("[ERROR] Not authenticated with GCP")
             return None
         
         try:
             # Construct image tag
             image_tag = f"{self.region}-docker.pkg.dev/{self.project_id}/{self.artifact_repo}/{service_name}:latest"
             
-            logger.info(f"🔨 Building image using GCP Cloud Build (no local Docker needed!): {service_name}")
+            logger.info(f"[BUILD] Building image using GCP Cloud Build (no local Docker needed!): {service_name}")
             
             # Use gcloud builds submit to build in the cloud
             # This runs entirely on GCP infrastructure - no local Docker required!
@@ -223,14 +223,14 @@ class GCPService:
             )
             
             if result.returncode == 0:
-                logger.info(f"✅ Image built and pushed: {image_tag}")
+                logger.info(f"[OK] Image built and pushed: {image_tag}")
                 return image_tag
             else:
-                logger.error(f"❌ Cloud Build failed: {result.stderr}")
+                logger.error(f"[ERROR] Cloud Build failed: {result.stderr}")
                 return None
             
         except Exception as e:
-            logger.error(f"❌ Failed to build/push image: {e}")
+            logger.error(f"[ERROR] Failed to build/push image: {e}")
             return None
     
     def _configure_docker_auth(self):
@@ -244,10 +244,10 @@ class GCPService:
                 "--quiet"
             ]
             subprocess.run(cmd, check=True, capture_output=True)
-            logger.info("✅ Docker authentication configured")
+            logger.info("[OK] Docker authentication configured")
         except subprocess.CalledProcessError as e:
-            logger.warning(f"⚠️ Failed to configure docker auth via gcloud: {e}")
-            logger.info("💡 Attempting alternative authentication method")
+            logger.warning(f"[WARN] Failed to configure docker auth via gcloud: {e}")
+            logger.info("[TIP] Attempting alternative authentication method")
             # Alternative: use credential helper
             try:
                 subprocess.run(
@@ -256,7 +256,7 @@ class GCPService:
                     capture_output=True
                 )
             except Exception:
-                logger.warning("⚠️ Alternative auth also failed, proceeding anyway")
+                logger.warning("[WARN] Alternative auth also failed, proceeding anyway")
     
     def deploy_to_cloud_run(
         self,
@@ -286,11 +286,11 @@ class GCPService:
             Deployment info dict or None if failed
         """
         if not self.authenticated:
-            logger.error("❌ Not authenticated with GCP")
+            logger.error("[ERROR] Not authenticated with GCP")
             return None
         
         try:
-            logger.info(f"🚀 Deploying service to Cloud Run: {service_name}")
+            logger.info(f"[START] Deploying service to Cloud Run: {service_name}")
             
             client = run_v2.ServicesClient(credentials=self.credentials)
             
@@ -330,7 +330,7 @@ class GCPService:
             # Check if service exists
             try:
                 existing_service = client.get_service(name=service_path)
-                logger.info(f"📝 Updating existing service: {service_name}")
+                logger.info(f"[LOG] Updating existing service: {service_name}")
                 
                 # Update service
                 operation = client.update_service(
@@ -349,7 +349,7 @@ class GCPService:
                 operation = client.create_service(request=request)
             
             # Wait for operation to complete
-            logger.info("⏳ Waiting for deployment to complete...")
+            logger.info("[WAIT] Waiting for deployment to complete...")
             result = operation.result(timeout=600)  # 10 minute timeout
             
             # Get service URL
@@ -359,7 +359,7 @@ class GCPService:
             logger.info("🌐 Configuring service to allow public access...")
             self._allow_public_access(service_name)
             
-            logger.info(f"✅ Service deployed: {service_url}")
+            logger.info(f"[OK] Service deployed: {service_url}")
             
             return {
                 "service_name": service_name,
@@ -370,7 +370,7 @@ class GCPService:
             }
             
         except Exception as e:
-            logger.error(f"❌ Cloud Run deployment failed: {e}")
+            logger.error(f"[ERROR] Cloud Run deployment failed: {e}")
             return None
     
     def _allow_public_access(self, service_name: str):
@@ -394,11 +394,11 @@ class GCPService:
             ]
             
             subprocess.run(cmd, check=True, capture_output=True)
-            logger.info("✅ Public access configured")
+            logger.info("[OK] Public access configured")
             
         except subprocess.CalledProcessError as e:
-            logger.warning(f"⚠️ Failed to configure public access: {e}")
-            logger.info("💡 You may need to manually configure IAM permissions")
+            logger.warning(f"[WARN] Failed to configure public access: {e}")
+            logger.info("[TIP] You may need to manually configure IAM permissions")
     
     def get_service_url(self, service_name: str) -> Optional[str]:
         """
@@ -411,7 +411,7 @@ class GCPService:
             Service URL or None if not found
         """
         if not self.authenticated:
-            logger.error("❌ Not authenticated with GCP")
+            logger.error("[ERROR] Not authenticated with GCP")
             return None
         
         try:
@@ -422,7 +422,7 @@ class GCPService:
             return service.uri
             
         except Exception as e:
-            logger.error(f"❌ Failed to get service URL: {e}")
+            logger.error(f"[ERROR] Failed to get service URL: {e}")
             return None
 
 

@@ -65,7 +65,7 @@ class ProjectProcessorV2:
         5. Handle completion or errors
         """
         try:
-            self.logger.info("🚀 Starting project processing (V2 - Arjun orchestration)...")
+            self.logger.info("[START] Starting project processing (V2 - Arjun orchestration)...")
             await self._update_status("processing")
             
             # 1. Load project
@@ -121,7 +121,7 @@ class ProjectProcessorV2:
             result = await self.arjun.execute_pipeline(requirements)
             
             # 5. Handle completion
-            self.logger.info("✅ Arjun completed pipeline successfully!")
+            self.logger.info("[OK] Arjun completed pipeline successfully!")
             await self._update_status("completed")
             
             # Store final result
@@ -130,7 +130,7 @@ class ProjectProcessorV2:
             return result
             
         except Exception as e:
-            self.logger.error(f"❌ Project processing failed: {e}")
+            self.logger.error(f"[ERROR] Project processing failed: {e}")
             await self._update_status("failed")
             await self._store_error(str(e))
             raise
@@ -149,7 +149,7 @@ class ProjectProcessorV2:
                 project.status = status
                 project.updated_at = datetime.utcnow()
                 self.db.commit()
-                self.logger.info(f"📊 Status updated: {status}")
+                self.logger.info(f"[STATS] Status updated: {status}")
         except Exception as e:
             self.logger.error(f"Failed to update status: {e}")
             self.db.rollback()
@@ -159,7 +159,7 @@ class ProjectProcessorV2:
         try:
             # Result is already stored in context by Arjun
             # Just log completion
-            self.logger.info(f"💾 Final result stored by Arjun")
+            self.logger.info(f"[SAVE] Final result stored by Arjun")
             
             # Access correct attributes from PipelineResult (handle object or dict)
             if isinstance(result, dict):

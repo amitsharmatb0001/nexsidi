@@ -45,6 +45,7 @@ from app.agents.mixins import (
     SearchCapableMixin, 
     MistakeMemoryMixin, 
     PermanentMemoryMixin,
+    ContextManagementMixin,
     DecisionLedgerMixin,
     ProgressMixin
 )
@@ -53,7 +54,7 @@ from app.services.isolation_manager import isolation_manager
 from app.services.git_service import git_service
 from app.services.signing_service import signing_service
 from app.agents.contracts import (
-    TilotmaOutput, SaanviOutput, ShubhamInput, 
+    TilotmaOutput, SaanviOutput, VikramOutput, ShubhamInput, 
     ShubhamOutput, AanyaInput, AanyaOutput
 )
 from app.services.collaboration import CollaborationSession
@@ -178,7 +179,7 @@ class TilotmaReporter:
         # Store using Arjun's SHA-256 verified storage
         await self._safe_store(f"tilotma_monitor_{agent_name}_start", report)
         
-        self.logger.info(f"📊 Reported to Tilotma: {agent_name} started")
+        self.logger.info(f"[STATS] Reported to Tilotma: {agent_name} started")
     
     async def report_agent_success(self, agent_name: str, result: Dict):
         """Report when agent succeeds"""
@@ -190,7 +191,7 @@ class TilotmaReporter:
         
         await self._safe_store(f"tilotma_monitor_{agent_name}_success", report)
         
-        self.logger.info(f"📊 Reported to Tilotma: {agent_name} succeeded")
+        self.logger.info(f"[STATS] Reported to Tilotma: {agent_name} succeeded")
     
     async def report_agent_failure(self, agent_name: str, error: str):
         """Report when agent fails"""
@@ -202,7 +203,7 @@ class TilotmaReporter:
         
         await self._safe_store(f"tilotma_monitor_{agent_name}_failure", report)
         
-        self.logger.warning(f"📊 Reported to Tilotma: {agent_name} failed")
+        self.logger.warning(f"[STATS] Reported to Tilotma: {agent_name} failed")
     
     async def report_quality_gate(self, review_result: Dict):
         """Report adversarial review results"""
@@ -214,7 +215,7 @@ class TilotmaReporter:
         
         await self._safe_store("tilotma_monitor_quality_gate", report)
         
-        self.logger.info("📊 Reported quality gate results to Tilotma")
+        self.logger.info("[STATS] Reported quality gate results to Tilotma")
     
     async def report_progress(self, phase: str, percentage: int):
         """Report progress update"""
@@ -295,6 +296,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         })
         
         # Enqueue project
+        from app.services.queue_manager import QueueManager
         queue = QueueManager.get_instance()
         queue_info = await queue.enqueue_project(
             project_id=project_id,
@@ -315,6 +317,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         Static method to get project status.
         Called by API endpoints.
         """
+        from app.services.queue_manager import QueueManager
         queue = QueueManager.get_instance()
         status = await queue.get_project_status(project_id)
         
@@ -335,12 +338,20 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         Execute full SDLC pipeline using agent contracts. (Phase 3 Refactor)
         """
         try:
-            self.logger.info("🚀 Starting SDLC pipeline execution with contracts...")
+            self.logger.info("[START] Starting SDLC pipeline execution with contracts...")
             self.pipeline_state.start_time = datetime.now()
+            
+            # PATENT GAP #5: GIT INTEGRATED PERSISTENCE
+            # =========================================
+            try:
+                git_service.init_repository(self.workspace["code_dir"], self.project_id)
+            except Exception as e:
+                self.logger.warning(f"[WARN] Git initialization failed: {e}")
             
             # Phase 0: Tilotma Input
             tilotma_output = TilotmaOutput(
                 project_id=self.project_id,
+                user_id=self.user_id,
                 project_type=requirements.get("project_type", "web_app"),
                 description=requirements.get("description", ""),
                 key_features=requirements.get("key_features", []),
@@ -349,7 +360,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             
             # Phase 1: Requirements Analysis (Saanvi)
             await self._update_progress(PipelinePhase.REQUIREMENTS, 10)
-            self.logger.info("🔍 Phase 1: Requirements (Saanvi)")
+            self.logger.info("[FIND] Phase 1: Requirements (Saanvi)")
             
             saanvi_dict = await self._delegate_to_agent("saanvi", {"conversation": requirements.get("conversation_history", [])})
             # Map Saanvi's to_contract_dict if needed, but Arjun's _execute_agent calls analyze_requirements
@@ -368,31 +379,41 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             )
             self.pipeline_state.agent_outputs["saanvi"] = saanvi_output
             
-            # Phase 2: Architecture Blueprint (Vikram - NEW)
-            # (Assuming Vikram is implemented or we fallback to standard)
+            # Phase 2: Architecture Blueprint (Vikram - NEW) (Task 1.2)
+            self.logger.info("[AI] Phase 2: Architecture (Vikram)")
+            vikram_dict = await self._delegate_to_agent("vikram", saanvi_output.requirements)
+            
+            vikram_output = VikramOutput(
+                project_id=self.project_id,
+                blueprint=vikram_dict,
+                tech_stack=vikram_dict.get("tech_stack", {}),
+                database_schema=vikram_dict.get("database_schema", {}),
+                api_contracts=vikram_dict.get("api_contracts", [])
+            )
+            self.pipeline_state.agent_outputs["vikram"] = vikram_output
             
             # Phase 2.5: Design System (Vanya)
-            self.logger.info("🎨 Phase 2.5: Design System (Vanya)")
+            self.logger.info("[DESIGN] Phase 2.5: Design System (Vanya)")
             vanya_result = await self._delegate_to_agent("vanya", {
-                "requirements": saanvi_output.requirements,
-                "style_preference": "modern"
+                "requirements": vikram_dict,  # Pass Vikram's blueprint (Task 1.3)
+                "style_preference": requirements.get("style_preference", "modern"),
+                "target_audience": requirements.get("target_audience", "general")
             })
             
             # NEW: CHECKPOINT 1 - User Approval on Design
-            self.logger.info("⏸️ CHECKPOINT 1: Waiting for user approval on design...")
+            self.logger.info("[PAUSE] CHECKPOINT 1: Waiting for user approval on design...")
             from app.services.approval_service import ApprovalService
             approval_service = ApprovalService(self.project_id)
             
-            vikram_blueprint = self.context_engine.get_context(self.project_id, "architecture_blueprint") or {}
             checkpoint_1 = await approval_service.create_design_preview_checkpoint(
-                vikram_blueprint,
+                vikram_output.blueprint,
                 vanya_result
             )
             
             approval_1 = await approval_service.wait_for_approval(checkpoint_1["checkpoint_id"])
             
             if approval_1["status"] == "rejected":
-                self.logger.info("❌ User rejected design - stopping pipeline")
+                self.logger.info("[ERROR] User rejected design - stopping pipeline")
                 return PipelineResult(
                     status="rejected",
                     code={},
@@ -402,7 +423,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                     timeline={"start": self.pipeline_state.start_time.isoformat(), "end": datetime.now().isoformat()}
                 )
             
-            self.logger.info("✅ User approved design - starting development...")
+            self.logger.info("[OK] User approved design - starting development...")
             
             # EMAIL 1: Send SDD email after approval
             try:
@@ -436,10 +457,10 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
 
             shubham_input = ShubhamInput(
                 project_id=self.project_id,
-                architecture=saanvi_output.requirements,
-                tech_stack=saanvi_output.recommended_tech_stack["backend"],
-                database_schema={"tables": saanvi_output.database_requirements},
-                api_endpoints=[{"name": ep} for ep in saanvi_output.api_endpoints_needed]
+                architecture=vikram_output.blueprint,
+                tech_stack=vikram_output.tech_stack.get("backend_framework", saanvi_output.recommended_tech_stack["backend"]),
+                database_schema=vikram_output.database_schema,
+                api_endpoints=vikram_output.api_contracts or [{"name": ep} for ep in saanvi_output.api_endpoints_needed]
             )
             
             shubham_dict = await self._delegate_to_agent("shubham", shubham_input.__dict__)
@@ -452,13 +473,13 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             )
             
             if not shubham_output.files_written:
-                raise ValueError("❌ Shubham failed to write backend files!")
+                raise ValueError("[ERROR] Shubham failed to write backend files!")
             
             self.pipeline_state.agent_outputs["shubham"] = shubham_output
             
             # Phase 4: Frontend Development (Aanya)
             await self._update_progress(PipelinePhase.FRONTEND, 60)
-            self.logger.info("🎨 Phase 4: Frontend (Aanya)")
+            self.logger.info("[DESIGN] Phase 4: Frontend (Aanya)")
             
             aanya_input = AanyaInput(
                 project_id=self.project_id,
@@ -478,12 +499,12 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             )
             
             if not aanya_output.files_written:
-                raise ValueError("❌ Aanya failed to write frontend files!")
+                raise ValueError("[ERROR] Aanya failed to write frontend files!")
                 
             self.pipeline_state.agent_outputs["aanya"] = aanya_output
             
             # NEW: CHECKPOINT 2 - User Testing
-            self.logger.info("⏸️ CHECKPOINT 2: Waiting for user to test the app...")
+            self.logger.info("[PAUSE] CHECKPOINT 2: Waiting for user to test the app...")
             checkpoint_2 = await approval_service.create_testing_checkpoint(
                 deployment_urls={
                     "backend": shubham_output.backend_url or "http://localhost:8000",
@@ -497,10 +518,49 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             if approval_2["status"] != "approved":
                 self.logger.info(f"🔁 User requested changes/rejected during testing: {approval_2.get('user_feedback')}")
                 # (Handle revisions...)
+
+            # Phase 4.5: Mobile Development (Riya) - NEW (Hybrid Support)
+            # ==========================================================
+            project_type_code = str(saanvi_output.project_type).lower()
+            if "mobile" in project_type_code or "hybrid" in project_type_code:
+                await self._update_progress(PipelinePhase.MOBILE, 75)
+                self.logger.info("📱 Phase 4.5: Mobile (Riya)")
+                
+                riya_input = {
+                    "project_id": self.project_id,
+                    "platforms": ["android", "ios"] if "hybrid" in project_type_code else ["android"],
+                    "requirements": saanvi_output.requirements,
+                    "design_system": vanya_result.get("design_system", {}),
+                    "api_base_url": shubham_output.backend_url or "http://localhost:8000"
+                }
+                
+                riya_result = await self._delegate_to_agent("riya", riya_input)
+                self.pipeline_state.agent_outputs["riya"] = riya_result
+
+            # Phase 4.8: Adversarial Quality Gate (Navya, Karan, Deepika)
+            # ==========================================================
+            self.logger.info("⚔️ Phase 4.8: Adversarial Quality Gate (Patent Claim 4)")
+            quality_report = await self.adversarial_quality_gate({
+                "backend": {"code": "Reading from workspace"}, # Informational
+                "frontend": {"code": "Reading from workspace"}
+            })
+            self.pipeline_state.quality_report = quality_report
+
+            # Phase 4.9: Automated Testing (Aarav)
+            # ====================================
+            await self._update_progress(PipelinePhase.TESTING, 85)
+            self.logger.info("🧪 Phase 4.9: Automated Testing (Aarav)")
+            
+            aarav_result = await self._delegate_to_agent("aarav", {
+                "project_id": self.project_id,
+                "backend_url": shubham_output.backend_url,
+                "frontend_url": aanya_output.frontend_url
+            })
+            self.pipeline_state.agent_outputs["aarav"] = aarav_result
             
             # Phase 5: Deployment (Pranav)
             await self._update_progress(PipelinePhase.DEPLOYMENT, 90)
-            self.logger.info("🚀 Phase 5: Deployment (Pranav)")
+            self.logger.info("[START] Phase 5: Deployment (Pranav)")
             
             pranav_dict = await self._delegate_to_agent("pranav", {
                 "project_id": self.project_id,
@@ -524,7 +584,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             except Exception as e:
                 self.logger.warning(f"Failed to send completion email: {e}")
 
-            self.logger.info("✅ Pipeline execution complete!")
+            self.logger.info("[OK] Pipeline execution complete!")
             
             return PipelineResult(
                 status="completed",
@@ -539,7 +599,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             )
             
         except Exception as e:
-            self.logger.error(f"❌ Pipeline failed: {e}")
+            self.logger.error(f"[ERROR] Pipeline failed: {e}")
             raise
     
     # =========================================================================
@@ -562,6 +622,9 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         # Report START to Tilotma
         await self.tilotma_reporter.report_agent_start(agent_name, input_data)
+        
+        # Task 2.5: Log agent activity
+        self._log_agent_activity(agent_name, "started", input_data)
         
         max_retries = 3
         retry_count = 0
@@ -622,6 +685,19 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 # Report SUCCESS to Tilotma
                 await self.tilotma_reporter.report_agent_success(agent_name, result)
                 
+                # Task 2.5: Log agent completion
+                self._log_agent_activity(agent_name, "completed", result)
+                
+                # PATENT GAP #5: COMMIT WORK
+                try:
+                    git_service.commit_agent_work(
+                        self.workspace["code_dir"], 
+                        agent_name,
+                        message=f"[AGENT] {agent_name.upper()} completed {self.pipeline_state.current_phase.value}"
+                    )
+                except Exception as git_err:
+                    self.logger.warning(f"Git commit failed for {agent_name}: {git_err}")
+
                 return result
                 
             except Exception as e:
@@ -635,7 +711,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 # === RESEARCH AGENT: AUTO-SEARCH FOR SOLUTIONS ===
                 research_solution = None
                 try:
-                    self.logger.info(f"🔍 Researching solution for error...")
+                    self.logger.info(f"[FIND] Researching solution for error...")
                     research = ResearchAgent(self.project_id)
                     research_result = await research.find_error_solution(
                         error_message=str(e),
@@ -643,13 +719,13 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                     )
                     research_solution = research_result.get("summary", "")
                     if research_solution:
-                        self.logger.info(f"💡 Research found: {research_solution[:200]}...")
+                        self.logger.info(f"[TIP] Research found: {research_solution[:200]}...")
                 except Exception as research_error:
-                    self.logger.warning(f"⚠️ Research agent failed: {research_error}")
+                    self.logger.warning(f"[WARN] Research agent failed: {research_error}")
                 
                 # Log error with classification
                 self.logger.warning(
-                    f"⚠️ {agent_name} failed (attempt {retry_count}/{max_retries}): {e} "
+                    f"[WARN] {agent_name} failed (attempt {retry_count}/{max_retries}): {e} "
                     f"[Category: {error_category.value}, Strategy: {recovery_strategy}]"
                 )
                 
@@ -801,7 +877,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             # Exponential backoff based on retry count
             retry_count = len([e for e in self.pipeline_state.error_history if e["agent"] == agent_name])
             delay = min(2 ** retry_count, 30)  # Max 30 seconds
-            self.logger.info(f"⏳ Rate limit detected - waiting {delay}s before retry")
+            self.logger.info(f"[WAIT] Rate limit detected - waiting {delay}s before retry")
             await asyncio.sleep(delay)
         
         elif strategy == "rollback_context":
@@ -816,7 +892,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         elif strategy == "correct_input":
             # Log validation error - would need input correction
-            self.logger.warning(f"⚠️ Validation error - input may need correction")
+            self.logger.warning(f"[WARN] Validation error - input may need correction")
         
         elif strategy == "escalate_tilotma":
             # Will be handled by caller
@@ -835,7 +911,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             error: The exception
             category: Error category
         """
-        self.logger.error(f"🚨 ESCALATING TO TILOTMA: {agent_name} - {error}")
+        self.logger.error(f"[CRITICAL] ESCALATING TO TILOTMA: {agent_name} - {error}")
         
         # Store escalation in context for Tilotma to review
         # Store escalation in context for Tilotma to review
@@ -880,7 +956,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         )
         
         if result["status"] != "success":
-            self.logger.error(f"❌ Failed to create container for {agent_name}: {result.get('error')}")
+            self.logger.error(f"[ERROR] Failed to create container for {agent_name}: {result.get('error')}")
             # Fallback for now, but in production this should probably raise
             return None
         
@@ -1004,6 +1080,12 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             agent = Vanya(self.project_id, self.workspace)
             return await agent.execute(input_data)
         
+        elif agent_name == "vikram":
+            # Vikram - Chief Architect (Task 1.2)
+            from app.agents.vikram import Vikram
+            agent = Vikram(self.project_id, self.user_id)
+            return await agent.generate_json_blueprint(input_data)
+        
         elif agent_name == "pranav":
             from app.agents.pranav import Pranav
             agent = Pranav(self.project_id, self.workspace)
@@ -1024,28 +1106,35 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
     # PATENT REQUIREMENT: ADVERSARIAL QUALITY GATE
     # =========================================================================
     
-    async def adversarial_quality_gate(self, code: Dict[str, Any]) -> Dict[str, Any]:
+    async def adversarial_quality_gate(self, code: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Patent Claim 4: GAN-based adversarial reviews with PARALLEL execution.
-        
-        Three adversarial agents compete to find the most bugs:
-        - Navya: Logic errors (Generator)
-        - Karan: Security vulnerabilities (Discriminator 1)
-        - Deepika: Performance issues (Discriminator 2)
-        
-        Competitive dynamics:
-        - Agents run in parallel
-        - Reward based on unique findings
-        - Competition drives thoroughness
         """
         self.logger.info("🎯 Starting PARALLEL adversarial quality gate...")
         
         # Extract code for review
-        backend_code = code.get("backend", {}).get("code", "")
-        frontend_code = code.get("frontend", {}).get("code", "")
+        code_dict = code or {}
+        backend_code = code_dict.get("backend", {}).get("code", "")
+        frontend_code = code_dict.get("frontend", {}).get("code", "")
         
+        # If no code snippet provided, try to read main files from workspace
         if not backend_code and not frontend_code:
-            self.logger.warning("⚠️ No code to review")
+            try:
+                # Attempt to read some key files for the review
+                backend_main = os.path.join(self.workspace["code_dir"], "backend", "app", "main.py")
+                if os.path.exists(backend_main):
+                    with open(backend_main, "r") as f:
+                        backend_code = f.read()
+                
+                frontend_main = os.path.join(self.workspace["code_dir"], "frontend", "src", "App.tsx")
+                if os.path.exists(frontend_main):
+                    with open(frontend_main, "r") as f:
+                        frontend_code = f.read()
+            except Exception as e:
+                self.logger.warning(f"Could not read code for adversarial review: {e}")
+
+        if not backend_code and not frontend_code:
+            self.logger.warning("[WARN] No code to review")
             return {
                 "status": "skipped",
                 "reason": "No code available"
@@ -1119,7 +1208,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         }
         
         self.logger.info(
-            f"✅ Adversarial review complete: {total_bugs} issues found in {execution_time:.1f}s\n"
+            f"[OK] Adversarial review complete: {total_bugs} issues found in {execution_time:.1f}s\n"
             f"   Navya: {navya_result.get('bugs_found', 0)} bugs (reward: {rewards['navya']:.2f})\n"
             f"   Karan: {karan_result.get('vulnerabilities_found', 0)} vulnerabilities (reward: {rewards['karan']:.2f})\n"
             f"   Deepika: {deepika_result.get('issues_found', 0)} performance issues (reward: {rewards['deepika']:.2f})"
@@ -1298,7 +1387,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             if convergence_result["converged"]:
                 self.pipeline_state.convergence_achieved = True
                 self.logger.info(
-                    f"✅ Convergence achieved: {convergence_result['reason']} "
+                    f"[OK] Convergence achieved: {convergence_result['reason']} "
                     f"(Quality: {quality_score:.2%}, Bugs: {bugs})"
                 )
                 break
@@ -1306,7 +1395,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             # === STAGNATION DETECTION ===
             if len(bug_history) >= 3:
                 if bug_history[-1] == bug_history[-2] == bug_history[-3]:
-                    self.logger.warning("⚠️ Stagnation detected - trying alternative strategy")
+                    self.logger.warning("[WARN] Stagnation detected - trying alternative strategy")
                     
                     # Extract persistent bugs from review
                     persistent_bugs = []
@@ -1327,7 +1416,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 improvement_velocity = self._calculate_improvement_velocity(bug_history)
                 if improvement_velocity < 0.1 and bugs > 0:
                     self.logger.warning(
-                        f"⚠️ Diminishing returns detected (velocity: {improvement_velocity:.2f})"
+                        f"[WARN] Diminishing returns detected (velocity: {improvement_velocity:.2f})"
                     )
                     # Continue but flag for Tilotma review
                     self.pipeline_state.quality_scores["diminishing_returns"] = True
@@ -1350,11 +1439,11 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         if final_bugs > 0:
             self.logger.warning(
-                f"⚠️ Refinement complete: {final_bugs} bugs remaining, "
+                f"[WARN] Refinement complete: {final_bugs} bugs remaining, "
                 f"quality: {final_quality:.2%}"
             )
         else:
-            self.logger.info(f"✅ Refinement complete: Zero defects, quality: {final_quality:.2%}")
+            self.logger.info(f"[OK] Refinement complete: Zero defects, quality: {final_quality:.2%}")
         
         return code
     
@@ -1554,11 +1643,11 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         # Architecture bugs require redesign
         if architecture_bugs:
             self.logger.warning(
-                f"⚠️ {len(architecture_bugs)} architecture-level bugs found - "
+                f"[WARN] {len(architecture_bugs)} architecture-level bugs found - "
                 f"may require Saanvi redesign"
             )
         
-        self.logger.info(f"✅ Bug fixes applied: {len(backend_bugs)} backend, {len(frontend_bugs)} frontend")
+        self.logger.info(f"[OK] Bug fixes applied: {len(backend_bugs)} backend, {len(frontend_bugs)} frontend")
         return code
     
     async def _alternative_strategy(
@@ -1624,7 +1713,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             fixed_code = json.loads(content)
             return fixed_code
         except Exception as e:
-            self.logger.error(f"❌ Failed to parse alternative strategy response: {e}")
+            self.logger.error(f"[ERROR] Failed to parse alternative strategy response: {e}")
             return current_code
     
     # =========================================================================
@@ -1648,7 +1737,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         hash_obj = hashlib.sha256(serialized.encode('utf-8'))
         hash_digest = hash_obj.hexdigest()
         
-        self.logger.debug(f"🔐 Computed hash: {hash_digest[:16]}...")
+        self.logger.debug(f"[SECURE] Computed hash: {hash_digest[:16]}...")
         return hash_digest
     
     async def _store_with_hash(self, context_key: str, data: Dict[str, Any]):
@@ -1678,7 +1767,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         # Add to hash chain for audit trail
         self.pipeline_state.hash_chain.append(context_hash)
         
-        self.logger.info(f"🔐 Stored {context_key} with hash: {context_hash[:16]}...")
+        self.logger.info(f"[SECURE] Stored {context_key} with hash: {context_hash[:16]}...")
     
     async def _verify_context_integrity(self, context_key: str) -> bool:
         """
@@ -1696,7 +1785,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         stored = context_engine.get_context(self.project_id, context_key)
         
         if not stored:
-            self.logger.warning(f"⚠️ Context not found: {context_key}")
+            self.logger.warning(f"[WARN] Context not found: {context_key}")
             return False
         
         # Extract original hash
@@ -1704,7 +1793,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         stored_data = stored.get("data")
         
         if not stored_hash or not stored_data:
-            self.logger.error(f"❌ Context missing hash: {context_key}")
+            self.logger.error(f"[ERROR] Context missing hash: {context_key}")
             return False
         
         # Recompute hash from current data
@@ -1713,7 +1802,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         # Compare hashes
         if computed_hash != stored_hash:
             self.logger.error(
-                f"🚨 CONTEXT CORRUPTION DETECTED: {context_key}\n"
+                f"[CRITICAL] CONTEXT CORRUPTION DETECTED: {context_key}\n"
                 f"   Expected: {stored_hash[:16]}...\n"
                 f"   Got:      {computed_hash[:16]}..."
             )
@@ -1731,7 +1820,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             await self._rollback_to_last_good_state(context_key)
             return False
         
-        self.logger.debug(f"✅ Context integrity verified: {context_key}")
+        self.logger.debug(f"[OK] Context integrity verified: {context_key}")
         return True
     
     async def _rollback_to_last_good_state(self, corrupted_key: str):
@@ -1764,7 +1853,7 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             # Remove corrupted hash from chain
             self.pipeline_state.hash_chain.pop()
         else:
-            self.logger.error("❌ No good state to rollback to - pipeline restart required")
+            self.logger.error("[ERROR] No good state to rollback to - pipeline restart required")
             raise RuntimeError("Context corruption with no recovery point")
     
     # =========================================================================
@@ -1785,27 +1874,47 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         if similar_mistakes:
             self.logger.info(
-                f"📚 Found {len(similar_mistakes)} similar past mistakes for {agent_name}"
+                f"[LOAD] Found {len(similar_mistakes)} similar past mistakes for {agent_name}"
             )
         
         return similar_mistakes
     
-    async def _record_mistake(self, agent_name: str, error: str, fix: str):
-        """Record mistake for future learning"""
+    async def _handle_signals(self):
+        """Check for external signals (pause, cancel) from QueueManager"""
+        from app.services.queue_manager import QueueManager
+        queue = QueueManager.get_instance()
+        signal = queue.check_signal(self.project_id)
         
-        mistake_memory.record_failure(
-            agent_name=agent_name,
-            task_type=self.pipeline_state.current_phase.value,
-            input_data="",  # Fixed: removed context parameter, added input_data
-            error=error,
-            fix=fix
-        )
+        if signal == "pause":
+            await self.pause_pipeline()
+            queue.clear_signal(self.project_id)
+        elif signal == "resume":
+            await self.resume_pipeline()
+            queue.clear_signal(self.project_id)
+        elif signal == "cancel":
+            self.logger.error("[CANCEL] Project cancelled by user signal")
+            raise Exception("Project cancelled by user")
+            
+        # If paused, wait until resumed
+        while self.pipeline_state.paused:
+            await asyncio.sleep(2)
+            # Re-check for resume signal while waiting
+            signal = queue.check_signal(self.project_id)
+            if signal == "resume":
+                await self.resume_pipeline()
+                queue.clear_signal(self.project_id)
+            elif signal == "cancel":
+                raise Exception("Project cancelled by user")
+
     # =========================================================================
     # PROGRESS TRACKING
     # =========================================================================
     
     async def _update_progress(self, phase: PipelinePhase, percentage: int):
         """Update progress and notify Tilotma and WebSocket"""
+        
+        # Task 4.3: Check for signals before continuing
+        await self._handle_signals()
         
         self.pipeline_state.current_phase = phase
         self.pipeline_state.progress_percentage = percentage
@@ -1829,9 +1938,27 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         elif phase == PipelinePhase.DEPLOYMENT:
             message = "Configuring cloud infrastructure and deploying containers..."
             
-        await self._send_progress(phase.value, percentage, message)
+        # Task 2.6: Real Progress Metrics
+        file_count = 0
+        workspace_path = self.workspace.get('code_dir')
+        if workspace_path and os.path.exists(workspace_path):
+            for root, dirs, files in os.walk(workspace_path):
+                file_count += len(files)
         
-        self.logger.info(f"📊 Progress: {phase.value} - {percentage}%")
+        self.context_engine.store_context(
+            self.project_id,
+            "progress_metrics",
+            {
+                "phase": phase.value,
+                "percentage": percentage,
+                "files_created": file_count,
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+        
+        await self._send_progress(phase.value, percentage, f"{message} ({file_count} files created)")
+        
+        self.logger.info(f"[STATS] Progress: {phase.value} - {percentage}% ({file_count} files)")
 
     # =========================================================================
     # TILOTMA INTERVENTION SUPPORT
@@ -1839,13 +1966,13 @@ class Arjun(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
 
     async def pause_pipeline(self):
         """Pause pipeline (called by Tilotma intervention)"""
-        self.logger.warning("⏸️ Pipeline paused by Tilotma")
+        self.logger.warning("[PAUSE] Pipeline paused by Tilotma")
         self.pipeline_state.paused = True
         self.pipeline_state.intervention_count += 1
     
     async def resume_pipeline(self):
         """Resume pipeline after Tilotma intervention"""
-        self.logger.info("▶️ Pipeline resumed after Tilotma intervention")
+        self.logger.info("[RESUME] Pipeline resumed after Tilotma intervention")
         self.pipeline_state.paused = False
 
     async def rerun_agent(self, agent_name: str, correction: dict):

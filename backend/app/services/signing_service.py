@@ -66,7 +66,7 @@ class SigningService:
         # Cache loaded keys in memory
         self._key_cache: Dict[str, Dict[str, Any]] = {}
         
-        self.logger.info(f"🔐 SigningService initialized: {keys_directory}")
+        self.logger.info(f"[SECURE] SigningService initialized: {keys_directory}")
     
     def get_or_create_keypair(self, agent_name: str) -> Dict[str, Any]:
         """
@@ -99,15 +99,15 @@ class SigningService:
                 }
                 
                 self._key_cache[agent_name] = keypair
-                self.logger.info(f"🔑 Loaded existing keys for {agent_name}")
+                self.logger.info(f"[KEY] Loaded existing keys for {agent_name}")
                 return keypair
                 
             except Exception as e:
-                self.logger.warning(f"⚠️ Failed to load keys for {agent_name}: {e}")
+                self.logger.warning(f"[WARN] Failed to load keys for {agent_name}: {e}")
                 # Fall through to generate new keys
         
         # Generate new keypair
-        self.logger.info(f"🔨 Generating new keypair for {agent_name}...")
+        self.logger.info(f"[KEY] Generating new keypair for {agent_name}...")
         
         private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -129,7 +129,7 @@ class SigningService:
         }
         
         self._key_cache[agent_name] = keypair
-        self.logger.info(f"✅ Generated and saved new keys for {agent_name}")
+        self.logger.info(f"[OK] Generated and saved new keys for {agent_name}")
         
         return keypair
     
@@ -194,12 +194,12 @@ class SigningService:
                 "metadata": signing_metadata
             }
             
-            self.logger.debug(f"✍️ Signed output for {agent_name}")
+            self.logger.debug(f"[SIG] Signed output for {agent_name}")
             
             return signed_output
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to sign output for {agent_name}: {e}")
+            self.logger.error(f"[ERROR] Failed to sign output for {agent_name}: {e}")
             raise
     
     def verify_signature(
@@ -223,7 +223,7 @@ class SigningService:
                 agent_name = signed_output.get("metadata", {}).get("agent_name")
             
             if not agent_name:
-                self.logger.error("❌ Agent name not provided and not in metadata")
+                self.logger.error("[ERROR] Agent name not provided and not in metadata")
                 return False
             
             # Get agent's public key
@@ -250,15 +250,15 @@ class SigningService:
                     hashes.SHA256()
                 )
                 
-                self.logger.debug(f"✅ Signature verified for {agent_name}")
+                self.logger.debug(f"[OK] Signature verified for {agent_name}")
                 return True
                 
             except Exception:
-                self.logger.warning(f"❌ Invalid signature for {agent_name}")
+                self.logger.warning(f"[FAIL] Invalid signature for {agent_name}")
                 return False
             
         except Exception as e:
-            self.logger.error(f"❌ Verification failed: {e}")
+            self.logger.error(f"[ERROR] Verification failed: {e}")
             return False
     
     def verify_hash(self, signed_output: Dict[str, Any]) -> bool:
@@ -278,7 +278,7 @@ class SigningService:
             return computed_hash == stored_hash
             
         except Exception as e:
-            self.logger.error(f"❌ Hash verification failed: {e}")
+            self.logger.error(f"[ERROR] Hash verification failed: {e}")
             return False
     
     def _get_or_create_encryption_key(self) -> bytes:
@@ -300,7 +300,7 @@ class SigningService:
                 f.write(key)
             # Restrict permissions
             os.chmod(key_file, 0o600)
-            self.logger.info("🔑 Generated new encryption key for key storage")
+            self.logger.info("[KEY] Generated new encryption key for key storage")
             return key
     
     def _save_private_key(self, private_key, path: Path):
@@ -317,7 +317,7 @@ class SigningService:
         path.write_bytes(encrypted_pem)
         # Restrict permissions (owner read/write only)
         os.chmod(path, 0o600)
-        self.logger.debug(f"🔐 Saved encrypted private key to {path}")
+        self.logger.debug(f"[SECURE] Saved encrypted private key to {path}")
     
     def _save_public_key(self, public_key, path: Path):
         """Save public key to PEM file"""
@@ -337,7 +337,7 @@ class SigningService:
             pem = self.cipher.decrypt(encrypted_pem)
         except Exception as e:
             # Fallback for unencrypted keys (backward compatibility)
-            self.logger.warning(f"⚠️ Failed to decrypt key, trying unencrypted: {e}")
+            self.logger.warning(f"[WARN] Failed to decrypt key, trying unencrypted: {e}")
             pem = encrypted_pem
         
         return serialization.load_pem_private_key(
@@ -422,12 +422,12 @@ class Arjun:
         
         # Verify signature
         if not signing_service.verify_signature(output, agent_name):
-            self.logger.error(f"❌ Invalid signature from {agent_name}")
+            self.logger.error(f"[ERROR] Invalid signature from {agent_name}")
             raise SecurityError("Agent output signature invalid")
         
         # Verify hash
         if not signing_service.verify_hash(output):
-            self.logger.error(f"❌ Hash mismatch for {agent_name}")
+            self.logger.error(f"[ERROR] Hash mismatch for {agent_name}")
             raise SecurityError("Agent output tampered")
         
         return output["data"]  # Extract original data
@@ -455,7 +455,7 @@ async def verify_project(project_id: str):
 
 if __name__ == "__main__":
     # Test signing service
-    print("🔐 Testing SigningService...")
+    print("[SECURE] Testing SigningService...")
     
     # Create test data
     test_data = {
@@ -470,28 +470,28 @@ if __name__ == "__main__":
         output_data=test_data
     )
     
-    print("\n✍️ Signed output:")
+    print("\n[SIG] Signed output:")
     print(f"- Signature: {signed['signature'][:50]}...")
     print(f"- Hash: {signed['hash']}")
     print(f"- Agent: {signed['metadata']['agent_name']}")
     
     # Verify signature
     is_valid = signing_service.verify_signature(signed)
-    print(f"\n✅ Signature valid: {is_valid}")
+    print(f"\n[OK] Signature valid: {is_valid}")
     
     # Verify hash
     hash_valid = signing_service.verify_hash(signed)
-    print(f"✅ Hash valid: {hash_valid}")
+    print(f"[OK] Hash valid: {hash_valid}")
     
     # Test tampering detection
-    print("\n🔍 Testing tampering detection...")
+    print("\n[FIND] Testing tampering detection...")
     tampered = signed.copy()
     tampered["data"]["code"] = "MALICIOUS CODE"
     
     tamper_check = signing_service.verify_signature(tampered)
-    print(f"❌ Tampered signature valid: {tamper_check}")
+    print(f"[ERROR] Tampered signature valid: {tamper_check}")
     
     hash_tamper = signing_service.verify_hash(tampered)
-    print(f"❌ Tampered hash valid: {hash_tamper}")
+    print(f"[ERROR] Tampered hash valid: {hash_tamper}")
     
-    print("\n✅ SigningService test complete!")
+    print("\n[OK] SigningService test complete!")

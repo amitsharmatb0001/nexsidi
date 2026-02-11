@@ -230,7 +230,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         result = safe_json_parse(ai_response.content)
         
         if not result:
-            self.logger.error("❌ Failed to parse Tilotma response")
+            self.logger.error("[ERROR] Failed to parse Tilotma response")
             result = {
                 "response": "I'm sorry, I'm having trouble processing that request. Could you rephrase?",
                 "understanding": "Error parsing AI response",
@@ -258,25 +258,31 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
                 missing_info=result.get("missing_info", [])
             )
         
-        # Phase 1.5: Proactive Handoff (Check if requirements complete)
+        # Phase 1.5: Check if requirements complete and signal readiness
         if await self._check_requirements_complete():
-            self.logger.info("✅ Requirements complete - Starting project auto-handoff")
-            await self._send_progress("handoff", 100, "Requirements satisfied. Handing off to project manager...")
-            handoff_result = await self.handoff_to_arjun()
+            self.logger.info("[OK] Requirements complete - Signaling READY_FOR_EXECUTION")
+            self.phase = ConversationPhase.READY_FOR_EXECUTION
+            await self._send_progress("ready_for_execution", 100, "Requirements satisfied. Ready to start development...")
+            
+            # Return response with metadata for chat.py to create project
             return {
-                "type": "project_started",
-                "message": handoff_result,
+                "response": result.get("response", "Great! I have all the information I need. Let's start building your project!"),
                 "understanding": result.get("understanding"),
-                "status": "in_progress"
+                "confidence": result.get("confidence", 0.8),
+                "ready_to_start": True,
+                "total_tokens": 0,
+                "cost": 0.0
             }
         
         # Normal chat response
         return {
-            "type": "chat_response",
-            "message": result.get("response"),
+            "response": result.get("response"),
             "understanding": result.get("understanding"),
-            "ready_to_start": result.get("ready_to_start"),
-            "missing_info": result.get("missing_info", [])
+            "confidence": result.get("confidence", 0.5),
+            "ready_to_start": result.get("ready_to_start", False),
+            "missing_info": result.get("missing_info", []),
+            "total_tokens": 0,
+            "cost": 0.0
         }
 
     async def _check_requirements_complete(self) -> bool:
@@ -307,7 +313,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         Tilotma remains available for monitoring and intervention.
         """
         
-        self.logger.info("🚀 Handing off to Arjun (Project Manager)")
+        self.logger.info("[START] Handing off to Arjun (Project Manager)")
         
         # Prepare requirements from Tilotma's understanding
         understanding = self.memory.project_understanding
@@ -347,7 +353,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         self.arjun_task = task
         
         return (
-            "✅ I've handed this off to Arjun, our Project Manager. "
+            "[OK] I've handed this off to Arjun, our Project Manager. "
             "He'll coordinate the specialized agents to build your project. "
             "I'll monitor everything and keep you updated on progress!"
         )
@@ -378,7 +384,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
             await self._perform_final_validation(result)
             
         except Exception as e:
-            self.logger.error(f"❌ Pipeline failed: {e}")
+            self.logger.error(f"[ERROR] Pipeline failed: {e}")
             
             # Update handoff state with error
             context_engine.store_context(
@@ -403,7 +409,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         except asyncio.CancelledError:
             pass  # Task cancellation should not be logged as an error
         except Exception as e:
-            self.logger.error(f"❌ Background task failed: {e}", exc_info=True)
+            self.logger.error(f"[ERROR] Background task failed: {e}", exc_info=True)
             # Since this is a callback, we can't await. 
             # If we need to notify the user, we should schedule a new task.
             asyncio.create_task(self._notify_user_of_failure(e))
@@ -511,7 +517,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
             issue: Issue details
         """
         
-        self.logger.warning(f"🚨 TILOTMA INTERVENTION: {agent_name} - {issue['issue']}")
+        self.logger.warning(f"[CRITICAL] TILOTMA INTERVENTION: {agent_name} - {issue['issue']}")
         
         # Record intervention
         self.memory.record_intervention(
@@ -622,7 +628,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         validation = safe_json_parse(response.content)
         
         if not validation or "approved" not in validation:
-            self.logger.error("❌ Failed to parse validation result")
+            self.logger.error("[ERROR] Failed to parse validation result")
             return False
         
         if validation["approved"]:
@@ -660,7 +666,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
     async def _approve_and_deliver(self, result, validation: Dict):
         """Approve project and deliver to user with justification"""
         
-        self.logger.info("✅ Tilotma APPROVED project for delivery")
+        self.logger.info("[OK] Tilotma APPROVED project for delivery")
         
         self.phase = ConversationPhase.APPROVED
         
@@ -686,7 +692,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         
         # TODO: Notify user
         message = f"""
-        ✅ **Project Approved for Delivery**
+        [OK] **Project Approved for Delivery**
         
         I've completed my final validation and I'm confident this project meets all requirements.
         
@@ -704,7 +710,7 @@ class Tilotma(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, 
         """Reject output and send back to Arjun for fixes."""
         
         issues = validation.get("concerns", [])
-        self.logger.warning(f"❌ Tilotma REJECTED output: {len(issues)} issues found")
+        self.logger.warning(f"[ERROR] Tilotma REJECTED output: {len(issues)} issues found")
         
         self.memory.record_intervention(
             agent_name="pipeline",

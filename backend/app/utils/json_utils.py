@@ -45,7 +45,7 @@ def safe_json_parse(content: str) -> Any:
                 extracted = content[start:end]
                 return json.loads(extracted)
         except Exception as e:
-            logger.error(f"❌ safe_json_parse: Total failure to parse content: {e}")
+            logger.error(f"[ERROR] safe_json_parse: Total failure to parse content: {e}")
             return {}
 
     return {}

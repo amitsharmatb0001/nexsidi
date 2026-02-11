@@ -80,9 +80,9 @@ class LedgerService:
             # So I will use the shared client.
             self.redis.ping()
             self.connected = True
-            self.logger.info("✅ Connected to Redis ledger (shared pool)")
+            self.logger.info("[OK] Connected to Redis ledger (shared pool)")
         except Exception as e:
-            self.logger.warning(f"⚠️ Redis unavailable: {e}")
+            self.logger.warning(f"[WARN] Redis unavailable: {e}")
             self.redis = None
             self.connected = False
             # Fallback to in-memory ledger
@@ -140,13 +140,13 @@ class LedgerService:
             self._store_event(event)
             
             self.logger.info(
-                f"📝 Ledger event: {project_id} | {agent_name} | {event_type}"
+                f"[LOG] Ledger event: {project_id} | {agent_name} | {event_type}"
             )
             
             return event
             
         except Exception as e:
-            self.logger.error(f"❌ Failed to append event: {e}")
+            self.logger.error(f"[ERROR] Failed to append event: {e}")
             raise
     
     def get_project_ledger(
@@ -431,12 +431,12 @@ async def export_audit_trail(project_id: str, format: str = "json"):
 
 if __name__ == "__main__":
     # Test ledger service
-    print("📝 Testing LedgerService...")
+    print("[LOG] Testing LedgerService...")
     
     test_project = "test-project-001"
     
     # Append some events
-    print("\n✍️ Appending events...")
+    print("\n[SIG] Appending events...")
     
     ledger_service.append_event(
         project_id=test_project,
@@ -468,7 +468,7 @@ if __name__ == "__main__":
     print(f"Total events: {len(events)}")
     
     # Verify chain
-    print("\n🔍 Verifying chain...")
+    print("\n[FIND] Verifying chain...")
     verification = ledger_service.verify_chain(test_project)
     print(f"Chain valid: {verification['valid']}")
     print(f"Event count: {verification['event_count']}")
@@ -483,8 +483,8 @@ if __name__ == "__main__":
         print(f"  [{event['timestamp']}] {event['agent']} -> {event['action']}")
     
     # Export
-    print("\n💾 Exporting ledger...")
+    print("\n[SAVE] Exporting ledger...")
     json_export = ledger_service.export_ledger(test_project, "json")
     print(f"JSON export size: {len(json_export)} bytes")
     
-    print("\n✅ LedgerService test complete!")
+    print("\n[OK] LedgerService test complete!")

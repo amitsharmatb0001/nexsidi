@@ -136,9 +136,12 @@ class QueueManager:
         if metadata:
             project_data['metadata'] = json.dumps(metadata)
         
+        # Ensure all values are strings for Redis
+        redis_mapping = {k: str(v) for k, v in project_data.items()}
+        
         self.redis.hset(
             f"{self.project_prefix}{project_id}",
-            mapping=project_data
+            mapping=redis_mapping
         )
         
         # Set expiry (auto-cleanup after 24 hours)
@@ -150,7 +153,7 @@ class QueueManager:
         wait_time = self._estimate_wait_time(position)
         
         self.logger.info(
-            f"📝 Project {project_id} queued at position {position}. "
+            f"[LOG] Project {project_id} queued at position {position}. "
             f"Estimated wait: {wait_time}"
         )
         
@@ -195,9 +198,28 @@ class QueueManager:
             # Start processing task (Celery)
             process_project.delay(project_id)
             
-            self.logger.info(f"🚀 Started processing project {project_id}")
+            self.logger.info(f"[START] Started processing project {project_id}")
             
             processing_count += 1
+            
+    async def get_project_status(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Get project status from Redis"""
+        data = self.redis.hgetall(f"{self.project_prefix}{project_id}")
+        if data:
+             print(f"DEBUG QUEUE: Project {project_id} data type: {type(data)}")
+             print(f"DEBUG QUEUE: Data: {data}")
+        
+        if not data:
+            return None
+            
+        # Already decoded by redis client (decode_responses=True)
+        decoded = data
+        
+        # Add queue position if queued
+        if decoded.get('status') == ProjectStatus.QUEUED.value:
+            decoded['queue_position'] = self._get_queue_position(project_id)
+            
+        return decoded
     
     async def mark_completed(
         self,
@@ -220,7 +242,7 @@ class QueueManager:
             }
         )
         
-        self.logger.info(f"✅ Project {project_id} completed")
+        self.logger.info(f"[OK] Project {project_id} completed")
         
         # Process next in queue
         await self._process_queue()
@@ -246,26 +268,46 @@ class QueueManager:
             }
         )
         
-        self.logger.error(f"❌ Project {project_id} failed: {error}")
+        self.logger.error(f"[ERROR] Project {project_id} failed: {error}")
         
         # Process next in queue
         await self._process_queue()
     
-    async def get_project_status(self, project_id: str) -> Dict[str, Any]:
-        """Get current status of a project"""
-        
-        data = self.redis.hgetall(f"{self.project_prefix}{project_id}")
-        
-        if not data:
-            return {'status': 'not_found'}
-        
-        # Add current queue position if queued
-        if data.get('status') == ProjectStatus.QUEUED.value:
-            position = self._get_queue_position(project_id)
-            data['queue_position'] = position
-            data['estimated_wait'] = self._estimate_wait_time(position)
-        
-        return data
+
+
+    async def pause_project(self, project_id: str):
+        """Signal project to pause"""
+        self.redis.set(f"signal:{project_id}", "pause", ex=3600)
+        self.logger.info(f"[PAUSE] Signal: PAUSE project {project_id}")
+
+    async def resume_project(self, project_id: str):
+        """Signal project to resume"""
+        self.redis.set(f"signal:{project_id}", "resume", ex=3600)
+        self.logger.info(f"[RESUME] Signal: RESUME project {project_id}")
+
+    async def cancel_project(self, project_id: str):
+        """Signal project to cancel"""
+        self.redis.set(f"signal:{project_id}", "cancel", ex=3600)
+        self.logger.info(f"[CANCEL] Signal: CANCEL project {project_id}")
+
+    def check_signal(self, project_id: str) -> Optional[str]:
+        """Check for external signals (pause/cancel)"""
+        signal = self.redis.get(f"signal:{project_id}")
+        if signal:
+            return signal.decode() if isinstance(signal, bytes) else signal
+        return None
+
+    def clear_signal(self, project_id: str):
+        """Clear the signal after consumption"""
+        self.redis.delete(f"signal:{project_id}")
+
+    def get_active_arjun(self, project_id: str) -> Any:
+        """
+        Stub for getting active Arjun instance. 
+        In multi-process environments, signals are preferred.
+        """
+        # For now, we'll return None as we use signals
+        return None
     
     async def get_queue_size(self) -> int:
         """Get current queue size (waiting projects)"""
@@ -362,7 +404,7 @@ def process_project(self, project_id: str):
     import asyncio
     from app.core.project_processor import ProjectProcessor
     
-    logger.info(f"🔨 Worker processing project {project_id}")
+    logger.info(f"[BUILD] Worker processing project {project_id}")
     
     queue = QueueManager()
     
@@ -380,7 +422,7 @@ def process_project(self, project_id: str):
         # Mark failed
         asyncio.run(queue.mark_failed(project_id, str(e)))
         
-        logger.error(f"❌ Worker failed for project {project_id}: {e}")
+        logger.error(f"[ERROR] Worker failed for project {project_id}: {e}")
         raise
 
 

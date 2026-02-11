@@ -27,10 +27,10 @@ class ContextEngine:
         try:
             self.redis_client = get_redis_client()
             self.redis_client.ping()
-            self.logger.info("✅ Connected to Redis for ContextEngine")
+            self.logger.info("[OK] Connected to Redis for ContextEngine")
             self.connected = True
         except Exception as e:
-            self.logger.warning(f"⚠️ Redis unavailable for ContextEngine: {e}")
+            self.logger.warning(f"[WARN] Redis unavailable for ContextEngine: {e}")
             self.redis_client = None
             self.connected = False
             self.memory_store = {}
@@ -119,7 +119,7 @@ class ContextEngine:
             self.memory_store[f"chain_index:{project_id}:{context_type}"] = str(payload['chain_index'])
             
         self.logger.info(
-            f"💾 Stored context: {context_type} for {project_id} "
+            f"[SAVE] Stored context: {context_type} for {project_id} "
             f"(hash: {data_hash[:8]}..., chain_index: {payload['chain_index']}, "
             f"previous: {previous_hash[:8] if previous_hash else 'genesis'}...)"
         )
@@ -184,7 +184,7 @@ class ContextEngine:
             data = payload.get("data", {})
             embedded_hash = payload.get("hash")
         except json.JSONDecodeError:
-            self.logger.error(f"❌ Corrupted payload for {context_type}")
+            self.logger.error(f"[ERROR] Corrupted payload for {context_type}")
             return {}
         
         # VERIFY HASH (patent requirement)
@@ -196,11 +196,11 @@ class ContextEngine:
             # Check if hash matches
             if computed_hash != embedded_hash:
                 self.logger.error(
-                    f"❌ HASH MISMATCH for {context_type}! "
+                    f"[ERROR] HASH MISMATCH for {context_type}! "
                     f"Expected: {embedded_hash[:8]}..., "
                     f"Got: {computed_hash[:8]}..."
                 )
-                self.logger.error("🚨 DATA CORRUPTION DETECTED - Triggering rollback")
+                self.logger.error("[CRITICAL] DATA CORRUPTION DETECTED - Triggering rollback")
                 
                 # Trigger automatic rollback (notify Arjun)
                 self._trigger_rollback(project_id, context_type, embedded_hash, computed_hash)
@@ -210,7 +210,7 @@ class ContextEngine:
             # Also verify against separately stored hash
             if stored_hash and stored_hash != embedded_hash:
                 self.logger.error(
-                    f"❌ HASH INCONSISTENCY for {context_type}! "
+                    f"[ERROR] HASH INCONSISTENCY for {context_type}! "
                     f"Embedded: {embedded_hash[:8]}..., "
                     f"Stored: {stored_hash[:8]}..."
                 )
@@ -218,7 +218,7 @@ class ContextEngine:
                 return {}
             
             self.logger.info(
-                f"✅ Hash verified for {context_type} "
+                f"[OK] Hash verified for {context_type} "
                 f"({embedded_hash[:8]}...)"
             )
         
@@ -241,7 +241,7 @@ class ContextEngine:
         - Freeze project until manual review
         """
         self.logger.error(
-            f"🚨 ROLLBACK TRIGGERED for project {project_id}, context: {context_type}"
+            f"[CRITICAL] ROLLBACK TRIGGERED for project {project_id}, context: {context_type}"
         )
         
         # Store rollback event
@@ -350,7 +350,7 @@ class ContextEngine:
             for k in keys_to_delete:
                 del self.memory_store[k]
                 
-        self.logger.info(f"🧹 Cleared context for {project_id}")
+        self.logger.info(f"[OK] Cleared context for {project_id}")
     
     def _get_latest_hash(self, project_id: str, context_type: str) -> Optional[str]:
         """

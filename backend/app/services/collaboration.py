@@ -82,15 +82,15 @@ class CollaborationSession:
                         })
                         break
                     except ImportError as e:
-                        self.logger.error(f"❌ Research agent not available: {e}")
+                        self.logger.error(f"[ERROR] Research agent not available: {e}")
                         break  # Don't retry import errors
                     except ConnectionError as e:
                         retry_count += 1
                         self.logger.warning(
-                            f"⚠️ Research agent connection failed (attempt {retry_count}/{max_retries}): {e}"
+                            f"[WARN] Research agent connection failed (attempt {retry_count}/{max_retries}): {e}"
                         )
                         if retry_count >= max_retries:
-                            self.logger.error("❌ Research agent failed after max retries")
+                            self.logger.error("[ERROR] Research agent failed after max retries")
                             # Add fallback message
                             self.discussion.append({
                                 "speaker": "system",
@@ -102,7 +102,7 @@ class CollaborationSession:
                             await __import__('asyncio').sleep(2 ** retry_count)
                     except Exception as e:
                         self.logger.error(
-                            f"❌ Research agent failed with unexpected error: {type(e).__name__}: {e}",
+                            f"[ERROR] Research agent failed with unexpected error: {type(e).__name__}: {e}",
                             exc_info=True
                         )
                         # For critical bugs, raise the error instead of suppressing

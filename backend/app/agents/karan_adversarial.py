@@ -128,7 +128,7 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             
             # Log cost
             self.logger.info(
-                f"✅ {response.output_tokens} tokens, "
+                f"[OK] {response.output_tokens} tokens, "
                 f"₹{response.cost_estimate:.4f}"
             )
             
@@ -158,11 +158,11 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             return result
             
         except json.JSONDecodeError as e:
-            self.logger.error(f"❌ Invalid JSON response: {e}")
+            self.logger.error(f"[ERROR] Invalid JSON response: {e}")
             return self._error_response("Failed to parse AI response")
             
         except Exception as e:
-            self.logger.error(f"❌ Security review failed: {e}")
+            self.logger.error(f"[ERROR] Security review failed: {e}")
             await self.record_failure(
                 task_type="adversarial_security",
                 error=str(e),
@@ -183,7 +183,7 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             reward: Reward score (vulnerability count + severity weighting)
             strategy: "maximization" (find more vulnerabilities)
         """
-        self.logger.info(f"📚 Learning from feedback: reward={reward}, strategy={strategy}")
+        self.logger.info(f"[LOAD] Learning from feedback: reward={reward}, strategy={strategy}")
         
         # Track learning history
         self.learning_history.append({
@@ -199,7 +199,7 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             if reward >= 5:
                 # High reward - excellent vulnerability detection
                 self.current_strategy_score += 1.5
-                self.logger.info("✅ High reward - reinforcing security analysis approach")
+                self.logger.info("[OK] High reward - reinforcing security analysis approach")
                 
             elif reward >= 2:
                 # Moderate reward - good but can improve
@@ -209,7 +209,7 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
             else:
                 # Low reward - need more aggressive analysis
                 self.current_strategy_score -= 0.5
-                self.logger.info("⚠️ Low reward - intensifying security analysis")
+                self.logger.info("[WARN] Low reward - intensifying security analysis")
         
         # Store learning in mistake memory
         mistake_memory.record_failure(
@@ -221,7 +221,7 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
         
         # Log current learning state
         self.logger.info(
-            f"📊 Learning state: strategy_score={self.current_strategy_score:.2f}, "
+            f"[STATS] Learning state: strategy_score={self.current_strategy_score:.2f}, "
             f"critical_vulns={self.critical_count}, history_size={len(self.learning_history)}"
         )
     
@@ -261,7 +261,7 @@ class KaranAdversarial(MistakeMemoryMixin, PermanentMemoryMixin, ContextManageme
         # Step 2: Incorporate past mistakes (from MistakeMemoryMixin)
         if past_mistakes:
             base_prompt = self.incorporate_past_learnings(past_mistakes, base_prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past mistakes into security review prompt")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past mistakes into security review prompt")
         
         return base_prompt
 

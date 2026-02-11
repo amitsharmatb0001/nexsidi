@@ -84,7 +84,7 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
             }
         """
         try:
-            self.logger.info("📱 Starting mobile app generation...")
+            self.logger.info("[MOBILE] Starting mobile app generation...")
             
             platforms = input_data.get("platforms", ["android"])
             framework = input_data.get("framework")
@@ -112,11 +112,11 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
             self.apps_generated += 1
             result["cost"] = self.total_cost
             
-            self.logger.info(f"✅ Mobile app generated: {framework}")
+            self.logger.info(f"[OK] Mobile app generated: {framework}")
             return result
             
         except Exception as e:
-            self.logger.error(f"❌ Mobile app generation failed: {e}")
+            self.logger.error(f"[ERROR] Mobile app generation failed: {e}")
             await self.record_failure(
                 task_type="mobile_execution",
                 error=str(e),
@@ -163,7 +163,7 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
         Output: ONE codebase for iOS + Android + Web
         Build: Android on Linux, iOS needs Mac
         """
-        self.logger.info("🎨 Generating Flutter app...")
+        self.logger.info("[DESIGN] Generating Flutter app...")
         
         requirements = input_data.get("requirements", {})
         design_system = input_data.get("design_system", {})
@@ -231,7 +231,7 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for flutter")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for flutter")
         
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],
@@ -257,9 +257,9 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
         Build Flutter artifacts
         
         Linux (GCP):
-        - ✅ Android APK
-        - ✅ Web build
-        - ❌ iOS IPA (needs Mac)
+        - [OK] Android APK
+        - [OK] Web build
+        - [ERROR] iOS IPA (needs Mac)
         
         Returns URLs and installation instructions
         """
@@ -301,7 +301,7 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
         4. Upload to Firebase App Distribution
         5. Return download URL and QR code
         """
-        self.logger.info("🤖 Building Android APK...")
+        self.logger.info("[AGENT] Building Android APK...")
         
         # For now, return mock result
         # TODO: Integrate with actual GCP Cloud Build
@@ -407,7 +407,7 @@ class Riya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, Dec
         
         if past_mistakes:
             prompt = self.incorporate_past_learnings(past_mistakes, prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings for PWA")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings for PWA")
         
         response = await self.ai_router.generate(
             messages=[{"role": "user", "content": prompt}],

@@ -101,7 +101,7 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             self.logger.info("ℹ️ Retrieved backend context")
 
         try:
-            self.logger.info("🎨 Starting frontend generation...")
+            self.logger.info("[DESIGN] Starting frontend generation...")
             
             # Extract architecture
             fe_arch = input_data.get("frontend_architecture", {})
@@ -149,23 +149,24 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             await self._send_progress("generating_frontend", 100, "Frontend generation complete.")
             
             self.logger.info(
-                f"✅ Frontend generation complete: {len(generated_files)} files, "
+                f"[OK] Frontend generation complete: {len(generated_files)} files, "
                 f"₹{self.total_cost:.2f}"
             )
             
-            # Re-confirm files written
+            # Re-confirm files written (Task 3.2 Fix)
             files_written = all(os.path.exists(os.path.join(self.workspace['code_dir'], f['path'])) for f in file_plan["files"])
             
             return {
                 "project_id": self.project_id,
                 "files_written": files_written,
+                "files_count": len(generated_files),
                 "frontend_url": "", # Will be set by Arjun if starting server
                 "build_status": "success",
                 "workspace_path": self.workspace['code_dir']
             }
             
         except Exception as e:
-            self.logger.error(f"❌ Frontend generation failed: {e}")
+            self.logger.error(f"[ERROR] Frontend generation failed: {e}")
             await self.record_failure(
                 task_type="frontend_execution",
                 error=str(e),
@@ -271,7 +272,7 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         
         if past_mistakes:
             generation_prompt = self.incorporate_past_learnings(past_mistakes, generation_prompt)
-            self.logger.info(f"📚 Incorporated {len(past_mistakes)} past learnings")
+            self.logger.info(f"[LOAD] Incorporated {len(past_mistakes)} past learnings")
 
         # Call AI Router directly
         response = await self.ai_router.generate(
@@ -285,7 +286,7 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
         # Log cost
         self.total_cost += response.cost_estimate
         self.logger.info(
-            f"✅ {response.output_tokens} tokens, "
+            f"[OK] {response.output_tokens} tokens, "
             f"₹{response.cost_estimate:.4f}"
         )
         
@@ -312,7 +313,7 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(result["file_content"])
             
-            self.logger.info(f"✅ Written: {full_path}")
+            self.logger.info(f"[OK] Written: {full_path}")
             
             # Commit to git
             git_service.commit_agent_work(
@@ -324,7 +325,7 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
             return result  # Return as-is
             
         except Exception as e:
-            self.logger.error(f"❌ Error generating frontend file: {e}")
+            self.logger.error(f"[ERROR] Error generating frontend file: {e}")
             await self.record_failure(
                 task_type="frontend_generation",
                 error=str(e),
@@ -363,10 +364,10 @@ class Aanya(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, De
                 check=True
             )
             
-            self.logger.info("✅ Frontend setup complete!")
+            self.logger.info("[OK] Frontend setup complete!")
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Frontend setup failed: {e}")
+            self.logger.error(f"[ERROR] Frontend setup failed: {e}")
             raise
 
 

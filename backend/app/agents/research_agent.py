@@ -73,7 +73,7 @@ class ResearchAgent(MistakeMemoryMixin, ProgressMixin):
             if not query:
                 raise ValueError("Query is required")
             
-            self.logger.info(f"🔍 Researching: {query}")
+            self.logger.info(f"[FIND] Researching: {query}")
             await self._send_progress("research", 30, f"Searching documentation for: {query}...")
             
             # Perform web search
@@ -92,7 +92,7 @@ class ResearchAgent(MistakeMemoryMixin, ProgressMixin):
             }
             
         except Exception as e:
-            self.logger.error(f"❌ Research failed: {e}")
+            self.logger.error(f"[ERROR] Research failed: {e}")
             raise
     
     async def _web_search(

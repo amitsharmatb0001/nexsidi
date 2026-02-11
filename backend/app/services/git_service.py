@@ -125,7 +125,7 @@ logs/
                 check=True
             )
             
-            self.logger.info(f"✅ Git repo initialized: {project_path}")
+            self.logger.info(f"[OK] Git repo initialized: {project_path}")
             
             return {
                 "status": "success",
@@ -134,7 +134,7 @@ logs/
             }
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Git init failed: {e}")
+            self.logger.error(f"[ERROR] Git init failed: {e}")
             return {
                 "status": "error",
                 "error": str(e)
@@ -166,7 +166,7 @@ logs/
             )
             
             # Commit
-            commit_msg = message or f"✨ {agent_name.upper()}: Generated code"
+            commit_msg = message or f"[STAR] {agent_name.upper()}: Generated code"
             subprocess.run(
                 ["git", "commit", "-m", commit_msg],
                 cwd=project_path,
@@ -184,7 +184,7 @@ logs/
             )
             commit_hash = result.stdout.strip()
             
-            self.logger.info(f"✅ Committed {agent_name} work: {commit_hash[:8]}")
+            self.logger.info(f"[OK] Committed {agent_name} work: {commit_hash[:8]}")
             
             return {
                 "status": "success",
@@ -200,7 +200,7 @@ logs/
                     "message": "No changes to commit"
                 }
             
-            self.logger.error(f"❌ Commit failed: {e}")
+            self.logger.error(f"[ERROR] Commit failed: {e}")
             return {
                 "status": "error",
                 "error": str(e)
@@ -225,7 +225,7 @@ logs/
                 check=True
             )
             
-            self.logger.info(f"✅ Created branch: {branch_name}")
+            self.logger.info(f"[OK] Created branch: {branch_name}")
             
             return {
                 "status": "success",
@@ -233,7 +233,7 @@ logs/
             }
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Branch creation failed: {e}")
+            self.logger.error(f"[ERROR] Branch creation failed: {e}")
             return {
                 "status": "error",
                 "error": str(e)
@@ -262,7 +262,7 @@ logs/
                 check=True
             )
             
-            self.logger.info(f"✅ Merged {iteration_branch} to main")
+            self.logger.info(f"[OK] Merged {iteration_branch} to main")
             
             return {
                 "status": "success",
@@ -270,7 +270,7 @@ logs/
             }
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Merge failed: {e}")
+            self.logger.error(f"[ERROR] Merge failed: {e}")
             return {
                 "status": "error",
                 "error": str(e)
@@ -293,7 +293,7 @@ logs/
                 check=True
             )
             
-            self.logger.info(f"✅ Tagged deployment: {version}")
+            self.logger.info(f"[OK] Tagged deployment: {version}")
             
             return {
                 "status": "success",
@@ -301,7 +301,7 @@ logs/
             }
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Tagging failed: {e}")
+            self.logger.error(f"[ERROR] Tagging failed: {e}")
             return {
                 "status": "error",
                 "error": str(e)
@@ -374,7 +374,7 @@ logs/
             return commits
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"❌ Failed to get history: {e}")
+            self.logger.error(f"[ERROR] Failed to get history: {e}")
             return []
 
 

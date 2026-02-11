@@ -441,7 +441,7 @@ class Vikram(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
         Returns:
             JSON blueprint
         """
-        self.logger.info("🧠 Generating architectural blueprint with AI...")
+        self.logger.info("[AI] Generating architectural blueprint with AI...")
         
         # Check if we already have a blueprint for this context to avoid re-gen
         # (Skip for now to ensure we always get fresh generation if called)
@@ -472,9 +472,9 @@ class Vikram(MistakeMemoryMixin, PermanentMemoryMixin, ContextManagementMixin, D
             if not blueprint:
                 raise ValueError("Failed to parse AI response as JSON")
                 
-            self.logger.info("✅ Blueprint generated and parsed successfully")
+            self.logger.info("[OK] Blueprint generated and parsed successfully")
             return blueprint
             
         except Exception as e:
-            self.logger.error(f"❌ Blueprint generation failed: {e}")
+            self.logger.error(f"[ERROR] Blueprint generation failed: {e}")
             raise

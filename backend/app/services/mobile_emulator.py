@@ -51,7 +51,7 @@ class MobileEmulator:
         
         try:
             # Wait for emulator boot
-            self.logger.info("📱 Waiting for Android emulator to boot...")
+            self.logger.info("[MOBILE] Waiting for Android emulator to boot...")
             isolation_manager.execute_in_container(
                 container_id,
                 "adb wait-for-device",

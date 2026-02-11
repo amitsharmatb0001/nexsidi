@@ -17,6 +17,16 @@ class User(Base):
     is_admin = Column(Boolean, default=False)                # Admin access
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
+# Table 2: Chats (grouping conversations)
+class Chat(Base):
+    __tablename__ = 'chats'
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'))
+    title = Column(String(255), default="New Chat")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
 # Table 2: Projects (user's app requests)
 class Project(Base):
     __tablename__ = 'projects'
@@ -56,6 +66,9 @@ class Conversation(Base):
     
     # NEW: Link to user (required)
     user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    
+    # NEW: Link to chat (grouping)
+    chat_id = Column(UUID(as_uuid=True), ForeignKey('chats.id', ondelete='CASCADE'), nullable=True)
     
     # CHANGED: Link to project (optional - might not exist yet!)
     project_id = Column(UUID(as_uuid=True), ForeignKey('projects.id', ondelete='CASCADE'), nullable=True)
