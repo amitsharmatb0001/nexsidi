@@ -122,6 +122,25 @@ def _build_database_url() -> str | None:
     return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
 
 
+def _build_admin_database_url() -> str | None:
+    """Construct DATABASE_ADMIN_URL for migrations (DDL permissions).
+
+    Same DB_HOST/DB_PORT/DB_NAME but uses DB_ADMIN_USER (default: nexsidi_admin)
+    and DB_ADMIN_PASSWORD (falls back to DB_PASSWORD if not set separately).
+    """
+    host = os.environ.get("DB_HOST")
+    password = os.environ.get("DB_ADMIN_PASSWORD") or os.environ.get("DB_PASSWORD")
+
+    if not host or not password:
+        return None
+
+    user = os.environ.get("DB_ADMIN_USER", "nexsidi_admin")
+    port = os.environ.get("DB_PORT", "5432")
+    dbname = os.environ.get("DB_NAME", "nexsidi")
+
+    return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
+
+
 def load_secrets() -> int:
     """Fetch all secrets from GCP Secret Manager and inject as env vars.
 
@@ -174,6 +193,14 @@ def load_secrets() -> int:
             os.environ["DATABASE_URL"] = db_url
             loaded += 1
             logger.info("DATABASE_URL constructed from DB_HOST + DB_PASSWORD")
+
+    # Build DATABASE_ADMIN_URL for migrations (DDL permissions)
+    if not os.environ.get("DATABASE_ADMIN_URL"):
+        admin_url = _build_admin_database_url()
+        if admin_url:
+            os.environ["DATABASE_ADMIN_URL"] = admin_url
+            loaded += 1
+            logger.info("DATABASE_ADMIN_URL constructed from DB_HOST + DB_ADMIN_USER")
 
     logger.info("secret_manager: loaded %d secrets from project %s", loaded, project_id)
     return loaded

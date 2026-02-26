@@ -1,0 +1,42 @@
+# NexSidi v2 -- Production Dependencies
+# Generated from pyproject.toml
+# Install: pip install -r requirements.txt
+
+# Web framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.18
+
+# Database
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+alembic>=1.14.0
+greenlet>=3.1.0
+
+# Auth
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.2.0
+httpx>=0.28.0
+
+# Cache
+redis[hiredis]>=5.2.0
+
+# Task queue
+celery[redis]>=5.4.0
+
+# Validation
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+email-validator>=2.2.0
+
+# Template engine
+jinja2>=3.1.0
+
+# GCP (dual-project: NexSidi infra + YugNex Vertex AI)
+google-cloud-secret-manager>=2.21.0
+google-auth>=2.36.0
+
+# Utilities
+python-dotenv>=1.0.1
+orjson>=3.10.0
+structlog>=24.4.0
