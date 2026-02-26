@@ -2,15 +2,23 @@
 
 Uses Pydantic BaseSettings for validation and type coercion.
 Every setting has a sensible default or raises at startup if missing.
+
+Secret loading order (highest priority wins):
+1. Explicit environment variables (e.g. set in Cloud Run / k8s)
+2. GCP Secret Manager (fetched at startup via load_secrets())
+3. .env file (development fallback)
 """
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("nexsidi.config")
 
 
 class Settings(BaseSettings):
@@ -28,13 +36,13 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
-    # --- Database (app user — RLS enforced, no DDL) ---
+    # --- Database (app user -- RLS enforced, no DDL) ---
     database_url: PostgresDsn
     db_pool_size: int = Field(default=10, ge=1, le=100)
     db_max_overflow: int = Field(default=20, ge=0, le=100)
     db_pool_recycle: int = Field(default=300, ge=60, description="Seconds before connection recycled")
 
-    # --- Database (admin — migrations only, never used by app) ---
+    # --- Database (admin -- migrations only, never used by app) ---
     database_admin_url: PostgresDsn | None = None
 
     # --- Valkey (Redis-compatible cache) ---
@@ -54,6 +62,16 @@ class Settings(BaseSettings):
     # --- AI Providers ---
     anthropic_api_key: str = ""
     google_ai_api_key: str = ""
+
+    # --- Email (ZeptoMail) ---
+    zeptomail_smtp_server: str = ""
+    zeptomail_smtp_port: int = 587
+    zeptomail_username: str = ""
+    zeptomail_password: str = ""
+    zeptomail_sender_email: str = ""
+
+    # --- Deployment ---
+    nexsidi_deploy_key: str = ""
 
     # --- CORS ---
     cors_origins: list[str] = ["http://localhost:3000"]
@@ -86,8 +104,40 @@ class Settings(BaseSettings):
         """Return database URL string for SQLAlchemy async engine."""
         return str(self.database_url)
 
+    @property
+    def has_email(self) -> bool:
+        """Check if ZeptoMail is configured."""
+        return bool(self.zeptomail_smtp_server and self.zeptomail_username)
+
+
+# ── Load secrets from GCP BEFORE Settings is created ───────────
+
+_secrets_loaded = False
+
+
+def _ensure_secrets_loaded() -> None:
+    """Load secrets from GCP Secret Manager (once, on first call)."""
+    global _secrets_loaded
+    if _secrets_loaded:
+        return
+    _secrets_loaded = True
+
+    try:
+        from app.services.secret_manager import load_secrets
+        count = load_secrets()
+        if count > 0:
+            logger.info("Loaded %d secrets from GCP Secret Manager", count)
+    except Exception as exc:
+        # Non-fatal: fall back to env vars / .env
+        logger.debug("Secret Manager unavailable: %s", exc)
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Cached settings singleton. Call this everywhere instead of constructing Settings()."""
+    """Cached settings singleton. Call this everywhere instead of constructing Settings().
+
+    On first call, attempts to load secrets from GCP Secret Manager.
+    If GCP is not available, falls back to env vars and .env file.
+    """
+    _ensure_secrets_loaded()
     return Settings()  # type: ignore[call-arg]

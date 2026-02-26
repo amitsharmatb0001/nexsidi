@@ -34,6 +34,9 @@ dependencies = [
     # Template engine
     "jinja2>=3.1.0",
 
+    # GCP
+    "google-cloud-secret-manager>=2.21.0",
+
     # Utilities
     "python-dotenv>=1.0.1",
     "orjson>=3.10.0",
