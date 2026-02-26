@@ -11,7 +11,7 @@ Vertex AI REST API in the YugNex project.
 
 Secret mapping (GCP secret name -> env var):
     ANTHROPIC_API_KEY       -> ANTHROPIC_API_KEY
-    database-password       -> DB_PASSWORD (used to build DATABASE_URL)
+    databse-paasword        -> DB_PASSWORD (used to build DATABASE_URL)
     GOOGLE_API_KEY          -> GOOGLE_AI_API_KEY
     JWT_SECRET              -> JWT_SECRET_KEY
     REDIS_URL               -> VALKEY_URL
@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 from typing import Any
 
 # Use stdlib logging (structlog may not be configured yet at import time)
@@ -46,7 +47,7 @@ logger = logging.getLogger("nexsidi.secret_manager")
 
 SECRET_TO_ENV: dict[str, str] = {
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
-    "database-password": "DB_PASSWORD",
+    "databse-paasword": "DB_PASSWORD",
     "GOOGLE_API_KEY": "GOOGLE_AI_API_KEY",
     "JWT_SECRET": "JWT_SECRET_KEY",
     "REDIS_URL": "VALKEY_URL",
@@ -119,7 +120,10 @@ def _build_database_url() -> str | None:
     port = os.environ.get("DB_PORT", "5432")
     dbname = os.environ.get("DB_NAME", "nexsidi")
 
-    return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
+    # URL-encode password (handles special chars like @, :, /, etc.)
+    encoded_pw = urllib.parse.quote_plus(password.strip())
+
+    return f"postgresql+asyncpg://{user}:{encoded_pw}@{host}:{port}/{dbname}"
 
 
 def _build_admin_database_url() -> str | None:
@@ -134,11 +138,14 @@ def _build_admin_database_url() -> str | None:
     if not host or not password:
         return None
 
-    user = os.environ.get("DB_ADMIN_USER", "nexsidi_admin")
+    user = os.environ.get("DB_ADMIN_USER", os.environ.get("DB_USER", "postgres"))
     port = os.environ.get("DB_PORT", "5432")
     dbname = os.environ.get("DB_NAME", "nexsidi")
 
-    return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
+    # URL-encode password (handles special chars like @, :, /, etc.)
+    encoded_pw = urllib.parse.quote_plus(password.strip())
+
+    return f"postgresql+asyncpg://{user}:{encoded_pw}@{host}:{port}/{dbname}"
 
 
 def load_secrets() -> int:

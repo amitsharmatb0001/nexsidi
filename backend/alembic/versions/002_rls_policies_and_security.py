@@ -5,7 +5,7 @@ Creates two PostgreSQL roles:
     nexsidi_admin -- migration user (full DDL, no RLS)
 
 Enables RLS on all tenant-scoped tables. Policies use SET LOCAL session
-variables (app.current_tenant, app.current_user, app.current_role) set
+variables (app.current_tenant, app.current_user_id, app.user_role) set
 by the application middleware before each transaction.
 
 Audit table (audit.logs) is made INSERT-ONLY for the app user:
@@ -124,8 +124,8 @@ def upgrade() -> None:
     conn.execute(sa.text("""
         CREATE POLICY rls_auth_whatsapp_accounts_user ON auth.whatsapp_accounts
         FOR ALL TO nexsidi_app
-        USING (user_id::text = current_setting('app.current_user', true))
-        WITH CHECK (user_id::text = current_setting('app.current_user', true))
+        USING (user_id::text = current_setting('app.current_user_id', true))
+        WITH CHECK (user_id::text = current_setting('app.current_user_id', true))
     """))
 
     # auth.feature_flags -- readable by all, writable by admins only
@@ -143,8 +143,8 @@ def upgrade() -> None:
     conn.execute(sa.text("""
         CREATE POLICY rls_auth_feature_flags_write ON auth.feature_flags
         FOR ALL TO nexsidi_app
-        USING (current_setting('app.current_role', true) IN ('org_admin', 'super_admin'))
-        WITH CHECK (current_setting('app.current_role', true) IN ('org_admin', 'super_admin'))
+        USING (current_setting('app.user_role', true) IN ('org_admin', 'super_admin'))
+        WITH CHECK (current_setting('app.user_role', true) IN ('org_admin', 'super_admin'))
     """))
 
     # core.team_members -- filter by team's organization
@@ -238,8 +238,8 @@ def upgrade() -> None:
     conn.execute(sa.text("""
         CREATE POLICY rls_audit_security_events_read ON audit.security_events
         FOR SELECT TO nexsidi_app
-        USING (user_id::text = current_setting('app.current_user', true)
-               OR current_setting('app.current_role', true) IN ('org_admin', 'super_admin'))
+        USING (user_id::text = current_setting('app.current_user_id', true)
+               OR current_setting('app.user_role', true) IN ('org_admin', 'super_admin'))
     """))
     conn.execute(sa.text("""
         CREATE POLICY rls_audit_security_events_insert ON audit.security_events
@@ -257,8 +257,8 @@ def upgrade() -> None:
     conn.execute(sa.text("""
         CREATE POLICY rls_audit_consent_records_user ON audit.consent_records
         FOR ALL TO nexsidi_app
-        USING (user_id::text = current_setting('app.current_user', true))
-        WITH CHECK (user_id::text = current_setting('app.current_user', true))
+        USING (user_id::text = current_setting('app.current_user_id', true))
+        WITH CHECK (user_id::text = current_setting('app.current_user_id', true))
     """))
 
     # ── Step 6: Grant nexsidi_app access to public schema for alembic_version

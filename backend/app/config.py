@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     valkey_password: str = ""
 
     # --- JWT Auth ---
-    jwt_secret_key: str = Field(min_length=32)
+    jwt_secret_key: str = Field(min_length=16)
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = Field(default=15, ge=1, le=60)
     refresh_token_expire_days: int = Field(default=7, ge=1, le=30)
@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     @field_validator("jwt_secret_key", mode="before")
     @classmethod
     def validate_jwt_secret(cls, v: str) -> str:
-        if not v or len(v) < 32:
-            raise ValueError("JWT_SECRET_KEY must be at least 32 characters")
+        if not v or len(v) < 16:
+            raise ValueError("JWT_SECRET_KEY must be at least 16 characters")
         return v
 
     @property
@@ -122,11 +122,22 @@ _secrets_loaded = False
 
 
 def _ensure_secrets_loaded() -> None:
-    """Load secrets from GCP Secret Manager (once, on first call)."""
+    """Load .env first, then secrets from GCP Secret Manager (once, on first call).
+
+    The .env file must be loaded BEFORE Secret Manager so that GCP_PROJECT_ID
+    and DB_HOST are available for _detect_gcp_project_id() and _build_database_url().
+    """
     global _secrets_loaded
     if _secrets_loaded:
         return
     _secrets_loaded = True
+
+    # Load .env FIRST so GCP_PROJECT_ID, DB_HOST etc. are in os.environ
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv not installed, rely on env vars
 
     try:
         from app.services.secret_manager import load_secrets

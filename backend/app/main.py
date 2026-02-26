@@ -92,6 +92,14 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # --- Global exception handler (logs unhandled errors) ---
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request, exc):
+        import traceback
+        logger.error("unhandled_exception", path=str(request.url), error=str(exc), traceback=traceback.format_exc())
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
     # --- Health check (no auth required) ---
     @app.get("/health", tags=["system"])
     async def health_check() -> dict[str, str]:
