@@ -99,8 +99,18 @@ def create_app() -> FastAPI:
 
     # --- Mount routers ---
     from app.routers.auth import router as auth_router
+    from app.routers.projects import router as projects_router
+    from app.routers.pipeline import router as pipeline_router
+    from app.routers.chat import router as chat_router
+    from app.routers.notifications import router as notifications_router
+    from app.routers.websocket import router as ws_router
 
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
+    app.include_router(projects_router, prefix="/api/v1/projects", tags=["projects"])
+    app.include_router(pipeline_router, prefix="/api/v1/pipeline", tags=["pipeline"])
+    app.include_router(chat_router, prefix="/api/v1/chat", tags=["chat"])
+    app.include_router(notifications_router, prefix="/api/v1/notifications", tags=["notifications"])
+    app.include_router(ws_router, prefix="/api/v1", tags=["websocket"])
 
     return app
 
