@@ -1,12 +1,13 @@
 """GCP Secret Manager integration -- zero .env files in production.
 
-All secrets are fetched from Google Cloud Secret Manager at app startup.
-They are injected as environment variables BEFORE Pydantic Settings loads.
+Dual-project architecture:
+    NexSidi project (GCP_PROJECT_ID) -- DB, infra, all secrets
+    YugNex project  (GCP_AI_PROJECT_ID) -- Vertex AI / Gemini models
 
-Usage:
-    # Called automatically by config.py before Settings() is created.
-    # In production (GKE / Cloud Run), GCP_PROJECT_ID is auto-detected.
-    # In development, set GCP_PROJECT_ID env var or fall back to .env file.
+All secrets live in the NexSidi project's Secret Manager, including
+YUGNEX_AI_CREDENTIALS (a service account JSON key for the YugNex project).
+The app fetches that key, parses it into Credentials, and uses it to call
+Vertex AI REST API in the YugNex project.
 
 Secret mapping (GCP secret name -> env var):
     ANTHROPIC_API_KEY       -> ANTHROPIC_API_KEY
@@ -15,7 +16,7 @@ Secret mapping (GCP secret name -> env var):
     JWT_SECRET              -> JWT_SECRET_KEY
     REDIS_URL               -> VALKEY_URL
     NEXSIDI_DEPLOY_KEY      -> NEXSIDI_DEPLOY_KEY
-    YUGNEX_AI_CREDENTIALS   -> YUGNEX_AI_CREDENTIALS
+    YUGNEX_AI_CREDENTIALS   -> YUGNEX_AI_CREDENTIALS  (service account JSON)
     ZEPTOMAIL_PASSWORD      -> ZEPTOMAIL_PASSWORD
     ZEPTOMAIL_SENDER_EMAIL  -> ZEPTOMAIL_SENDER_EMAIL
     ZEPTOMAIL_SMTP_PORT     -> ZEPTOMAIL_SMTP_PORT
@@ -32,8 +33,10 @@ DATABASE_URL is constructed from:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from typing import Any
 
 # Use stdlib logging (structlog may not be configured yet at import time)
@@ -55,6 +58,9 @@ SECRET_TO_ENV: dict[str, str] = {
     "ZEPTOMAIL_SMTP_SERVER": "ZEPTOMAIL_SMTP_SERVER",
     "ZEPTOMAIL_USERNAME": "ZEPTOMAIL_USERNAME",
 }
+
+# Cache TTL for secrets (15 minutes)
+_CACHE_TTL_SECONDS = 900
 
 
 def _detect_gcp_project_id() -> str | None:
@@ -171,3 +177,125 @@ def load_secrets() -> int:
 
     logger.info("secret_manager: loaded %d secrets from project %s", loaded, project_id)
     return loaded
+
+
+# ── Vertex AI Credential Manager (dual-project) ───────────────
+
+class VertexAICredentialManager:
+    """Manages Vertex AI credentials for the YugNex project.
+
+    Fetches YUGNEX_AI_CREDENTIALS (service account JSON) from NexSidi's
+    Secret Manager, parses it, and handles token refresh for Vertex AI
+    REST API calls.
+
+    Usage:
+        mgr = get_vertex_credentials()
+        token = mgr.get_access_token()
+        # Use token in: Authorization: Bearer {token}
+        # Against: https://aiplatform.googleapis.com/v1/projects/{yugnex-ai}/...
+    """
+
+    def __init__(self) -> None:
+        self._credentials: Any = None
+        self._token: str | None = None
+        self._token_expiry: float = 0
+        self._initialized = False
+
+    def initialize(self) -> bool:
+        """Load YugNex service account credentials.
+
+        Tries in order:
+        1. YUGNEX_AI_CREDENTIALS env var (JSON string, set by load_secrets)
+        2. GOOGLE_APPLICATION_CREDENTIALS file path (local dev fallback)
+
+        Returns True if credentials are available.
+        """
+        if self._initialized:
+            return self._credentials is not None
+
+        self._initialized = True
+
+        # Method 1: From env var (populated by Secret Manager)
+        creds_json = os.environ.get("YUGNEX_AI_CREDENTIALS")
+        if creds_json:
+            try:
+                from google.oauth2 import service_account
+                key_data = json.loads(creds_json)
+                self._credentials = service_account.Credentials.from_service_account_info(
+                    key_data,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                logger.info("Vertex AI credentials loaded from YUGNEX_AI_CREDENTIALS")
+                return True
+            except Exception as exc:
+                logger.error("Failed to parse YUGNEX_AI_CREDENTIALS: %s", exc)
+
+        # Method 2: Local file fallback (dev)
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if creds_path and os.path.isfile(creds_path):
+            try:
+                from google.oauth2 import service_account
+                self._credentials = service_account.Credentials.from_service_account_file(
+                    creds_path,
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
+                logger.info("Vertex AI credentials loaded from file: %s", creds_path)
+                return True
+            except Exception as exc:
+                logger.error("Failed to load credentials file: %s", exc)
+
+        logger.warning("No Vertex AI credentials available -- Gemini models disabled")
+        return False
+
+    def get_access_token(self) -> str | None:
+        """Get a valid access token for Vertex AI REST API.
+
+        Automatically refreshes if expired (tokens last ~1 hour).
+        Returns None if no credentials are available.
+        """
+        if self._credentials is None:
+            if not self.initialize():
+                return None
+
+        # Token still valid (with 5-min buffer)
+        if self._token and time.time() < (self._token_expiry - 300):
+            return self._token
+
+        # Refresh token
+        try:
+            import google.auth.transport.requests
+            auth_req = google.auth.transport.requests.Request()
+            self._credentials.refresh(auth_req)
+            self._token = self._credentials.token
+            self._token_expiry = time.time() + 3600  # 1 hour
+            logger.info("Vertex AI token refreshed")
+            return self._token
+        except Exception as exc:
+            logger.error("Token refresh failed: %s", exc)
+            self._token = None
+            return None
+
+    @property
+    def has_credentials(self) -> bool:
+        """Check if Vertex AI credentials are available."""
+        if not self._initialized:
+            self.initialize()
+        return self._credentials is not None
+
+    @property
+    def ai_project_id(self) -> str:
+        """The YugNex GCP project ID for Vertex AI calls."""
+        return os.environ.get("GCP_AI_PROJECT_ID", "yugnex-ai")
+
+
+# ── Singleton ──────────────────────────────────────────────────
+
+_vertex_mgr: VertexAICredentialManager | None = None
+
+
+def get_vertex_credentials() -> VertexAICredentialManager:
+    """Get or create the Vertex AI credential manager singleton."""
+    global _vertex_mgr
+    if _vertex_mgr is None:
+        _vertex_mgr = VertexAICredentialManager()
+    return _vertex_mgr

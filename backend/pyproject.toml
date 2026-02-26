@@ -34,8 +34,9 @@ dependencies = [
     # Template engine
     "jinja2>=3.1.0",
 
-    # GCP
+    # GCP (dual-project: NexSidi infra + YugNex Vertex AI)
     "google-cloud-secret-manager>=2.21.0",
+    "google-auth>=2.36.0",
 
     # Utilities
     "python-dotenv>=1.0.1",

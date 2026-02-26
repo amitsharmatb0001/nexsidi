@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
 
+    # --- GCP Dual-Project (NexSidi infra + YugNex AI) ---
+    gcp_project_id: str = ""                          # NexSidi: DB, secrets, infra
+    gcp_ai_project_id: str = "yugnex-ai"              # YugNex: Vertex AI / Gemini
+    gcp_ai_key_secret: str = "YUGNEX_AI_CREDENTIALS"  # SA key stored in NexSidi SM
+    use_cloud_secrets: bool = False                    # Toggle GCP Secret Manager
+
     # --- AI Providers ---
     anthropic_api_key: str = ""
     google_ai_api_key: str = ""
