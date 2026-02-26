@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.database import close_database, create_schemas, setup_database
+from app.database import close_database, create_schemas_and_tables, setup_database
 from app.services.ai_router import get_ai_router, shutdown_ai_router
 from app.services.context_engine import init_context_engine, shutdown_context_engine
 from app.services.prompt_engine import init_prompt_engine, shutdown_prompt_engine
@@ -36,9 +36,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     engine, _ = setup_database(settings)
 
-    if not settings.is_production:
-        await create_schemas(engine)
-        logger.info("schemas_created")
+    # Auto-create schemas + tables on startup (idempotent, skips existing)
+    await create_schemas_and_tables(engine)
+    logger.info("schemas_and_tables_ready")
 
     # AI services (non-fatal if Valkey is unavailable at startup)
     try:

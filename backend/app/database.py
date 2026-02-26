@@ -67,15 +67,25 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
-async def create_schemas(engine: AsyncEngine) -> None:
-    """Create all PostgreSQL schemas if they don't exist.
+async def create_schemas_and_tables(engine: AsyncEngine) -> None:
+    """Create all PostgreSQL schemas and tables if they don't exist.
 
-    This runs with the app database user. The schemas must be pre-created
-    by the admin user in production (via migration). This is a dev convenience.
+    On startup the app automatically:
+    1. Creates all 8 schemas (auth, core, pipeline, chat, etc.)
+    2. Creates all tables via SQLAlchemy metadata.create_all()
+
+    This is idempotent — safe to run every time the server starts.
+    Tables that already exist are silently skipped.
     """
+    from app.models import Base  # noqa: F401 — triggers all model imports
+
     async with engine.begin() as conn:
+        # Step 1: Create schemas
         for schema in SCHEMAS:
             await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+
+        # Step 2: Create all tables (skips existing ones)
+        await conn.run_sync(Base.metadata.create_all)
 
 
 async def close_database() -> None:
