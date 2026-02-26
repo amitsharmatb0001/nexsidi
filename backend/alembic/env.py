@@ -24,7 +24,8 @@ target_metadata = Base.metadata
 # Use admin URL for migrations (has DDL permissions)
 settings = get_settings()
 migration_url = str(settings.database_admin_url or settings.database_url)
-config.set_main_option("sqlalchemy.url", migration_url)
+# Escape '%' for configparser interpolation (% in URL-encoded passwords)
+config.set_main_option("sqlalchemy.url", migration_url.replace("%", "%%"))
 
 
 def include_name(name: str | None, type_: str, parent_names: dict) -> bool:
