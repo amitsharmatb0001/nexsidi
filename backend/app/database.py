@@ -4,13 +4,11 @@ Key design decisions:
 - Async engine (asyncpg) for non-blocking I/O
 - Session factory yields scoped sessions with proper cleanup
 - Schema creation separated from model definition
-- RLS context (tenant, user, role) set via SET LOCAL per-transaction
+- RLS context setting is in dependencies.py (single source of truth)
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -78,40 +76,6 @@ async def create_schemas(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         for schema in SCHEMAS:
             await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
-
-
-@asynccontextmanager
-async def get_tenant_session(
-    organization_id: str,
-    user_id: str,
-    role: str,
-) -> AsyncGenerator[AsyncSession]:
-    """Yield a session with RLS context variables set.
-
-    Every query in this session is automatically filtered by PostgreSQL RLS
-    policies using the SET LOCAL variables. SET LOCAL is transaction-scoped —
-    it resets when the transaction ends.
-
-    Args:
-        organization_id: UUID of the user's organization
-        user_id: UUID of the authenticated user
-        role: User's role (super_admin, org_admin, team_lead, member, viewer)
-    """
-    factory = get_session_factory()
-    async with factory() as session:
-        async with session.begin():
-            await session.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": organization_id})
-            await session.execute(text("SET LOCAL app.current_user = :uid"), {"uid": user_id})
-            await session.execute(text("SET LOCAL app.current_role = :role"), {"role": role})
-            yield session
-
-
-async def get_session() -> AsyncGenerator[AsyncSession]:
-    """Yield a plain session without RLS context. For health checks and non-tenant routes."""
-    factory = get_session_factory()
-    async with factory() as session:
-        async with session.begin():
-            yield session
 
 
 async def close_database() -> None:

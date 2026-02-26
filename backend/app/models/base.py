@@ -49,10 +49,13 @@ class TimestampMixin:
 
 
 class TenantMixin:
-    """organization_id for direct 1-hop RLS. Every tenant-scoped table must use this."""
+    """organization_id for direct 1-hop RLS. Every tenant-scoped table must use this.
+
+    NOTE: No index=True here. Each model adds its own explicit Index in __table_args__
+    to avoid duplicate indexes when the column is overridden with ForeignKey.
+    """
 
     organization_id: Mapped[uuid.UUID] = mapped_column(
         Uuid,
         nullable=False,
-        index=True,
     )

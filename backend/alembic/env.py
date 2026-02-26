@@ -27,10 +27,14 @@ migration_url = str(settings.database_admin_url or settings.database_url)
 config.set_main_option("sqlalchemy.url", migration_url)
 
 
-def include_schemas(names: set[str | None]) -> set[str | None]:
-    """Include all NexSidi schemas in autogenerate."""
-    names.update(SCHEMAS)
-    return names
+def include_name(name: str | None, type_: str, parent_names: dict) -> bool:
+    """Filter Alembic autogenerate to only NexSidi schemas.
+
+    Prevents picking up stray schemas from the PostgreSQL instance.
+    """
+    if type_ == "schema":
+        return name in SCHEMAS
+    return True
 
 
 def run_migrations_offline() -> None:
@@ -42,6 +46,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         include_schemas=True,
+        include_name=include_name,
     )
 
     with context.begin_transaction():
@@ -54,6 +59,7 @@ def do_run_migrations(connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         include_schemas=True,
+        include_name=include_name,
     )
 
     with context.begin_transaction():

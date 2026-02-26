@@ -83,7 +83,7 @@ class ApiKey(Base, UUIDPrimaryKeyMixin, TenantMixin):
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    scope: Mapped[dict] = mapped_column(JSONB, default=lambda: ["all"], nullable=False)
+    scope: Mapped[list] = mapped_column(JSONB, default=lambda: ["all"], nullable=False)
     rate_limit: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

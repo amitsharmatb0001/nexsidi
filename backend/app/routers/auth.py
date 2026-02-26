@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.database import get_session_factory
@@ -64,9 +64,19 @@ async def register(body: UserRegister) -> TokenResponse:
                     detail="Email already registered",
                 )
 
+            # Generate unique slug (append counter if collision)
+            base_slug = body.organization_name.lower().replace(" ", "-")[:100]
+            slug = base_slug
+            slug_check = await session.execute(
+                select(func.count()).select_from(Organization).where(Organization.slug.like(f"{base_slug}%"))
+            )
+            count = slug_check.scalar_one()
+            if count > 0:
+                slug = f"{base_slug}-{count}"
+
             org = Organization(
                 name=body.organization_name,
-                slug=body.organization_name.lower().replace(" ", "-")[:100],
+                slug=slug,
                 plan="free",
             )
             session.add(org)

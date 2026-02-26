@@ -12,11 +12,11 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session_factory
-from app.middleware.tenant import TenantContext
+from app.middleware.tenant import TenantContext, set_tenant_context
 from app.models.auth import User
 from app.services.auth import decode_token
 
@@ -77,9 +77,7 @@ async def get_tenant_session(
     factory = get_session_factory()
     async with factory() as session:
         async with session.begin():
-            await session.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": ctx.organization_id})
-            await session.execute(text("SET LOCAL app.current_user = :uid"), {"uid": ctx.user_id})
-            await session.execute(text("SET LOCAL app.current_role = :role"), {"role": ctx.role})
+            await set_tenant_context(session, ctx)
             yield session
 
 

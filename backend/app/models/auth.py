@@ -53,6 +53,7 @@ class WhatsAppAccount(Base, UUIDPrimaryKeyMixin):
     verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     pin_hash: Mapped[str | None] = mapped_column(String(255), default=None)
     linked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()", nullable=False)
 
 
 class FeatureFlag(Base, UUIDPrimaryKeyMixin):
@@ -65,4 +66,5 @@ class FeatureFlag(Base, UUIDPrimaryKeyMixin):
     updated_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("auth.users.id", ondelete="SET NULL"), default=None
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()", nullable=False)
