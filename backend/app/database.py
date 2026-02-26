@@ -1,17 +1,19 @@
-"""Async SQLAlchemy database engine, session factory, and schema management.
+"""Async SQLAlchemy database engine, session factory, and Alembic migrations.
 
 Key design decisions:
 - Async engine (asyncpg) for non-blocking I/O
 - Session factory yields scoped sessions with proper cleanup
-- Schema creation separated from model definition
+- Alembic migrations run automatically on server startup
 - RLS context setting is in dependencies.py (single source of truth)
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -22,6 +24,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 # Module-level engine and session factory — initialized in setup_database()
 _engine: AsyncEngine | None = None
@@ -67,25 +71,29 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return _session_factory
 
 
-async def create_schemas_and_tables(engine: AsyncEngine) -> None:
-    """Create all PostgreSQL schemas and tables if they don't exist.
+async def run_migrations() -> None:
+    """Run Alembic migrations automatically on server startup.
 
-    On startup the app automatically:
-    1. Creates all 8 schemas (auth, core, pipeline, chat, etc.)
-    2. Creates all tables via SQLAlchemy metadata.create_all()
+    Programmatically executes `alembic upgrade head` so all schemas
+    and tables are created/updated without any manual commands.
 
     This is idempotent — safe to run every time the server starts.
-    Tables that already exist are silently skipped.
+    Already-applied migrations are skipped automatically by Alembic.
     """
-    from app.models import Base  # noqa: F401 — triggers all model imports
 
-    async with engine.begin() as conn:
-        # Step 1: Create schemas
-        for schema in SCHEMAS:
-            await conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema}"))
+    def _run_alembic_upgrade() -> None:
+        from alembic import command
+        from alembic.config import Config
 
-        # Step 2: Create all tables (skips existing ones)
-        await conn.run_sync(Base.metadata.create_all)
+        backend_dir = Path(__file__).resolve().parent.parent
+        alembic_cfg = Config(str(backend_dir / "alembic.ini"))
+        alembic_cfg.set_main_option("script_location", str(backend_dir / "alembic"))
+        command.upgrade(alembic_cfg, "head")
+
+    # Run in a thread because Alembic's env.py uses asyncio.run() internally
+    # which cannot be called from within an already-running event loop
+    await asyncio.to_thread(_run_alembic_upgrade)
+    logger.info("Alembic migrations applied (upgrade head)")
 
 
 async def close_database() -> None:
