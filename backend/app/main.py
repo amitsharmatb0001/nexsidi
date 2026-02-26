@@ -15,6 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import close_database, create_schemas, setup_database
+from app.services.ai_router import get_ai_router, shutdown_ai_router
+from app.services.context_engine import init_context_engine, shutdown_context_engine
+from app.services.prompt_engine import init_prompt_engine, shutdown_prompt_engine
 
 logger = structlog.get_logger()
 
@@ -37,12 +40,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await create_schemas(engine)
         logger.info("schemas_created")
 
+    # AI services (non-fatal if Valkey is unavailable at startup)
+    try:
+        await init_context_engine()
+        logger.info("context_engine_ready")
+    except Exception as exc:
+        logger.warning("context_engine_deferred", error=str(exc))
+
+    try:
+        await init_prompt_engine()
+        logger.info("prompt_engine_ready")
+    except Exception as exc:
+        logger.warning("prompt_engine_deferred", error=str(exc))
+
+    # AI Router (lazy-init, just ensure it's importable)
+    _ = get_ai_router()
+    logger.info("ai_router_ready")
+
     logger.info("nexsidi_started")
 
     yield
 
     # --- Shutdown ---
     logger.info("shutting_down_nexsidi")
+    await shutdown_ai_router()
+    await shutdown_context_engine()
+    await shutdown_prompt_engine()
     await close_database()
     logger.info("nexsidi_stopped")
 
