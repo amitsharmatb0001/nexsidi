@@ -1,9 +1,8 @@
 """Authentication service: password hashing, JWT creation/verification.
 
 Security decisions:
-- Argon2id for password hashing (memory-hard, resistant to GPU attacks)
-  Falling back to bcrypt since argon2-cffi adds a C dependency.
-  When we move to production, switch to argon2id.
+- bcrypt for password hashing (uses direct bcrypt library, not passlib).
+  passlib is unmaintained and incompatible with bcrypt 4.x / Python 3.13.
 - JWT with HS256 (symmetric) for v1. Switch to RS256 (asymmetric) before
   multi-service deployment.
 - Access token: 15 min. Refresh token: 7 days.
@@ -15,22 +14,33 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.config import get_settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# bcrypt max input is 72 bytes — we truncate to prevent ValueError
+_BCRYPT_MAX_BYTES = 72
+
+
+def _prep_password(password: str) -> bytes:
+    """Encode password to bytes and truncate to bcrypt's 72-byte limit."""
+    pw_bytes = password.encode("utf-8")
+    return pw_bytes[:_BCRYPT_MAX_BYTES]
 
 
 def hash_password(password: str) -> str:
-    """Hash a plaintext password using bcrypt."""
-    return pwd_context.hash(password)
+    """Hash a plaintext password using bcrypt with auto-generated salt."""
+    pw_bytes = _prep_password(password)
+    hashed = bcrypt.hashpw(pw_bytes, bcrypt.gensalt(rounds=12))
+    return hashed.decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a plaintext password against a bcrypt hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    pw_bytes = _prep_password(plain_password)
+    hash_bytes = hashed_password.encode("utf-8")
+    return bcrypt.checkpw(pw_bytes, hash_bytes)
 
 
 def create_access_token(
