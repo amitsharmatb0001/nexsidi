@@ -22,6 +22,7 @@ import httpx
 import structlog
 
 from app.config import get_settings
+from app.services.secret_manager import get_vertex_credentials
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -255,17 +256,31 @@ class AIResponse:
 
 
 class AIRouter:
-    """Unified multi-model AI client with routing, escalation, and caching."""
+    """Unified multi-model AI client with routing, escalation, and caching.
+
+    Google/Gemini calls support two paths:
+      1. Google AI API (public key) -- generativelanguage.googleapis.com
+      2. Vertex AI REST (YugNex SA)  -- aiplatform.googleapis.com
+
+    Vertex AI is preferred when use_cloud_secrets=True and YUGNEX_AI_CREDENTIALS
+    is available. Falls back to the public API key if Vertex AI is unavailable.
+    """
 
     def __init__(self) -> None:
         settings = get_settings()
         self._anthropic_key = settings.anthropic_api_key
         self._google_key = settings.google_ai_api_key
+
+        # Vertex AI dual-project settings
+        self._use_vertex = settings.use_cloud_secrets
+        self._vertex_project = settings.gcp_ai_project_id  # "yugnex-ai"
+        self._vertex_location = "us-central1"
+
         self._circuits: dict[Provider, CircuitState] = {
             Provider.ANTHROPIC: CircuitState(),
             Provider.GOOGLE: CircuitState(),
         }
-        # Shared httpx client — connection pooling across providers
+        # Shared httpx client -- connection pooling across providers
         self._http: httpx.AsyncClient | None = None
 
     async def _get_http(self) -> httpx.AsyncClient:
@@ -516,11 +531,38 @@ class AIRouter:
                             yield delta["text"]
 
     # ── Google (Gemini) ─────────────────────────────────────────────
+    #
+    # Two paths:
+    #   1. Vertex AI REST (production) -- aiplatform.googleapis.com
+    #      Uses YugNex SA token via VertexAICredentialManager.
+    #   2. Google AI API (dev/fallback) -- generativelanguage.googleapis.com
+    #      Uses public API key.
+    #
+    # _call_google / _stream_google auto-detect which path to use.
+
+    def _get_vertex_token(self) -> str | None:
+        """Get a fresh Vertex AI access token from VertexAICredentialManager.
+
+        Returns None if credentials are unavailable (falls back to public API).
+        """
+        if not self._use_vertex:
+            return None
+        mgr = get_vertex_credentials()
+        return mgr.get_access_token()
 
     async def _call_google(
         self, spec: ModelSpec, request: AIRequest, request_id: str
     ) -> AIResponse:
-        """Call Gemini via Google AI Generative Language API."""
+        """Call Gemini via Vertex AI REST or Google AI API (auto-detect)."""
+        token = self._get_vertex_token()
+        if token:
+            return await self._call_vertex(spec, request, request_id, token)
+        return await self._call_google_ai(spec, request, request_id)
+
+    async def _call_google_ai(
+        self, spec: ModelSpec, request: AIRequest, request_id: str
+    ) -> AIResponse:
+        """Call Gemini via public Google AI Generative Language API (API key)."""
         http = await self._get_http()
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -533,7 +575,54 @@ class AIRouter:
         resp.raise_for_status()
         data = resp.json()
 
-        # Extract text
+        return self._parse_google_response(data, spec, request_id)
+
+    async def _call_vertex(
+        self, spec: ModelSpec, request: AIRequest, request_id: str, token: str
+    ) -> AIResponse:
+        """Call Gemini via Vertex AI REST API (YugNex project, SA token).
+
+        Endpoint:
+            POST https://aiplatform.googleapis.com/v1/projects/{project}/
+                 locations/{location}/publishers/google/models/{model}:generateContent
+
+        The request body format is identical to the Google AI API — we reuse
+        _build_google_body() and _parse_google_response().
+        """
+        http = await self._get_http()
+        url = (
+            f"https://{self._vertex_location}-aiplatform.googleapis.com/v1/"
+            f"projects/{self._vertex_project}/"
+            f"locations/{self._vertex_location}/"
+            f"publishers/google/models/{spec.model_id}:generateContent"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        body = self._build_google_body(spec, request)
+
+        logger.debug(
+            "vertex_ai_call",
+            project=self._vertex_project,
+            model=spec.model_id,
+            request_id=request_id,
+        )
+
+        resp = await http.post(url, headers=headers, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+
+        return self._parse_google_response(data, spec, request_id)
+
+    def _parse_google_response(
+        self, data: dict[str, Any], spec: ModelSpec, request_id: str
+    ) -> AIResponse:
+        """Parse response from either Google AI API or Vertex AI REST.
+
+        Both APIs return the same response structure.
+        """
         text = ""
         candidates = data.get("candidates", [])
         if candidates:
@@ -580,7 +669,19 @@ class AIRouter:
     async def _stream_google(
         self, spec: ModelSpec, request: AIRequest
     ) -> AsyncGenerator[str, None]:
-        """Stream Gemini response."""
+        """Stream Gemini response (auto-detects Vertex AI vs public API)."""
+        token = self._get_vertex_token()
+        if token:
+            async for chunk in self._stream_vertex(spec, request, token):
+                yield chunk
+        else:
+            async for chunk in self._stream_google_ai(spec, request):
+                yield chunk
+
+    async def _stream_google_ai(
+        self, spec: ModelSpec, request: AIRequest
+    ) -> AsyncGenerator[str, None]:
+        """Stream Gemini response via public Google AI API (API key)."""
         http = await self._get_http()
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -590,6 +691,43 @@ class AIRouter:
         body = self._build_google_body(spec, request)
 
         async with http.stream("POST", url, json=body) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    import orjson
+
+                    event = orjson.loads(line[6:])
+                    candidates = event.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        for part in parts:
+                            if "text" in part:
+                                yield part["text"]
+
+    async def _stream_vertex(
+        self, spec: ModelSpec, request: AIRequest, token: str
+    ) -> AsyncGenerator[str, None]:
+        """Stream Gemini response via Vertex AI REST API (YugNex project).
+
+        Endpoint:
+            POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/
+                 locations/{location}/publishers/google/models/{model}:streamGenerateContent?alt=sse
+        """
+        http = await self._get_http()
+        url = (
+            f"https://{self._vertex_location}-aiplatform.googleapis.com/v1/"
+            f"projects/{self._vertex_project}/"
+            f"locations/{self._vertex_location}/"
+            f"publishers/google/models/{spec.model_id}:streamGenerateContent?alt=sse"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        body = self._build_google_body(spec, request)
+
+        async with http.stream("POST", url, headers=headers, json=body) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line.startswith("data: "):
