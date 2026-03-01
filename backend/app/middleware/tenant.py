@@ -40,20 +40,42 @@ async def set_tenant_context(session: AsyncSession, ctx: TenantContext) -> None:
         ctx: Tenant context from JWT claims.
     """
     # Validate inputs are safe (UUIDs and known role values only)
-    _validate_uuid(ctx.organization_id)
-    _validate_uuid(ctx.user_id)
-    if not ctx.role.isalnum() and "_" not in ctx.role:
-        raise ValueError(f"Invalid role: {ctx.role}")
+    # A-16-FIX: Use normalized UUID strings to prevent any format-based injection
+    org_id = _validate_uuid(ctx.organization_id)
+    user_id = _validate_uuid(ctx.user_id)
+    _validate_role(ctx.role)
 
-    await session.execute(text(f"SET LOCAL app.current_tenant = '{ctx.organization_id}'"))
-    await session.execute(text(f"SET LOCAL app.current_user_id = '{ctx.user_id}'"))
+    await session.execute(text(f"SET LOCAL app.current_tenant = '{org_id}'"))
+    await session.execute(text(f"SET LOCAL app.current_user_id = '{user_id}'"))
     await session.execute(text(f"SET LOCAL app.user_role = '{ctx.role}'"))
 
 
-def _validate_uuid(value: str) -> None:
-    """Validate that a string is a valid UUID (prevents SQL injection)."""
+_ALLOWED_ROLES = frozenset({
+    "org_admin", "admin", "developer", "viewer", "member", "billing",
+    "super_admin",  # H8-FIX: required for require_admin dependency
+})
+
+
+def _validate_role(value: str) -> None:
+    """Validate role against an explicit allowlist (prevents SQL injection).
+
+    A regex or isalnum check is fragile — allowlist is the only safe approach
+    when the value is interpolated into SQL via f-string.
+    """
+    if value not in _ALLOWED_ROLES:
+        raise ValueError(f"Invalid role: {value!r}. Allowed: {sorted(_ALLOWED_ROLES)}")
+
+
+def _validate_uuid(value: str) -> str:
+    """Validate and normalize a UUID string (prevents SQL injection).
+
+    A-16-FIX: Returns the canonical lowercase string form of the UUID.
+    This ensures the value interpolated into ``SET LOCAL`` SQL is always
+    a clean, normalized UUID — even if the input had mixed case, extra
+    whitespace, or braces (all valid UUID forms but dangerous in SQL).
+    """
     import uuid
     try:
-        uuid.UUID(value)
+        return str(uuid.UUID(value))
     except (ValueError, AttributeError):
         raise ValueError(f"Invalid UUID: {value}")

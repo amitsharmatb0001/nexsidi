@@ -1,14 +1,19 @@
 """WebSocket endpoint for real-time pipeline progress.
 
-Clients connect with a JWT token and subscribe to pipeline run events.
+Clients connect and authenticate to subscribe to pipeline run events.
 Events are pushed as the pipeline progresses through stages.
 
-Protocol:
-    1. Client connects: ws://host/api/v1/ws/{run_id}?token={jwt}
-    2. Server validates JWT and verifies tenant ownership
-    3. Server sends JSON events as pipeline progresses
-    4. Client can send heartbeat pings
-    5. Connection closes when pipeline completes or client disconnects
+Protocol (PHASE-2: Auth via first message):
+    1. Client connects: ws://host/api/v1/ws/{run_id}  (no token in URL)
+    2. Client sends: {"type": "auth", "token": "<jwt>"}
+    3. Server validates JWT, verifies tenant ownership
+    4. Server sends: {"type": "auth_ok", "run_id": "...", "status": "..."}
+    5. Server sends JSON events as pipeline progresses
+    6. Client can send heartbeat pings
+    7. Connection closes when pipeline completes or client disconnects
+
+    Deprecated fallback: ?token=<jwt> query param (logs deprecation warning).
+    Will be removed in a future release.
 
 Event format:
     {
@@ -33,7 +38,7 @@ import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from jose import JWTError
 
-from app.services.auth import decode_token
+from app.services.auth import decode_token, verify_token
 from app.services.pipeline import PipelineRunStatus, get_orchestrator
 
 logger = structlog.get_logger(__name__)
@@ -42,17 +47,41 @@ router = APIRouter()
 
 
 class ConnectionManager:
-    """Manages active WebSocket connections per pipeline run."""
+    """Manages active WebSocket connections per pipeline run.
+
+    H12-FIX: Enforces limits on total connections and per-run connections
+    to prevent DoS via file descriptor exhaustion.
+    """
+
+    MAX_TOTAL_CONNECTIONS = 500
+    MAX_PER_RUN_CONNECTIONS = 10
 
     def __init__(self) -> None:
         self._connections: dict[str, list[WebSocket]] = {}
 
-    async def connect(self, run_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
+    async def connect(self, run_id: str, websocket: WebSocket) -> bool:
+        """Register an already-accepted WebSocket connection.
+
+        Returns False (and closes the socket) if limits are exceeded.
+
+        PHASE-2: Connection is already accepted before this call (auth
+        happens after accept). We only check limits and close if exceeded.
+        """
+        if self.total_connections >= self.MAX_TOTAL_CONNECTIONS:
+            await websocket.close(code=4029, reason="Too many connections")
+            logger.warning("ws_limit_total", total=self.total_connections)
+            return False
+
+        if self.active_connections(run_id) >= self.MAX_PER_RUN_CONNECTIONS:
+            await websocket.close(code=4029, reason="Too many connections for this run")
+            logger.warning("ws_limit_per_run", run_id=run_id)
+            return False
+
         if run_id not in self._connections:
             self._connections[run_id] = []
         self._connections[run_id].append(websocket)
-        logger.info("ws_connected", run_id=run_id)
+        logger.info("ws_connected", run_id=run_id, total=self.total_connections)
+        return True
 
     def disconnect(self, run_id: str, websocket: WebSocket) -> None:
         conns = self._connections.get(run_id, [])
@@ -63,17 +92,28 @@ class ConnectionManager:
         logger.info("ws_disconnected", run_id=run_id)
 
     async def broadcast(self, run_id: str, message: dict[str, Any]) -> None:
-        """Send a message to all connections for a pipeline run."""
-        conns = self._connections.get(run_id, [])
+        """Send a message to all connections for a pipeline run.
+
+        R35-FIX: Use asyncio.wait_for with timeout to prevent one half-open
+        TCP connection from blocking ALL event delivery. Previously, serial
+        send_json() would hang up to 60s (OS TCP timeout) on a dead mobile
+        client, blocking every other subscriber from receiving events.
+        """
+        # R38-FIX: Snapshot the list. await ws.send_json() yields to event loop,
+        # during which connect()/disconnect() can mutate the live list.
+        conns = list(self._connections.get(run_id, []))
+        if not conns:
+            return
         disconnected: list[WebSocket] = []
 
         for ws in conns:
             try:
-                await ws.send_json(message)
+                await asyncio.wait_for(ws.send_json(message), timeout=5.0)
             except Exception:
                 disconnected.append(ws)
 
         for ws in disconnected:
+            logger.info("ws_broadcast_disconnect", run_id=run_id)
             self.disconnect(run_id, ws)
 
     def active_connections(self, run_id: str) -> int:
@@ -87,19 +127,68 @@ class ConnectionManager:
 # Singleton connection manager
 manager = ConnectionManager()
 
+# Auth timeout for first-message protocol (seconds)
+_AUTH_TIMEOUT_SECONDS = 5.0
 
-def _validate_ws_token(token: str) -> dict[str, str] | None:
-    """Validate JWT from WebSocket query param. Returns claims or None."""
+# R19-FIX: Maximum message size for WebSocket receive. Starlette's
+# receive_json() buffers the entire message in memory before parsing.
+# Without a size limit, a malicious client can send multi-gigabyte JSON
+# strings to exhaust server memory. 4KB is generous for auth messages
+# (typically ~200 bytes) and heartbeat pings (typically ~30 bytes).
+_MAX_WS_MESSAGE_BYTES = 4096
+
+# R19-FIX: Track pre-auth connections to prevent fd exhaustion DoS.
+# Connections are accepted before auth (required by WebSocket protocol),
+# but not counted against ConnectionManager limits until registered.
+# An attacker can open thousands of connections and hold them at the
+# auth step (never sending auth, letting it timeout) to exhaust fds.
+# R21-FIX: Use asyncio.Semaphore instead of int counter. The old pattern
+# had a TOCTOU race: `if count >= limit` then `await accept()` then `count += 1`
+# — the await yields to the event loop, allowing another coroutine to pass
+# the same check before either increments. Semaphore.acquire() is atomic.
+_MAX_PRE_AUTH_CONNECTIONS = 100
+# R25-FIX-10: Lazy-initialize semaphore. Previously created at module import
+# time — same bug pattern as DEFERRED-FIX-4 (pipeline.py). asyncio primitives
+# created before the event loop starts can bind to the wrong loop in test
+# environments or when using uvloop with multiple workers (pre-fork).
+_pre_auth_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_pre_auth_semaphore() -> asyncio.Semaphore:
+    """Get or create the pre-auth connection semaphore (lazy init)."""
+    global _pre_auth_semaphore
+    if _pre_auth_semaphore is None:
+        _pre_auth_semaphore = asyncio.Semaphore(_MAX_PRE_AUTH_CONNECTIONS)
+    return _pre_auth_semaphore
+
+
+async def _validate_ws_token(token: str) -> dict[str, str] | None:
+    """Validate JWT from WebSocket. Returns claims or None.
+
+    PHASE-1: Now async — uses verify_token() which checks Valkey revocation.
+    """
     try:
-        payload = decode_token(token)
-        if payload.get("type") != "access":
-            return None
+        # S-20-FIX: Validate token type at decode layer (defense-in-depth)
+        # PHASE-1: verify_token also checks revocation blocklist
+        payload = await verify_token(token, expected_type="access")
+        # R30-FIX-5: Use bracket access for mandatory claims. verify_token()
+        # enforces these claims via decode_token()'s require list, so they're
+        # guaranteed present. Using .get("sub", "") masks bugs: if a token
+        # somehow bypasses validation, downstream code silently uses "" as
+        # user_id instead of failing loudly.
         return {
-            "user_id": payload.get("sub", ""),
-            "organization_id": payload.get("org", ""),
-            "role": payload.get("role", ""),
+            "user_id": payload["sub"],
+            "organization_id": payload["org"],
+            "role": payload["role"],
         }
-    except (JWTError, Exception):
+    except JWTError:
+        return None
+    except Exception as exc:
+        # R28-FIX-12: Catch non-JWTError infrastructure exceptions (e.g.,
+        # ConnectionError from Valkey, RuntimeError from uninitialized store).
+        # Previously these propagated out of the WebSocket handler, leaving
+        # an accepted-but-unregistered connection leaking.
+        logger.warning("ws_token_validation_error", error=str(exc)[:200])
         return None
 
 
@@ -111,66 +200,174 @@ async def pipeline_websocket(
 ) -> None:
     """WebSocket endpoint for real-time pipeline progress.
 
-    Connect: ws://host/api/v1/ws/{run_id}?token={jwt_access_token}
+    PHASE-2: Auth via first message protocol.
+
+    New protocol:
+        1. Connect: ws://host/api/v1/ws/{run_id}  (no query params)
+        2. Send: {"type": "auth", "token": "<jwt>"}
+        3. Receive: {"type": "auth_ok", ...} or connection closed
+
+    Deprecated: ws://host/api/v1/ws/{run_id}?token={jwt}
+        Still works but logs a deprecation warning. Will be removed.
     """
-    # Validate token
-    if not token:
-        await websocket.close(code=4001, reason="Missing token")
+    # WS-UUID-FIX: Validate run_id as UUID before any processing
+    import uuid as _uuid
+    try:
+        run_id = str(_uuid.UUID(run_id))
+    except (ValueError, AttributeError):
+        await websocket.accept()
+        await websocket.close(code=4004, reason="Invalid run_id format")
         return
 
-    claims = _validate_ws_token(token)
+    # R22-FIX: Must accept() before close() — ASGI spec requires it.
+    # Previously called close() on un-accepted WebSocket, causing RuntimeError
+    # in uvicorn. Also removed private _value attribute access (CPython-only).
+    # Strategy: accept first, then try-acquire semaphore. If semaphore is
+    # exhausted, close with rejection code after accept.
+    await websocket.accept()
+
+    # Acquire semaphore slot, release after auth completes.
+    acquired = False
+    try:
+        try:
+            await asyncio.wait_for(_get_pre_auth_semaphore().acquire(), timeout=0.01)
+            acquired = True
+        except asyncio.TimeoutError:
+            await websocket.close(code=4029, reason="Too many pending connections")
+            return
+
+        # Determine auth source: query param (deprecated) or first message (new)
+        claims: dict[str, str] | None = None
+
+        if token:
+            # DEPRECATED: Token in URL query param — log warning
+            logger.warning(
+                "ws_auth_deprecated_query_param",
+                run_id=run_id,
+                hint="Use first-message auth: {\"type\": \"auth\", \"token\": \"...\"}",
+            )
+            claims = await _validate_ws_token(token)
+        else:
+            # PHASE-2: Auth via first message
+            # R19-FIX: Use receive_text() with size check instead of
+            # receive_json(). Starlette's receive_json() buffers the entire
+            # message in memory before parsing — a multi-GB payload exhausts
+            # server memory. Check size before JSON parsing.
+            try:
+                import json as _json
+                raw_text = await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=_AUTH_TIMEOUT_SECONDS,
+                )
+                if len(raw_text) > _MAX_WS_MESSAGE_BYTES:
+                    await websocket.close(code=4008, reason="Message too large")
+                    return
+                auth_msg = _json.loads(raw_text)
+            except asyncio.TimeoutError:
+                await websocket.close(code=4001, reason="Auth timeout")
+                return
+            except WebSocketDisconnect:
+                # R26-FIX-34: Client disconnected during auth phase — nothing to do.
+                # Previously fell through to `except Exception:` which called
+                # websocket.close() on an already-closed socket, raising RuntimeError.
+                return
+            except (ValueError, _json.JSONDecodeError):
+                await websocket.close(code=4001, reason="Invalid JSON")
+                return
+            except Exception:
+                await websocket.close(code=4001, reason="Invalid auth message")
+                return
+
+            if auth_msg.get("type") != "auth" or not auth_msg.get("token"):
+                await websocket.close(code=4001, reason="Expected auth message with token")
+                return
+
+            claims = await _validate_ws_token(auth_msg["token"])
+    finally:
+        if acquired:
+            _get_pre_auth_semaphore().release()
+
     if claims is None:
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    # Verify pipeline run exists and belongs to this organization
+    # Verify pipeline run exists and belongs to this organization.
+    # REVIEW-FIX: get_run() only checks the in-memory hot cache. After server
+    # restart, completed/failed runs are evicted. Fall back to DB so WebSocket
+    # connections work for runs that aren't in the hot cache.
+    # Also always verify tenant ownership to prevent cross-org data leakage.
     orch = get_orchestrator()
     run = orch.get_run(run_id)
 
     if run is None:
+        # REVIEW-FIX: Fall back to DB for runs not in hot cache
+        run = await orch.load_run_metadata(
+            run_id, organization_id=claims["organization_id"],
+        )
+
+    # R16-FIX: Use same error code for both "not found" and "wrong tenant"
+    # to prevent cross-tenant run existence enumeration. A hot-cache hit for
+    # another org's run returns 4004 (not 4003), so attackers can't distinguish
+    # "run exists but belongs to another org" from "run doesn't exist at all".
+    # R29-FIX-10: Normalize to str — load_run_metadata may return UUID type.
+    if run is None or str(run.organization_id) != str(claims["organization_id"]):
         await websocket.close(code=4004, reason="Pipeline run not found")
         return
 
-    if run.organization_id != claims["organization_id"]:
-        await websocket.close(code=4003, reason="Access denied")
+    # Register with connection manager (enforces limits)
+    connected = await manager.connect(run_id, websocket)
+    if not connected:
         return
 
-    # Accept connection
-    await manager.connect(run_id, websocket)
-
-    # Send current state immediately
-    await websocket.send_json({
-        "type": "status",
-        "run_id": run_id,
-        "status": run.status.value,
-        "current_stage": run.current_stage.value,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
+    # R18-FIX: Moved send_json inside the try block. Previously, if auth_ok
+    # send failed (client disconnected between connect and send), the exception
+    # propagated past the try/finally, leaving a "ghost connection" registered
+    # in the manager forever, consuming one of the per-run connection slots.
     try:
+        # Send auth confirmation + current state
+        await websocket.send_json({
+            "type": "auth_ok",
+            "run_id": run_id,
+            "status": run.status.value,
+            "current_stage": run.current_stage.value,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
         while True:
-            # Wait for client messages (heartbeat) or disconnection
-            data = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+            try:
+                # Wait for client messages (heartbeat) or disconnection
+                # R19-FIX: Use receive_text() with size check to prevent
+                # memory DoS in the main message loop (same as auth phase).
+                import json as _json
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                if len(raw) > _MAX_WS_MESSAGE_BYTES:
+                    await websocket.close(code=4008, reason="Message too large")
+                    break
+                data = _json.loads(raw)
 
-            if data.get("type") == "ping":
-                await websocket.send_json({
-                    "type": "pong",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-    except asyncio.TimeoutError:
-        # Send heartbeat on timeout
-        try:
-            await websocket.send_json({
-                "type": "heartbeat",
-                "run_id": run_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-        except Exception:
-            pass
+                if data.get("type") == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+            except asyncio.TimeoutError:
+                # M10-FIX: Send heartbeat INSIDE the loop — don't break out
+                try:
+                    await websocket.send_json({
+                        "type": "heartbeat",
+                        "run_id": run_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception:
+                    break  # Connection dead — exit loop
+            except (ValueError, _json.JSONDecodeError):
+                pass  # Malformed JSON from client — ignore, keep connection
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        logger.warning("ws_error", run_id=run_id, error=str(exc))
+        # R19-FIX: Sanitize exception before logging. Raw exception strings
+        # from downstream httpx calls can contain API keys in headers.
+        from app.services.ai_router import _sanitize_error
+        logger.warning("ws_error", run_id=run_id, error=_sanitize_error(exc))
     finally:
         manager.disconnect(run_id, websocket)
 

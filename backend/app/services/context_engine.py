@@ -15,6 +15,7 @@ Design decisions:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from dataclasses import dataclass, field
@@ -119,6 +120,8 @@ class ContextEngine:
         """Store a pipeline step's output in the context chain.
 
         Serializes content to JSON, computes hash chain, stores in Valkey.
+        Uses a per-pipeline distributed lock to prevent TOCTOU race conditions
+        when parallel agents store context simultaneously.
 
         Args:
             pipeline_run_id: UUID of the pipeline run.
@@ -128,24 +131,13 @@ class ContextEngine:
         Returns:
             The created ContextEntry with hash chain values.
         """
-        # Serialize content
+        # Serialize content first (outside lock to minimize lock hold time)
         if isinstance(content, str):
             content_bytes = content.encode("utf-8")
         else:
             content_bytes = orjson.dumps(content)
 
         content_hash = compute_content_hash(content_bytes)
-
-        # Get previous hash from chain (or genesis seed)
-        meta_key = f"ctx:{pipeline_run_id}:meta"
-        meta_raw = await self._redis.get(meta_key)
-        if meta_raw:
-            meta = orjson.loads(meta_raw)
-            prev_hash = meta["last_hash"]
-        else:
-            prev_hash = _sha256(_HASH_CHAIN_SEED.encode("utf-8"))
-
-        chain_h = _chain_hash(content_hash, prev_hash)
         entry_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
@@ -153,62 +145,100 @@ class ContextEngine:
         chunk_count = (len(content_bytes) + self._chunk_size - 1) // self._chunk_size
         chunk_count = max(chunk_count, 1)
 
-        entry = ContextEntry(
-            pipeline_run_id=pipeline_run_id,
-            step_name=step_name,
-            content=content_bytes,
-            content_hash=content_hash,
-            prev_hash=prev_hash,
-            chain_hash=chain_h,
-            created_at=now,
-            chunk_count=chunk_count,
-            entry_id=entry_id,
-        )
+        # TOCTOU-FIX: Acquire per-pipeline lock to ensure atomic
+        # read-prev-hash → compute-chain → write sequence.
+        # Without this, parallel agents (e.g., quality review gates)
+        # would read the same prev_hash and corrupt the chain.
+        # R29-FIX-4: Use manual acquire/release instead of `async with lock:`.
+        # If the lock's timeout=30s expires while code is still inside the
+        # `async with` block (slow pipe.execute under load), the lock auto-
+        # releases in Valkey. When the context manager exits, it calls
+        # lock.release() again → LockNotOwnedError, masking success/failure
+        # of the actual write. Manual release with try/except avoids this.
+        lock_key = f"ctx:{pipeline_run_id}:lock"
+        lock = self._redis.lock(lock_key, timeout=30, blocking_timeout=30)
+        acquired = await lock.acquire()
+        if not acquired:
+            raise TimeoutError(f"Cannot acquire context lock for pipeline {pipeline_run_id}")
+        try:
+            # Get previous hash from chain (or genesis seed)
+            meta_key = f"ctx:{pipeline_run_id}:meta"
+            meta_raw = await self._redis.get(meta_key)
+            if meta_raw:
+                meta = orjson.loads(meta_raw)
+                prev_hash = meta["last_hash"]
+            else:
+                prev_hash = _sha256(_HASH_CHAIN_SEED.encode("utf-8"))
 
-        # Store in Valkey (pipeline for atomicity)
-        pipe = self._redis.pipeline(transaction=True)
+            chain_h = _chain_hash(content_hash, prev_hash)
 
-        # Store entry metadata (without content — content goes in chunks)
-        entry_key = f"ctx:{pipeline_run_id}:entry:{entry_id}"
-        entry_meta = {
-            "entry_id": entry_id,
-            "step_name": step_name,
-            "content_hash": content_hash,
-            "prev_hash": prev_hash,
-            "chain_hash": chain_h,
-            "created_at": now,
-            "chunk_count": chunk_count,
-        }
-        pipe.set(entry_key, orjson.dumps(entry_meta), ex=self._ttl)
+            entry = ContextEntry(
+                pipeline_run_id=pipeline_run_id,
+                step_name=step_name,
+                content=content_bytes,
+                content_hash=content_hash,
+                prev_hash=prev_hash,
+                chain_hash=chain_h,
+                created_at=now,
+                chunk_count=chunk_count,
+                entry_id=entry_id,
+            )
 
-        # Store content chunks
-        for i in range(chunk_count):
-            start = i * self._chunk_size
-            end = start + self._chunk_size
-            chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
-            pipe.set(chunk_key, content_bytes[start:end], ex=self._ttl)
+            # DEFERRED-FIX-8: Single atomic pipeline for all writes.
+            # Previously used pipe.execute() followed by a separate eval(),
+            # creating a two-phase write: if the process crashed between
+            # execute() and eval(), the meta key would be stale (wrong
+            # last_hash/step_count), corrupting the chain for subsequent
+            # writes. Now all writes happen in one pipeline.execute().
+            pipe = self._redis.pipeline(transaction=True)
 
-        # Update chain list and step index
-        chain_key = f"ctx:{pipeline_run_id}:chain"
-        pipe.rpush(chain_key, entry_id)
-        pipe.expire(chain_key, self._ttl)
+            # Store entry metadata (without content — content goes in chunks)
+            entry_key = f"ctx:{pipeline_run_id}:entry:{entry_id}"
+            entry_meta = {
+                "entry_id": entry_id,
+                "step_name": step_name,
+                "content_hash": content_hash,
+                "prev_hash": prev_hash,
+                "chain_hash": chain_h,
+                "created_at": now,
+                "chunk_count": chunk_count,
+            }
+            pipe.set(entry_key, orjson.dumps(entry_meta), ex=self._ttl)
 
-        step_key = f"ctx:{pipeline_run_id}:step:{step_name}"
-        pipe.set(step_key, entry_id, ex=self._ttl)
+            # Store content chunks
+            for i in range(chunk_count):
+                start = i * self._chunk_size
+                end = start + self._chunk_size
+                chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
+                pipe.set(chunk_key, content_bytes[start:end], ex=self._ttl)
 
-        # Update meta with new last_hash
-        new_meta = orjson.dumps({"last_hash": chain_h, "step_count": 0})
-        pipe.set(meta_key, new_meta, ex=self._ttl)
+            # Update chain list and step index
+            chain_key = f"ctx:{pipeline_run_id}:chain"
+            pipe.rpush(chain_key, entry_id)
+            pipe.expire(chain_key, self._ttl)
 
-        await pipe.execute()
+            step_key = f"ctx:{pipeline_run_id}:step:{step_name}"
+            pipe.set(step_key, entry_id, ex=self._ttl)
 
-        # Update step_count separately (need current value)
-        chain_len = await self._redis.llen(chain_key)
-        await self._redis.set(
-            meta_key,
-            orjson.dumps({"last_hash": chain_h, "step_count": chain_len}),
-            ex=self._ttl,
-        )
+            # Meta update via Lua inside the same pipeline.
+            # The lock ensures no concurrent writers, so LLEN is accurate.
+            # R26-FIX-10: Use cjson.encode instead of string concatenation.
+            # String concatenation is fragile if ARGV[1] ever contains
+            # JSON-special characters (currently it's always a hex digest).
+            lua_script = """
+            local count = redis.call('LLEN', KEYS[1])
+            local meta = cjson.encode({last_hash = ARGV[1], step_count = count})
+            redis.call('SET', KEYS[2], meta, 'EX', ARGV[2])
+            return count
+            """
+            pipe.eval(lua_script, 2, chain_key, meta_key, chain_h, str(self._ttl))
+
+            await pipe.execute()
+        finally:
+            try:
+                await lock.release()
+            except Exception:
+                pass  # Lock may have auto-expired via timeout — safe to ignore
 
         logger.info(
             "context_stored",
@@ -269,14 +299,31 @@ class ContextEngine:
         results: list[dict[str, Any]] = []
         expected_prev_hash = _sha256(_HASH_CHAIN_SEED.encode("utf-8"))
 
-        for raw_id in entry_ids:
-            entry_id = raw_id.decode("utf-8") if isinstance(raw_id, bytes) else raw_id
-            entry_key = f"ctx:{pipeline_run_id}:entry:{entry_id}"
-            entry_raw = await self._redis.get(entry_key)
+        # R28-FIX-11: Batch-load all entry metadata with MGET instead of
+        # sequential GETs.  Reduces O(N) round-trips to O(1) and eliminates
+        # TOCTOU window between individual reads.
+        decoded_ids = [
+            raw_id.decode("utf-8") if isinstance(raw_id, bytes) else raw_id
+            for raw_id in entry_ids
+        ]
+        entry_keys = [f"ctx:{pipeline_run_id}:entry:{eid}" for eid in decoded_ids]
+        entry_raws = await self._redis.mget(*entry_keys)
 
+        for entry_id, entry_raw in zip(decoded_ids, entry_raws):
             if entry_raw is None:
                 logger.error("chain_entry_missing", entry_id=entry_id)
-                break
+                # R27-FIX-11: When verify_chain=True, a missing entry must raise
+                # ContextIntegrityError instead of silently returning a truncated
+                # chain that passes verification.
+                if verify_chain:
+                    raise ContextIntegrityError(
+                        f"Chain entry {entry_id} missing — chain integrity compromised"
+                    )
+                # R30-FIX-7: Use `continue` instead of `break`. Previously,
+                # a single missing entry truncated ALL subsequent steps. With
+                # verify_chain=False (used for progress display, not integrity),
+                # we should skip the bad entry and return the remaining steps.
+                continue
 
             entry_meta = orjson.loads(entry_raw)
             content = await self._reassemble_chunks(
@@ -341,18 +388,90 @@ class ContextEngine:
     async def clear_pipeline(self, pipeline_run_id: str) -> int:
         """Clear all context for a pipeline run.
 
+        DEFERRED-FIX-7: Replaced SCAN-based key enumeration with deterministic
+        key construction from the chain list. SCAN is non-atomic — concurrent
+        writes during iteration can cause keys to be missed or double-counted.
+        Instead, we read the chain list (which IS atomic), derive all keys
+        from the entry IDs, and delete them in a single pipeline.
+
+        R25-FIX-4: Acquire the per-pipeline distributed lock before clearing.
+        Without this, a concurrent store() could write new keys between our
+        chain read and our delete, creating orphaned keys and corrupted state.
+        The lock key is NOT deleted — it expires via TTL after the lock is
+        released (the SET NX EX handles TTL).
+
         Returns the number of keys deleted.
         """
-        pattern = f"ctx:{pipeline_run_id}:*"
-        keys: list[bytes] = []
-        async for key in self._redis.scan_iter(match=pattern, count=100):
-            keys.append(key)
+        lock_key = f"ctx:{pipeline_run_id}:lock"
+        chain_key = f"ctx:{pipeline_run_id}:chain"
+        meta_key = f"ctx:{pipeline_run_id}:meta"
 
-        if keys:
-            deleted = await self._redis.delete(*keys)
-            logger.info("context_cleared", pipeline_run_id=pipeline_run_id, keys_deleted=deleted)
-            return deleted
-        return 0
+        # R26-FIX-3: Use self._redis.lock() — the SAME mechanism as store().
+        # Previously used manual SET NX + unconditional DELETE which was
+        # incompatible with store()'s redis-py Lock (random token + Lua release).
+        # The unconditional DELETE in the finally block could steal store()'s lock.
+        lock = self._redis.lock(lock_key, timeout=30, blocking_timeout=10)
+        acquired = False
+        try:
+            acquired = await lock.acquire()
+        except Exception:
+            logger.warning("clear_pipeline_lock_failed", pipeline_run_id=pipeline_run_id)
+
+        if not acquired:
+            # R26-FIX-8: Do NOT proceed without the lock — that corrupts data.
+            logger.error("clear_pipeline_lock_timeout", pipeline_run_id=pipeline_run_id)
+            raise TimeoutError(
+                f"Cannot clear pipeline {pipeline_run_id}: lock held by concurrent operation"
+            )
+
+        try:
+            # Get all entry IDs from the chain
+            entry_ids_raw = await self._redis.lrange(chain_key, 0, -1)
+
+            # R25-FIX-4: Do NOT delete lock_key — let it expire via TTL
+            keys_to_delete: list[str] = [chain_key, meta_key]
+
+            # R28-FIX-10: Use MGET instead of sequential GETs for entry metadata.
+            # Reduces O(N) round-trips under the distributed lock to O(1),
+            # preventing lock timeout on large pipelines (18+ steps).
+            entry_ids = [
+                raw_id.decode("utf-8") if isinstance(raw_id, bytes) else raw_id
+                for raw_id in entry_ids_raw
+            ]
+            entry_keys = [
+                f"ctx:{pipeline_run_id}:entry:{eid}" for eid in entry_ids
+            ]
+            keys_to_delete.extend(entry_keys)
+
+            entry_raws = await self._redis.mget(*entry_keys) if entry_keys else []
+
+            for entry_id, entry_raw in zip(entry_ids, entry_raws):
+                if entry_raw:
+                    entry_meta = orjson.loads(entry_raw)
+                    chunk_count = entry_meta.get("chunk_count", 1)
+                    for i in range(chunk_count):
+                        keys_to_delete.append(f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}")
+                    step_name = entry_meta.get("step_name")
+                    if step_name:
+                        keys_to_delete.append(f"ctx:{pipeline_run_id}:step:{step_name}")
+                else:
+                    logger.warning(
+                        "clear_pipeline_entry_expired",
+                        entry_id=entry_id,
+                        note="chunks may be orphaned until TTL expiry",
+                    )
+
+            if keys_to_delete:
+                deleted = await self._redis.delete(*keys_to_delete)
+                logger.info("context_cleared", pipeline_run_id=pipeline_run_id, keys_deleted=deleted)
+                return deleted
+            return 0
+        finally:
+            if acquired:
+                try:
+                    await lock.release()
+                except Exception:
+                    pass  # Lock may have expired via timeout
 
     # ── Internal Helpers ────────────────────────────────────────────
 
@@ -366,8 +485,11 @@ class ContextEngine:
             return None
 
         entry_meta = orjson.loads(entry_raw)
+        # R37-FIX: Use .get() with default to handle corrupt/partial metadata.
+        # If chunk_count is missing (Valkey eviction, schema change), KeyError
+        # propagates as unhandled exception instead of ContextIntegrityError.
         content = await self._reassemble_chunks(
-            pipeline_run_id, entry_id, entry_meta["chunk_count"]
+            pipeline_run_id, entry_id, entry_meta.get("chunk_count", 1)
         )
 
         if verify:
@@ -389,16 +511,29 @@ class ContextEngine:
         if chunk_count == 1:
             chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:0"
             data = await self._redis.get(chunk_key)
-            return data if data else b""
+            # R25-FIX-12: Raise ContextIntegrityError on missing single chunk.
+            # Previously returned b"" silently, which downstream code parsed as
+            # empty JSON (orjson.loads(b"") → error) or returned {"_raw": ""}.
+            # Multi-chunk already raises ContextIntegrityError on any missing
+            # chunk — single-chunk must have the same fail-closed semantics.
+            if data is None:
+                logger.error("chunk_missing", entry_id=entry_id, chunk=0)
+                raise ContextIntegrityError(f"Missing chunk 0 for entry {entry_id}")
+            return data
 
-        parts: list[bytes] = []
-        for i in range(chunk_count):
-            chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
-            data = await self._redis.get(chunk_key)
+        # R27-FIX-12: Use MGET instead of sequential GETs.  For N chunks this
+        # reduces N round-trips to 1 and provides a consistent read snapshot
+        # (no TOCTOU between individual GETs if a concurrent clear_pipeline
+        # deletes keys between reads).
+        chunk_keys = [
+            f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
+            for i in range(chunk_count)
+        ]
+        parts = await self._redis.mget(*chunk_keys)
+        for i, data in enumerate(parts):
             if data is None:
                 logger.error("chunk_missing", entry_id=entry_id, chunk=i)
                 raise ContextIntegrityError(f"Missing chunk {i} for entry {entry_id}")
-            parts.append(data)
 
         return b"".join(parts)
 
@@ -429,28 +564,35 @@ def get_context_engine() -> ContextEngine:
 async def init_context_engine() -> ContextEngine:
     """Initialize the Context Engine with a Valkey connection.
 
+    DEFERRED-FIX-10: Uses shared Valkey pool instead of creating a
+    dedicated connection pool. Reduces total Valkey connections from
+    3 pools (context + prompt + revocation) to 1 shared pool.
+
     Called once at app startup.
     """
     global _engine
     if _engine is not None:
         return _engine
 
-    import redis.asyncio as aioredis
+    from app.services.valkey_pool import get_valkey_client
 
-    settings = get_settings()
-    client = aioredis.from_url(
-        settings.valkey_url,
-        password=settings.valkey_password or None,
-        decode_responses=False,  # We handle encoding ourselves
-    )
+    client = await get_valkey_client()
     _engine = ContextEngine(client)
     logger.info("context_engine_initialized")
     return _engine
 
 
 async def shutdown_context_engine() -> None:
-    """Shutdown the Context Engine. Call at app shutdown."""
+    """Shutdown the Context Engine. Call at app shutdown.
+
+    DEFERRED-FIX-10: Does NOT close the Redis client — it's shared.
+    The shared pool is closed by shutdown_valkey_client() in main.py.
+    """
     global _engine
-    if _engine is not None:
-        await _engine._redis.aclose()
-        _engine = None
+    _engine = None
+
+
+def reset_context_engine() -> None:
+    """DEFERRED-FIX-11: Reset the singleton for testing / event loop changes."""
+    global _engine
+    _engine = None

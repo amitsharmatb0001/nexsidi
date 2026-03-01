@@ -25,9 +25,11 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
+    call_ai,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -42,15 +44,16 @@ _COMPLIANCE_PATTERNS: dict[str, list[str]] = {
 }
 
 
-class Tilotma(BaseAgent):
+class Tilotma:
     """Project Manager — requirements gathering via structured conversation."""
 
     name = "tilotma"
     display_name = "Tilotma — Project Manager"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="save_requirement",
@@ -88,6 +91,24 @@ class Tilotma(BaseAgent):
                 "required": ["regulation", "reason"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -129,17 +150,19 @@ class Tilotma(BaseAgent):
         messages = [{"role": "user", "content": user_input}]
 
         try:
-            response = await self.call_ai(
+            response = await call_ai(self, 
                 messages=messages,
                 system_prompt=system_prompt,
                 task_type="general",
                 temperature=0.3,  # Low temp for structured extraction
             )
         except Exception as exc:
+            # R21-FIX: Sanitize exception to prevent API key leakage.
+            from app.services.ai_router import _sanitize_error
             return AgentResult(
                 agent_name=self.name,
                 status=AgentStatus.FAILED,
-                error=f"AI call failed: {exc}",
+                error=f"AI call failed: {_sanitize_error(exc)}",
             )
 
         # Auto-detect compliance needs from user input
@@ -158,7 +181,7 @@ class Tilotma(BaseAgent):
         }
 
         # Store in context engine
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
             agent_name=self.name,

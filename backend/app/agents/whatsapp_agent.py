@@ -33,9 +33,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -72,6 +73,7 @@ class WhatsAppIncoming:
     mime_type: str = ""
     caption: str = ""
     timestamp: str = ""
+    phone_hash: str = ""  # R27-FIX-3: Hash of original phone, computed before redaction
 
     @classmethod
     def from_webhook(cls, payload: dict[str, Any]) -> WhatsAppIncoming | None:
@@ -98,8 +100,13 @@ class WhatsAppIncoming:
                 media_id = media_data.get("id", "")
                 caption = media_data.get("caption", "")
 
+            # R27-FIX-3: Store the hash of the ORIGINAL phone for correlation,
+            # not the redacted form. _redact_phone("919876543210") → "91******10"
+            # which is useless for hashing (collides for all same-prefix numbers).
+            phone_hash = _hash_phone(phone)
             return cls(
                 phone_number=_redact_phone(phone),
+                phone_hash=phone_hash,
                 message_type=WhatsAppMessageType(msg_type) if msg_type in WhatsAppMessageType.__members__.values() else WhatsAppMessageType.TEXT,
                 text=text,
                 media_id=media_id,
@@ -137,7 +144,7 @@ WHATSAPP_TEMPLATES: dict[str, str] = {
 # ── WhatsApp Agent ────────────────────────────────────────────────
 
 
-class WhatsAppAgent(BaseAgent):
+class WhatsAppAgent:
     """WhatsApp Business API integration agent.
 
     Behind ENABLE_WHATSAPP feature flag.
@@ -146,9 +153,10 @@ class WhatsAppAgent(BaseAgent):
     name = "whatsapp_agent"
     display_name = "WhatsApp Agent"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="send_message",
@@ -175,6 +183,24 @@ class WhatsAppAgent(BaseAgent):
                 "required": ["phone", "template"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -212,11 +238,12 @@ class WhatsAppAgent(BaseAgent):
             "source": "whatsapp",
             "message_type": incoming.message_type.value,
             "requirements": requirements,
-            "phone_hash": _hash_phone(incoming.phone_number),
+            # R27-FIX-3: Use pre-computed hash from original phone, not redacted form
+            "phone_hash": incoming.phone_hash,
             "has_media": bool(incoming.media_id),
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "whatsapp_processed",
@@ -238,7 +265,15 @@ class WhatsAppAgent(BaseAgent):
     ) -> WhatsAppOutgoing:
         """Send a progress update via WhatsApp template."""
         template = WHATSAPP_TEMPLATES.get(template_name, "")
-        text = template.format(**params) if template else f"Update: {template_name}"
+        # R28-FIX-18: Use manual replacement instead of str.format() to prevent
+        # format string injection. A project_name like "{__class__}" would trigger
+        # attribute access via Python's format() mini-language.
+        if template:
+            text = template
+            for key, value in params.items():
+                text = text.replace(f"{{{key}}}", str(value))
+        else:
+            text = f"Update: {template_name}"
 
         msg = WhatsAppOutgoing(
             phone_number=phone_hash,

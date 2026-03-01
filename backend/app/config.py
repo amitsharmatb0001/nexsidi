@@ -50,8 +50,12 @@ class Settings(BaseSettings):
     valkey_password: str = ""
 
     # --- JWT Auth ---
-    jwt_secret_key: str = Field(min_length=16)
-    jwt_algorithm: str = "HS256"
+    # JWTSEC-FIX: Minimum 32 chars for HS256 (NIST recommends key ≥ hash output).
+    # 16 chars (128 bits) is below the 256-bit security level of HS256.
+    jwt_secret_key: str = Field(min_length=32)
+    # R9-FIX: Constrain to known-safe algorithms. An unconstrained string
+    # allows "none" algorithm (complete auth bypass) via env var injection.
+    jwt_algorithm: Literal["HS256", "HS384", "HS512", "RS256", "RS384", "RS512"] = "HS256"
     access_token_expire_minutes: int = Field(default=15, ge=1, le=60)
     refresh_token_expire_days: int = Field(default=7, ge=1, le=30)
 
@@ -61,9 +65,33 @@ class Settings(BaseSettings):
 
     # --- GCP Dual-Project (NexSidi infra + YugNex AI) ---
     gcp_project_id: str = ""                          # NexSidi: DB, secrets, infra
-    gcp_ai_project_id: str = "yugnex-ai"              # YugNex: Vertex AI / Gemini
-    gcp_ai_key_secret: str = "YUGNEX_AI_CREDENTIALS"  # SA key stored in NexSidi SM
+    # R36-FIX: Removed hardcoded "yugnex-ai" and "YUGNEX_AI_CREDENTIALS".
+    # Hardcoded GCP project IDs and secret names are a security concern:
+    # 1. Leaked source code reveals infrastructure naming conventions
+    # 2. Cannot change without code deployment (should be env-driven)
+    # 3. Violates 12-factor app config principles
+    gcp_ai_project_id: str = ""                       # YugNex: Vertex AI / Gemini
+    gcp_ai_key_secret: str = ""                       # SA key name in NexSidi SM
     use_cloud_secrets: bool = False                    # Toggle GCP Secret Manager
+
+    # REVIEW-FIX: Validate GCP project IDs to prevent SSRF via path traversal.
+    # An attacker-controlled project ID like "../../evil" in the Vertex AI URL
+    # (https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/...)
+    # could redirect requests to unintended endpoints.
+    @field_validator("gcp_project_id", "gcp_ai_project_id", mode="after")
+    @classmethod
+    def validate_gcp_project_id(cls, v: str) -> str:
+        if not v:
+            return v  # Empty = not configured, fine
+        import re
+        # GCP project ID format: 6-30 chars, lowercase letters, digits, hyphens
+        # Must start with a letter, cannot end with a hyphen
+        if not re.match(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$", v):
+            raise ValueError(
+                f"Invalid GCP project ID '{v}': must be 6-30 lowercase "
+                f"alphanumeric characters or hyphens, starting with a letter"
+            )
+        return v
 
     # --- AI Providers ---
     anthropic_api_key: str = ""
@@ -82,10 +110,57 @@ class Settings(BaseSettings):
     # --- CORS ---
     cors_origins: list[str] = ["http://localhost:3000"]
 
+    # R19-FIX: Validate CORS origins to prevent wildcard + credentials bypass.
+    # Starlette's CORSMiddleware with allow_credentials=True and origins=["*"]
+    # reflects the Origin header — effectively allowing ANY origin with cookies.
+    # This completely defeats CORS protection. Also reject origins without
+    # explicit http/https scheme (e.g., bare domains) to prevent misconfiguration.
+    @field_validator("cors_origins", mode="after")
+    @classmethod
+    def validate_cors_origins(cls, v: list[str]) -> list[str]:
+        # R38-FIX: Reject empty list — silently breaks frontend CORS preflight
+        if not v:
+            raise ValueError("CORS_ORIGINS must contain at least one origin")
+        for origin in v:
+            if origin == "*":
+                raise ValueError(
+                    "CORS_ORIGINS cannot contain '*' when allow_credentials is True. "
+                    "Specify explicit origins instead (e.g., 'https://app.example.com')."
+                )
+            if not origin.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"Invalid CORS origin '{origin}': must start with http:// or https://"
+                )
+        return v
+
     # --- Feature Flags (auth features disabled by default) ---
     enable_phone_otp: bool = False
     enable_totp: bool = False
     enable_passkeys: bool = False
+
+    # --- AI Provider Mode ---
+    # "mixed"  = both providers (default, current behavior)
+    # "gemini" = Gemini-only (testing/dev — saves Claude costs)
+    # "claude" = Claude-only (production — max quality)
+    ai_provider_mode: Literal["mixed", "gemini", "claude"] = "mixed"
+    enable_batch_quality_gates: bool = False  # Anthropic Batch API for quality gates
+
+    # --- Celery Task Queue ---
+    # When use_celery=True, pipeline runs dispatch to Celery workers instead
+    # of in-process asyncio.create_task(). Enables horizontal scaling.
+    use_celery: bool = False  # Feature flag — False = current behavior
+    celery_broker_url: str = ""  # Falls back to valkey_url if empty
+    celery_result_backend: str = ""  # Falls back to valkey_url if empty
+
+    # --- Proxy / Network ---
+    # REFIX: Only trust X-Forwarded-For when behind a known reverse proxy.
+    # Without this, any client can spoof their IP to bypass rate limiting.
+    trust_proxy_headers: bool = False
+
+    # --- Resource Limits (project isolation) ---
+    max_concurrent_pipelines: int = Field(default=10, ge=1, le=100)
+    ai_calls_per_minute_per_project: int = Field(default=30, ge=1, le=1000)
+    pipeline_total_timeout_minutes: int = Field(default=120, ge=10, le=1440)
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -97,8 +172,8 @@ class Settings(BaseSettings):
     @field_validator("jwt_secret_key", mode="before")
     @classmethod
     def validate_jwt_secret(cls, v: str) -> str:
-        if not v or len(v) < 16:
-            raise ValueError("JWT_SECRET_KEY must be at least 16 characters")
+        if not v or len(v) < 32:
+            raise ValueError("JWT_SECRET_KEY must be at least 32 characters (256 bits for HS256)")
         return v
 
     @property
@@ -107,8 +182,18 @@ class Settings(BaseSettings):
 
     @property
     def async_database_url(self) -> str:
-        """Return database URL string for SQLAlchemy async engine."""
-        return str(self.database_url)
+        """Return database URL string for SQLAlchemy async engine.
+
+        R17-FIX: Rewrites postgresql:// to postgresql+asyncpg:// if needed.
+        Standard DATABASE_URL values (from Django, Heroku, most cloud providers)
+        use postgresql:// which doesn't include the async driver marker.
+        SQLAlchemy's create_async_engine requires the +asyncpg dialect.
+        Without this rewrite, startup crashes with a cryptic driver error.
+        """
+        url = str(self.database_url)
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        return url
 
     @property
     def has_email(self) -> bool:
@@ -120,33 +205,52 @@ class Settings(BaseSettings):
 
 _secrets_loaded = False
 
+# R37-FIX: Protect _ensure_secrets_loaded() against concurrent calls.
+# Without a lock, two threads calling get_settings() simultaneously can both
+# see _secrets_loaded=False, both enter loading, and race on os.environ writes.
+import threading as _threading
+_secrets_lock = _threading.Lock()
+
 
 def _ensure_secrets_loaded() -> None:
     """Load .env first, then secrets from GCP Secret Manager (once, on first call).
 
     The .env file must be loaded BEFORE Secret Manager so that GCP_PROJECT_ID
     and DB_HOST are available for _detect_gcp_project_id() and _build_database_url().
+
+    R36-FIX: Moved ``_secrets_loaded = True`` to AFTER the loading completes.
+    Previously, the flag was set immediately (before loading), which meant:
+    - If load_secrets() raised a transient GCP error on cold start, the flag
+      was already True, preventing any retry on the next get_settings() call.
+    - On GCP Cloud Run, this caused the first request to fail (no DB_PASSWORD)
+      and all subsequent requests to use incomplete settings forever.
     """
     global _secrets_loaded
+    # R37-FIX: Double-checked locking — fast path without lock acquisition.
     if _secrets_loaded:
         return
-    _secrets_loaded = True
+    with _secrets_lock:
+        if _secrets_loaded:
+            return
 
-    # Load .env FIRST so GCP_PROJECT_ID, DB_HOST etc. are in os.environ
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass  # python-dotenv not installed, rely on env vars
+        # Load .env FIRST so GCP_PROJECT_ID, DB_HOST etc. are in os.environ
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass  # python-dotenv not installed, rely on env vars
 
-    try:
-        from app.services.secret_manager import load_secrets
-        count = load_secrets()
-        if count > 0:
-            logger.info("Loaded %d secrets from GCP Secret Manager", count)
-    except Exception as exc:
-        # Non-fatal: fall back to env vars / .env
-        logger.debug("Secret Manager unavailable: %s", exc)
+        try:
+            from app.services.secret_manager import load_secrets
+            count = load_secrets()
+            if count > 0:
+                logger.info("Loaded %d secrets from GCP Secret Manager", count)
+        except Exception as exc:
+            # Non-fatal: fall back to env vars / .env
+            logger.debug("Secret Manager unavailable: %s", exc)
+
+        # R36-FIX: Set flag AFTER loading completes, not before.
+        _secrets_loaded = True
 
 
 @lru_cache(maxsize=1)
@@ -158,3 +262,19 @@ def get_settings() -> Settings:
     """
     _ensure_secrets_loaded()
     return Settings()  # type: ignore[call-arg]
+
+
+def clear_settings_cache() -> None:
+    """R36-FIX: Clear the cached settings singleton.
+
+    The @lru_cache on get_settings() caches the Settings object indefinitely.
+    If secrets rotate (e.g., DB password via GCP Secret Manager) or env vars
+    change, the cache must be cleared so the next get_settings() call picks
+    up the new values. Without this, the only way to reload settings was
+    restarting the process.
+
+    Usage: call after secret rotation or config update.
+    """
+    global _secrets_loaded
+    get_settings.cache_clear()
+    _secrets_loaded = False

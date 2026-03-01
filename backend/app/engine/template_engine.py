@@ -37,6 +37,7 @@ class FileTemplate:
     content: str  # Jinja2 template string
     category: str = "backend"  # backend, frontend, compliance, config
     description: str = ""
+    framework: str | None = None  # None = all frameworks, "fastapi", "django", "express"
 
 
 @dataclass(slots=True)
@@ -77,12 +78,15 @@ class TemplateEngine:
         self,
         contract: dict[str, Any],
         categories: list[str] | None = None,
+        framework: str | None = None,
     ) -> list[GeneratedFile]:
-        """Render all templates (or filtered by category) using the contract.
+        """Render all templates (or filtered by category/framework) using the contract.
 
         Args:
             contract: Vikram's architecture contract.
             categories: If provided, only render templates in these categories.
+            framework: If provided, only render templates matching this
+                backend framework (or universal templates with framework=None).
 
         Returns:
             List of GeneratedFile objects ready for writing.
@@ -92,6 +96,11 @@ class TemplateEngine:
 
         for name, template in self._templates.items():
             if categories and template.category not in categories:
+                continue
+
+            # Framework filtering: include templates that are universal (None)
+            # or match the requested framework
+            if framework and template.framework and template.framework != framework:
                 continue
 
             try:
@@ -113,6 +122,7 @@ class TemplateEngine:
             "templates_rendered",
             count=len(files),
             categories=categories or "all",
+            framework=framework or "all",
         )
         return files
 
@@ -178,9 +188,13 @@ class TemplateEngine:
 
         Uses a sandboxed Jinja2 environment for safety.
         """
-        from jinja2 import BaseLoader, Environment, StrictUndefined
+        # R30-FIX-1: Use SandboxedEnvironment to prevent SSTI. The standard
+        # Environment permits arbitrary attribute access (e.g., __class__.__mro__)
+        # which allows remote code execution if an attacker controls any context field.
+        from jinja2 import BaseLoader, StrictUndefined
+        from jinja2.sandbox import SandboxedEnvironment
 
-        env = Environment(
+        env = SandboxedEnvironment(
             loader=BaseLoader(),
             undefined=StrictUndefined,
             keep_trailing_newline=True,
@@ -211,7 +225,8 @@ class TemplateEngine:
             name="backend.dockerfile",
             output_path="backend/Dockerfile",
             category="backend",
-            description="Python backend Dockerfile",
+            description="Python backend Dockerfile (FastAPI)",
+            framework="fastapi",
             content="""\
 FROM python:3.12-slim AS base
 
@@ -237,7 +252,8 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
             name="backend.requirements",
             output_path="backend/requirements.txt",
             category="backend",
-            description="Python dependencies",
+            description="Python dependencies (FastAPI)",
+            framework="fastapi",
             content="""\
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
@@ -268,7 +284,8 @@ structlog>=24.4.0
             name="backend.env_example",
             output_path="backend/.env.example",
             category="backend",
-            description="Environment template",
+            description="Environment template (FastAPI)",
+            framework="fastapi",
             content="""\
 # {{ project_name }} Environment Configuration
 DATABASE_URL=postgresql+asyncpg://{{ project_slug }}_user:password@localhost:5432/{{ project_slug }}
@@ -332,6 +349,306 @@ services:
 
 volumes:
   pgdata:
+""",
+        ))
+
+        # ── Django Backend Templates ──────────────────────────────
+
+        self.register(FileTemplate(
+            name="backend.django.dockerfile",
+            output_path="backend/Dockerfile",
+            category="backend",
+            description="Python backend Dockerfile (Django)",
+            framework="django",
+            content="""\
+FROM python:3.12-slim AS base
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    build-essential libpq-dev && \\
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN python manage.py collectstatic --noinput
+
+EXPOSE 8000
+
+CMD ["gunicorn", "{{ project_slug }}.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4"]
+""",
+        ))
+
+        self.register(FileTemplate(
+            name="backend.django.requirements",
+            output_path="backend/requirements.txt",
+            category="backend",
+            description="Python dependencies (Django)",
+            framework="django",
+            content="""\
+django>=5.1.0
+djangorestframework>=3.15.0
+django-cors-headers>=4.6.0
+django-filter>=24.3
+psycopg[binary]>=3.2.0
+gunicorn>=23.0.0
+python-jose[cryptography]>=3.3.0
+bcrypt>=4.2.0
+pydantic>=2.10.0
+python-dotenv>=1.0.1
+httpx>=0.28.0
+redis[hiredis]>=5.2.0
+orjson>=3.10.0
+structlog>=24.4.0
+dj-database-url>=2.3.0
+whitenoise>=6.8.0
+{% if integrations %}
+# Integrations
+{% for integration in integrations %}
+# {{ integration.get('name', 'unknown') }}
+{% endfor %}
+{% endif %}
+""",
+        ))
+
+        self.register(FileTemplate(
+            name="backend.django.settings",
+            output_path="backend/{{ project_slug }}/settings.py",
+            category="backend",
+            description="Django settings module",
+            framework="django",
+            content="""\
+\"\"\"Django settings for {{ project_name }}.\"\"\"
+
+import os
+from pathlib import Path
+
+import dj_database_url
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "change-me-to-a-random-key")
+
+DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "rest_framework",
+    "corsheaders",
+    "django_filters",
+    "{{ project_slug }}.core",
+]
+
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
+ROOT_URLCONF = "{{ project_slug }}.urls"
+
+DATABASES = {
+    "default": dj_database_url.config(
+        default="postgresql://{{ project_slug }}_user:password@localhost:5432/{{ project_slug }}",
+        conn_max_age=600,
+    ),
+}
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+
+CORS_ALLOWED_ORIGINS = [
+    {% for origin in cors_origins %}
+    "{{ origin }}",
+    {% endfor %}
+]
+
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+""",
+        ))
+
+        self.register(FileTemplate(
+            name="backend.django.env_example",
+            output_path="backend/.env.example",
+            category="backend",
+            description="Environment template (Django)",
+            framework="django",
+            content="""\
+# {{ project_name }} Environment Configuration
+DATABASE_URL=postgresql://{{ project_slug }}_user:password@localhost:5432/{{ project_slug }}
+DJANGO_SECRET_KEY=change-me-to-a-random-50-char-string
+VALKEY_URL=redis://localhost:6379/0
+ENVIRONMENT=development
+DEBUG=true
+ALLOWED_HOSTS=localhost,127.0.0.1
+CORS_ALLOWED_ORIGINS=http://localhost:3000
+""",
+        ))
+
+        # ── Express Backend Templates ────────────────────────────
+
+        self.register(FileTemplate(
+            name="backend.express.dockerfile",
+            output_path="backend/Dockerfile",
+            category="backend",
+            description="Node.js backend Dockerfile (Express)",
+            framework="express",
+            content="""\
+FROM node:22-slim AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+FROM node:22-slim AS runner
+
+WORKDIR /app
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+
+EXPOSE 8000
+
+CMD ["node", "dist/index.js"]
+""",
+        ))
+
+        self.register(FileTemplate(
+            name="backend.express.package_json",
+            output_path="backend/package.json",
+            category="backend",
+            description="Node.js package manifest (Express)",
+            framework="express",
+            content="""\
+{
+  "name": "{{ project_slug }}-backend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "eslint src/",
+    "test": "jest"
+  },
+  "dependencies": {
+    "express": "^5.0.0",
+    "cors": "^2.8.5",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.0",
+    "bcryptjs": "^3.0.0",
+    "pg": "^8.13.0",
+    "drizzle-orm": "^0.36.0",
+    "zod": "^3.24.0",
+    "pino": "^9.5.0",
+    "dotenv": "^16.4.0",
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/cors": "^2.8.0",
+    "@types/jsonwebtoken": "^9.0.0",
+    "@types/bcryptjs": "^2.4.0",
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "drizzle-kit": "^0.28.0",
+    "jest": "^30.0.0",
+    "@types/jest": "^30.0.0",
+    "ts-jest": "^29.2.0",
+    "eslint": "^9.0.0"
+  }
+}
+""",
+        ))
+
+        self.register(FileTemplate(
+            name="backend.express.tsconfig",
+            output_path="backend/tsconfig.json",
+            category="backend",
+            description="TypeScript configuration (Express)",
+            framework="express",
+            content="""\
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+""",
+        ))
+
+        self.register(FileTemplate(
+            name="backend.express.env_example",
+            output_path="backend/.env.example",
+            category="backend",
+            description="Environment template (Express)",
+            framework="express",
+            content="""\
+# {{ project_name }} Environment Configuration
+DATABASE_URL=postgresql://{{ project_slug }}_user:password@localhost:5432/{{ project_slug }}
+JWT_SECRET=change-me-to-a-random-32-char-string
+REDIS_URL=redis://localhost:6379/0
+NODE_ENV=development
+PORT=8000
+CORS_ORIGINS=http://localhost:3000
 """,
         ))
 

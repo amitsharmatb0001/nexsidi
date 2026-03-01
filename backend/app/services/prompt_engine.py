@@ -108,12 +108,39 @@ class PromptRegistry:
 def _escape_variable(value: str) -> str:
     """Escape a variable value to prevent prompt injection.
 
-    Wraps user-provided values in delimiters and strips control sequences.
+    R36-FIX: Enhanced escaping for inter-agent prompt injection defense.
+    Previous version only stripped {{ }} and control chars, but did NOT
+    sanitize prompt-boundary markers that could trick LLMs:
+    - [STOP], [END], [SYSTEM] markers with surrounding newlines
+    - Markdown code fence boundaries (``` blocks)
+    - Fake role markers ("Assistant:", "System:", "Human:")
+
+    Now wraps injected values in clearly-delimited boundaries so the LLM
+    sees them as data, not instructions.
     """
     # Strip any existing delimiter patterns
     sanitized = value.replace("{{", "").replace("}}", "")
     # Strip null bytes and control characters (except newlines/tabs)
     sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", sanitized)
+    # R36-FIX: Neutralize fake role/instruction markers that could trick
+    # LLMs into treating injected content as system instructions.
+    # Replace with visually similar but non-functional versions.
+    sanitized = re.sub(
+        r"(?i)^\s*\[(STOP|END|SYSTEM|INST|/INST)\]\s*$",
+        r"[escaped_\1]",
+        sanitized,
+        flags=re.MULTILINE,
+    )
+    # R37-FIX: Remove ^ anchor — matches only at line start, allowing
+    # bypass via tab/space prefix or mid-line injection.
+    sanitized = re.sub(
+        r"(?i)(System|Assistant|Human|User)\s*:",
+        r"[\1]:",
+        sanitized,
+    )
+    # R37-FIX: Neutralize code fence boundaries that LLMs interpret
+    # as code block delimiters for framing injected instructions.
+    sanitized = sanitized.replace("```", "` ` `")
     return sanitized
 
 
@@ -139,8 +166,11 @@ def render_template(
     # Find all variables in template
     required_vars = set(_VAR_PATTERN.findall(template_text))
 
-    # Validate allowed variables
-    if allowed_variables:
+    # R9-FIX: Use `is not None` instead of truthiness check.
+    # frozenset() is falsy, so `if allowed_variables:` skipped validation
+    # when the template declared "no variables allowed" (empty frozenset).
+    # This completed the R7 FROZENSET-FIX which only fixed the caller.
+    if allowed_variables is not None:
         unknown = set(variables.keys()) - allowed_variables
         if unknown:
             raise ValueError(f"Disallowed variables: {unknown}")
@@ -229,11 +259,15 @@ class PromptEngine:
                     cache_key=cache_key,
                 )
 
+        # FROZENSET-FIX: Use `is not None` instead of truthiness check.
+        # An empty frozenset() is falsy but means "no variables allowed".
+        allowed = template.allowed_variables if template.allowed_variables is not None else None
+
         # Render system prompt
         system_rendered = render_template(
             template.system_prompt,
             variables,
-            template.allowed_variables if template.allowed_variables else None,
+            allowed,
         )
 
         # Render user prompt if present
@@ -242,7 +276,7 @@ class PromptEngine:
             user_rendered = render_template(
                 template.user_prompt,
                 variables,
-                template.allowed_variables if template.allowed_variables else None,
+                allowed,
             )
 
         result = RenderedPrompt(
@@ -259,7 +293,17 @@ class PromptEngine:
                 "system_prompt": system_rendered,
                 "user_prompt": user_rendered,
             })
-            await self._redis.set(f"prompt:{cache_key}", cache_data, ex=self._cache_ttl)
+            # R26-FIX-29: Use transaction=True for atomic SET + SADD.
+            # Without this, a crash between SET and SADD leaves an untracked
+            # cache entry that invalidate() cannot find or delete.
+            pipe = self._redis.pipeline(transaction=True)
+            pipe.set(f"prompt:{cache_key}", cache_data, ex=self._cache_ttl)
+            # INVALIDATE-FIX: Track cache key in per-template index for
+            # targeted invalidation (avoids nuclear scan of all prompt:* keys).
+            index_key = f"prompt_index:{template_name}"
+            pipe.sadd(index_key, cache_key)
+            pipe.expire(index_key, self._cache_ttl)
+            await pipe.execute()
             logger.debug("prompt_cache_set", template=template_name)
 
         return result
@@ -276,26 +320,64 @@ class PromptEngine:
         # Sort variables for deterministic hashing
         var_str = orjson.dumps(dict(sorted(variables.items()))).decode("utf-8")
         raw = f"{template.name}:{template.version}:{var_str}"
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+        # R26-FIX-28: Use full 64-char hex digest instead of truncated 24 chars.
+        # 24 chars = 96 bits — birthday-paradox collision serves wrong prompt.
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     async def invalidate(self, template_name: str) -> int:
-        """Invalidate all cached renders for a template.
+        """Invalidate all cached renders for a specific template.
+
+        Uses a secondary index (set of cache keys per template) to avoid
+        scanning all prompt:* keys. Falls back to TTL expiry if no
+        index exists.
+
+        DEFERRED-FIX-9: Uses Lua script for atomic read-and-delete to prevent
+        TOCTOU race between smembers() and delete(). Without this, a concurrent
+        render() could add a new cache key to the index set between our
+        smembers() and delete(index_key) calls, causing the newly cached key
+        to be lost when the index is deleted.
 
         Returns number of keys deleted.
         """
         if not self._redis:
             return 0
 
-        # We can't efficiently find all keys for a template without scanning.
-        # In practice, cache_ttl handles expiry. This is for explicit invalidation.
-        pattern = f"prompt:*"
-        count = 0
-        async for key in self._redis.scan_iter(match=pattern, count=100):
-            count += 1
-            await self._redis.delete(key)
+        index_key = f"prompt_index:{template_name}"
 
-        logger.info("prompt_cache_invalidated", template=template_name, keys=count)
+        # Lua script: atomically read members, delete all cache keys, delete index
+        lua_script = """
+        local index_key = KEYS[1]
+        local prefix = ARGV[1]
+        local members = redis.call('SMEMBERS', index_key)
+        local count = 0
+        for _, member in ipairs(members) do
+            redis.call('DEL', prefix .. member)
+            count = count + 1
+        end
+        if count > 0 then
+            redis.call('DEL', index_key)
+        end
         return count
+        """
+        count = await self._redis.eval(lua_script, 1, index_key, "prompt:")
+        count = int(count) if count else 0
+
+        if count > 0:
+            logger.info("prompt_cache_invalidated", template=template_name, keys=count)
+            return count
+
+        # NUKE-FIX: No index exists (legacy data before INVALIDATE-FIX).
+        # Previous fallback deleted ALL prompt:* keys across all templates,
+        # which is a nuclear option that harms unrelated templates.
+        # Instead, log a warning and return 0 — the cached entries will
+        # naturally expire via TTL. New entries use the index going forward.
+        logger.warning(
+            "prompt_cache_invalidate_no_index",
+            template=template_name,
+            action="skipped_nuclear_scan",
+            note="Legacy keys will expire via TTL. New entries use index.",
+        )
+        return 0
 
 
 # ── Global Registry & Engine ────────────────────────────────────────
@@ -321,6 +403,9 @@ def get_prompt_engine() -> PromptEngine:
 async def init_prompt_engine() -> PromptEngine:
     """Initialize the Prompt Engine with optional Valkey caching.
 
+    DEFERRED-FIX-10: Uses shared Valkey pool instead of creating a
+    dedicated connection pool.
+
     Called once at app startup after Valkey connection is available.
     """
     global _engine
@@ -329,14 +414,9 @@ async def init_prompt_engine() -> PromptEngine:
 
     redis_client = None
     try:
-        import redis.asyncio as aioredis
+        from app.services.valkey_pool import get_valkey_client
 
-        settings = get_settings()
-        redis_client = aioredis.from_url(
-            settings.valkey_url,
-            password=settings.valkey_password or None,
-            decode_responses=False,
-        )
+        redis_client = await get_valkey_client()
     except Exception:
         logger.warning("prompt_engine_no_cache", reason="Valkey not available, running without cache")
 
@@ -346,9 +426,15 @@ async def init_prompt_engine() -> PromptEngine:
 
 
 async def shutdown_prompt_engine() -> None:
-    """Shutdown the Prompt Engine. Call at app shutdown."""
+    """Shutdown the Prompt Engine. Call at app shutdown.
+
+    DEFERRED-FIX-10: Does NOT close the Redis client — it's shared.
+    """
     global _engine
-    if _engine is not None:
-        if _engine._redis is not None:
-            await _engine._redis.aclose()
-        _engine = None
+    _engine = None
+
+
+def reset_prompt_engine() -> None:
+    """DEFERRED-FIX-11: Reset the singleton for testing / event loop changes."""
+    global _engine
+    _engine = None

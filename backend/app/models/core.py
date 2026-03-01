@@ -178,8 +178,11 @@ class FileUpload(Base, UUIDPrimaryKeyMixin, TenantMixin):
     project_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("core.projects.id", ondelete="CASCADE"), nullable=False
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("auth.users.id", ondelete="SET NULL"), nullable=False
+    # R28-FIX-19: Changed nullable to True. SET NULL + nullable=False creates
+    # an IntegrityError when the referenced user is deleted. File uploads should
+    # persist for project history even after user deletion.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("auth.users.id", ondelete="SET NULL"), nullable=True
     )
     original_name: Mapped[str] = mapped_column(String(500), nullable=False)
     storage_path: Mapped[str] = mapped_column(Text, nullable=False)

@@ -1,4 +1,4 @@
-"""Tests for all 19 NexSidi agents.
+"""Tests for all 20 NexSidi agents.
 
 Tests registration, tool definitions, properties, and execute() for each agent.
 Agents that call store_output() are patched to avoid Valkey dependency.
@@ -35,18 +35,20 @@ import app.agents.whatsapp_agent  # noqa: F401
 import app.agents.git_agent     # noqa: F401
 import app.agents.security_guardian  # noqa: F401
 import app.agents.system_monitor  # noqa: F401
+import app.agents.challenger      # noqa: F401
+import app.agents.attack_tester   # noqa: F401
 
 
 class TestAgentRegistry:
     """Test the global agent registry."""
 
     def test_total_agent_count(self):
-        assert len(AGENT_REGISTRY) == 19
+        assert len(AGENT_REGISTRY) == 21  # 20 original + attack_tester
 
     def test_list_agents_returns_sorted(self):
         names = list_agents()
         assert names == sorted(names)
-        assert len(names) == 19
+        assert len(names) == 21  # 20 original + attack_tester
 
     def test_all_agents_have_unique_names(self):
         names = list_agents()
@@ -57,6 +59,7 @@ class TestAgentRegistry:
         "shubham", "aanya", "karan", "navya", "deepika",
         "aarav", "fixer", "pranav", "docs_agent", "support_agent",
         "whatsapp_agent", "git_agent", "security_guardian", "system_monitor",
+        "challenger",
     ])
     def test_agent_registered(self, name: str):
         agent = get_agent(name)
@@ -68,6 +71,7 @@ class TestAgentRegistry:
         "shubham", "aanya", "karan", "navya", "deepika",
         "aarav", "fixer", "pranav", "docs_agent", "support_agent",
         "whatsapp_agent", "git_agent", "security_guardian", "system_monitor",
+        "challenger",
     ])
     def test_agent_has_tools(self, name: str):
         agent = get_agent(name)
@@ -78,6 +82,7 @@ class TestAgentRegistry:
         "shubham", "aanya", "karan", "navya", "deepika",
         "aarav", "fixer", "pranav", "docs_agent", "support_agent",
         "whatsapp_agent", "git_agent", "security_guardian", "system_monitor",
+        "challenger",
     ])
     def test_agent_has_display_name(self, name: str):
         agent = get_agent(name)
@@ -227,7 +232,7 @@ class TestAgentExecution:
                 }]}}]}]
             }
         }
-        with patch.object(wa, "store_output", new_callable=AsyncMock):
+        with patch("app.agents.whatsapp_agent.store_output", new_callable=AsyncMock):
             result = await wa.execute("run-1", payload)
         assert result.status == AgentStatus.COMPLETED
         assert result.output["source"] == "whatsapp"

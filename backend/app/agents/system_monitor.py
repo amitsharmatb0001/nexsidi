@@ -29,9 +29,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -216,7 +217,7 @@ def classify_bug_severity(error_type: str, occurrence_count: int) -> BugSeverity
 
 # ── System Monitor Agent ────────────────────────────────────────
 
-class SystemMonitor(BaseAgent):
+class SystemMonitor:
     """System Monitor -- optimizer + bug tracker.
 
     Combines system performance monitoring with automatic
@@ -226,11 +227,19 @@ class SystemMonitor(BaseAgent):
     name = "system_monitor"
     display_name = "System Monitor"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
+
+    # MEM-FIX: Bound in-memory storage to prevent OOM.
+    _MAX_BUGS: int = 1_000
+    _MAX_METRICS: int = 10_000
 
     def __init__(self) -> None:
-        super().__init__()
+        from collections import deque
+
+        self._tools: dict[str, ToolDefinition] = {}
         self._bugs: dict[str, BugReport] = {}  # fingerprint -> report
-        self._metrics_history: list[MetricSnapshot] = []
+        self._metrics_history: deque[MetricSnapshot] = deque(maxlen=self._MAX_METRICS)
+        self._next_bug_id: int = 0  # RACE-FIX: monotonic counter for unique IDs
 
         self.register_tool(ToolDefinition(
             name="check_health",
@@ -265,6 +274,24 @@ class SystemMonitor(BaseAgent):
                 },
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -327,6 +354,9 @@ class SystemMonitor(BaseAgent):
             bugs=len(self._bugs),
         )
 
+        # STORE-FIX: Persist output to context engine for downstream agents
+        await store_output(self, pipeline_run_id, output)
+
         return AgentResult(
             agent_name=self.name,
             status=AgentStatus.COMPLETED,
@@ -351,7 +381,9 @@ class SystemMonitor(BaseAgent):
             bug.severity = classify_bug_severity(error_type, bug.occurrence_count)
             return bug
 
-        bug_id = f"BUG-{len(self._bugs) + 1:04d}"
+        # RACE-FIX: Use monotonic counter instead of len(dict) for unique IDs
+        self._next_bug_id += 1
+        bug_id = f"BUG-{self._next_bug_id:04d}"
         severity = classify_bug_severity(error_type, 1)
 
         bug = BugReport(
@@ -365,6 +397,10 @@ class SystemMonitor(BaseAgent):
         )
         self._bugs[fp] = bug
 
+        # MEM-FIX: Evict oldest resolved bugs when over capacity
+        if len(self._bugs) > self._MAX_BUGS:
+            self._evict_resolved_bugs()
+
         logger.info(
             "bug_captured",
             bug_id=bug_id,
@@ -373,6 +409,19 @@ class SystemMonitor(BaseAgent):
         )
 
         return bug
+
+    def _evict_resolved_bugs(self) -> None:
+        """MEM-FIX: Remove resolved/wont_fix bugs to stay under capacity."""
+        evictable = [
+            fp for fp, b in self._bugs.items()
+            if b.status in (BugStatus.RESOLVED, BugStatus.WONT_FIX)
+        ]
+        # Evict oldest resolved first (by first_seen)
+        evictable.sort(key=lambda fp: self._bugs[fp].first_seen)
+        for fp in evictable:
+            if len(self._bugs) <= self._MAX_BUGS:
+                break
+            del self._bugs[fp]
 
     def get_bugs(
         self,

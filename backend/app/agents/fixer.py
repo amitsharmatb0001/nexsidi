@@ -27,9 +27,11 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
+    call_ai,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -41,14 +43,38 @@ logger = structlog.get_logger(__name__)
 MAX_FIX_ITERATIONS: int = 5
 
 # Model escalation by iteration number (AUDIT FIX #18)
-ITERATION_MODEL_MAP: dict[int, tuple[str, bool]] = {
-    # iteration -> (model_override, enable_thinking)
-    1: ("gemini-2.5-pro", False),
-    2: ("gemini-2.5-pro", False),
-    3: ("claude-sonnet-4-6", False),
-    4: ("claude-sonnet-4-6", False),
-    5: ("claude-sonnet-4-6", True),   # Extended thinking on last attempt
+# Uses MODELS registry keys (not raw model IDs) — mode-aware.
+_ITERATION_MODELS: dict[str, dict[int, tuple[str, bool]]] = {
+    "mixed": {
+        1: ("gemini-pro", False),
+        2: ("gemini-pro", False),
+        3: ("sonnet", False),
+        4: ("sonnet", False),
+        5: ("sonnet", True),
+    },
+    "gemini": {
+        1: ("gemini-pro", False),
+        2: ("gemini-pro", False),
+        3: ("gemini-3-pro", False),
+        4: ("gemini-3-pro", False),
+        5: ("gemini-3.1-pro", True),
+    },
+    "claude": {
+        1: ("haiku", False),
+        2: ("haiku", False),
+        3: ("sonnet", False),
+        4: ("sonnet", False),
+        5: ("sonnet", True),
+    },
 }
+
+
+def _get_iteration_model_map() -> dict[int, tuple[str, bool]]:
+    """Get model escalation map for the current AI provider mode."""
+    from app.services.ai_router import get_ai_mode
+    mode = get_ai_mode()
+    # R29-FIX-13: Fallback to "mixed" for unknown modes instead of KeyError.
+    return _ITERATION_MODELS.get(mode, _ITERATION_MODELS["mixed"])
 
 
 class FixStatus(str, Enum):
@@ -146,7 +172,7 @@ def _sanitize_message(message: str) -> str:
 # ── Fixer Agent ────────────────────────────────────────────────────
 
 
-class Fixer(BaseAgent):
+class Fixer:
     """Autonomous Error Correction — reads errors, generates targeted fixes.
 
     Max 5 iterations with model escalation.
@@ -155,9 +181,10 @@ class Fixer(BaseAgent):
     name = "fixer"
     display_name = "Fixer — Error Correction"
     default_complexity = TaskComplexity.HIGH
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="read_file",
@@ -192,6 +219,24 @@ class Fixer(BaseAgent):
                 "properties": {},
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -230,8 +275,8 @@ class Fixer(BaseAgent):
             report.iterations = iteration
             current_error = remaining_errors[0]
 
-            model_override, enable_thinking = ITERATION_MODEL_MAP.get(
-                iteration, ("claude-sonnet-4-6", False)
+            model_override, enable_thinking = _get_iteration_model_map().get(
+                iteration, ("sonnet", False)
             )
 
             logger.info(
@@ -301,7 +346,7 @@ class Fixer(BaseAgent):
             ],
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "fixer_complete",
@@ -312,9 +357,16 @@ class Fixer(BaseAgent):
             files_modified=report.files_modified,
         )
 
+        # R8-FIX: Return COMPLETED for both FIXED and PARTIAL statuses.
+        # PARTIAL means some errors were fixed but others remain — the pipeline's
+        # fix-retest loop (line 852-870) checks _has_errors_to_fix() and rewinds
+        # to QUALITY_REVIEW. If we return FAILED here, the failure handler (line 814)
+        # fires FIRST, sets run.status=FAILED, and breaks — the fix-retest check
+        # is never reached, making the entire loop dead code.
+        fixer_completed = report.status in (FixStatus.FIXED, FixStatus.PARTIAL)
         return AgentResult(
             agent_name=self.name,
-            status=AgentStatus.COMPLETED if report.status == FixStatus.FIXED else AgentStatus.FAILED,
+            status=AgentStatus.COMPLETED if fixer_completed else AgentStatus.FAILED,
             output=output,
         )
 
@@ -370,24 +422,34 @@ class Fixer(BaseAgent):
         ])
 
         try:
-            # Temporarily override model for this call
-            original_model = self.default_model
-            self.default_model = model_override
+            # M1-FIX: Pass model_override directly instead of mutating
+            # self.default_model (which is a race condition with concurrent pipelines)
+            from app.agents.base import resolve_model_override
+            from app.services.ai_router import AIMessage, AIRequest, get_ai_router
 
-            response = await self.call_ai(
-                messages=[{"role": "user", "content": user_message}],
+            router = get_ai_router()
+            ai_messages = [AIMessage(role="user", content=user_message)]
+            request = AIRequest(
+                messages=ai_messages,
                 system_prompt=system_prompt,
                 task_type="general",
+                complexity=self.default_complexity,
+                model_override=resolve_model_override(model_override),
                 temperature=0.1,
                 enable_thinking=enable_thinking,
             )
-
-            self.default_model = original_model
+            response = await router.call(request)
 
             fixed_content = response.content.strip()
             # Strip markdown code fences if present
+            # R12-FIX: Guard split to prevent IndexError if response is
+            # exactly "```" with no newline (split returns 1-element list).
             if fixed_content.startswith("```"):
-                fixed_content = fixed_content.split("\n", 1)[1].rsplit("```", 1)[0]
+                parts = fixed_content.split("\n", 1)
+                if len(parts) > 1:
+                    fixed_content = parts[1].rsplit("```", 1)[0]
+                else:
+                    fixed_content = ""
 
             # Validate the fix produced actual content
             if len(fixed_content) < 10:
@@ -427,12 +489,16 @@ class Fixer(BaseAgent):
             )
 
         except Exception as exc:
-            logger.error("fix_attempt_failed", iteration=iteration, error=str(exc))
+            # R11-FIX: Sanitize exception — may contain API keys/Bearer tokens
+            # from httpx error messages, which flow into pipeline output dicts.
+            from app.services.ai_router import _sanitize_error
+            safe_err = _sanitize_error(exc)
+            logger.error("fix_attempt_failed", iteration=iteration, error=safe_err)
             return FixAttempt(
                 iteration=iteration,
                 error=error,
                 model_used=model_override,
-                fix_applied=f"Fix attempt failed: {exc}",
+                fix_applied=f"Fix attempt failed: {safe_err}",
                 file_path=error.file_path,
                 file_content_before=file_content,
                 file_content_after="",
@@ -442,7 +508,11 @@ class Fixer(BaseAgent):
     # ── Error Collection ───────────────────────────────────────────
 
     def _collect_errors(self, context: dict[str, Any]) -> list[SanitizedError]:
-        """Collect and sanitize errors from quality gates + test results."""
+        """Collect and sanitize errors from quality gates + test results.
+
+        MUTATION-FIX: Creates shallow copies of finding dicts before adding
+        ``source_agent`` to avoid mutating the shared pipeline context.
+        """
         errors: list[SanitizedError] = []
 
         # From Karan (security findings)
@@ -450,24 +520,24 @@ class Fixer(BaseAgent):
         if isinstance(karan_output, dict):
             for finding in karan_output.get("findings", []):
                 if finding.get("severity") in ("critical", "high"):
-                    finding["source_agent"] = "karan"
-                    errors.append(SanitizedError.from_finding(finding))
+                    enriched = {**finding, "source_agent": "karan"}
+                    errors.append(SanitizedError.from_finding(enriched))
 
         # From Navya (logic findings)
         navya_output = context.get("navya", {})
         if isinstance(navya_output, dict):
             for finding in navya_output.get("findings", []):
                 if finding.get("severity") == "error":
-                    finding["source_agent"] = "navya"
-                    errors.append(SanitizedError.from_finding(finding))
+                    enriched = {**finding, "source_agent": "navya"}
+                    errors.append(SanitizedError.from_finding(enriched))
 
         # From Deepika (perf findings — only critical)
         deepika_output = context.get("deepika", {})
         if isinstance(deepika_output, dict):
             for finding in deepika_output.get("findings", []):
                 if finding.get("severity") == "critical":
-                    finding["source_agent"] = "deepika"
-                    errors.append(SanitizedError.from_finding(finding))
+                    enriched = {**finding, "source_agent": "deepika"}
+                    errors.append(SanitizedError.from_finding(enriched))
 
         # From Aarav (test failures)
         aarav_output = context.get("aarav", {})
@@ -494,13 +564,22 @@ class Fixer(BaseAgent):
         file_path: str,
         new_content: str,
     ) -> None:
-        """Update a file's content in the pipeline context after fixing."""
+        """Update a file's content in the pipeline context after fixing.
+
+        MUTATION-FIX: Creates a shallow copy of the agent output dict and
+        file_contents dict before modifying, so the original cached output
+        is preserved. The context dict itself is per-pipeline-run so
+        updating the top-level key is safe.
+        """
         for agent_name in ("shubham", "aanya"):
             agent_output = context.get(agent_name, {})
             if isinstance(agent_output, dict):
                 file_contents = agent_output.get("file_contents", {})
                 if file_path in file_contents:
-                    file_contents[file_path] = new_content
+                    # Copy-on-write: replace the whole agent output to
+                    # avoid mutating the original dict stored in context engine
+                    new_file_contents = {**file_contents, file_path: new_content}
+                    context[agent_name] = {**agent_output, "file_contents": new_file_contents}
                     return
 
 

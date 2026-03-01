@@ -23,9 +23,11 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
+    call_ai,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -189,15 +191,16 @@ _TS_LOGIC_PATTERNS: list[tuple[re.Pattern, str, LogicSeverity, LogicCategory, st
 # ── Navya Agent ────────────────────────────────────────────────────
 
 
-class Navya(BaseAgent):
+class Navya:
     """Logic Analyst — detects logic errors and correctness issues."""
 
     name = "navya"
     display_name = "Navya — Logic Analyst"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="read_file",
@@ -228,6 +231,24 @@ class Navya(BaseAgent):
                 "required": ["severity", "category", "file_path", "title", "description"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -263,7 +284,8 @@ class Navya(BaseAgent):
                 for finding in ai_findings:
                     report.add(finding)
             except Exception as exc:
-                logger.warning("ai_contract_verification_failed", error=str(exc))
+                from app.services.ai_router import _sanitize_error  # R27-FIX
+                logger.warning("ai_contract_verification_failed", error=_sanitize_error(exc))
 
         findings_output = [
             {
@@ -287,7 +309,7 @@ class Navya(BaseAgent):
             "total_findings": len(report.findings),
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "logic_analysis_complete",
@@ -458,8 +480,12 @@ class Navya(BaseAgent):
         impl_summary: list[str] = []
         for path, content in files.items():
             if path.endswith(".py") and ("router" in path.lower() or "model" in path.lower()):
-                truncated = content[:2000]
-                impl_summary.append(f"### {path}\n```python\n{truncated}\n```")
+                from app.agents.scan_utils import split_into_windows
+
+                windows = split_into_windows(content, window_size=2000, overlap=400)
+                for i, window in enumerate(windows):
+                    label = f"### {path}" if len(windows) == 1 else f"### {path} (part {i + 1}/{len(windows)})"
+                    impl_summary.append(f"{label}\n```python\n{window}\n```")
 
         if not impl_summary:
             return []
@@ -477,10 +503,10 @@ class Navya(BaseAgent):
             "Output ONLY valid JSON.",
         ])
 
-        response = await self.call_ai(
+        response = await call_ai(self, 
             messages=[{
                 "role": "user",
-                "content": f"Contract:\n{contract_summary}\n\nImplementation:\n{''.join(impl_summary[:5])}",
+                "content": f"Contract:\n{contract_summary}\n\nImplementation:\n{'\n\n'.join(impl_summary[:5])}",
             }],
             system_prompt=system_prompt,
             task_type="general",
@@ -496,7 +522,10 @@ class Navya(BaseAgent):
 
             if isinstance(parsed, list):
                 for item in parsed:
-                    sev = LogicSeverity(item.get("severity", "info"))
+                    try:
+                        sev = LogicSeverity(item.get("severity", "info"))
+                    except ValueError:
+                        sev = LogicSeverity.INFO
                     findings.append(LogicFinding(
                         severity=sev,
                         category=LogicCategory.CONTRACT_MISMATCH,
@@ -507,7 +536,8 @@ class Navya(BaseAgent):
                         suggestion=item.get("suggestion"),
                     ))
         except Exception as exc:
-            logger.warning("ai_contract_parse_failed", error=str(exc))
+            from app.services.ai_router import _sanitize_error  # R27-FIX
+            logger.warning("ai_contract_parse_failed", error=_sanitize_error(exc))
 
         return findings
 

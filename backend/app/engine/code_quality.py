@@ -4,17 +4,19 @@ Catches ~80% of errors WITHOUT running Docker by statically analyzing
 the generated code against the architecture contract.
 
 Checks:
-1. Import resolution: every import → verify target file exists
-2. Route completeness: every route in App.tsx → verify page component exists
-3. Router registration: every router → verify included in main.py
-4. Model-schema match: every model → verify matching Pydantic schema
-5. FK consistency: every foreign key → verify target table exists in contract
-6. Endpoint coverage: every contract endpoint → verify matching route handler
-7. Anti-hallucination: no TODOs, no pass, no stubs, no invented imports
+1. **Syntax validation** (Level 1): AST parse Python, bracket-balance TS/JS
+2. Import resolution: every import → verify target file exists
+3. Route completeness: every route in App.tsx → verify page component exists
+4. Router registration: every router → verify included in main.py
+5. Model-schema match: every model → verify matching Pydantic schema
+6. FK consistency: every foreign key → verify target table exists in contract
+7. Endpoint coverage: every contract endpoint → verify matching route handler
+8. Anti-hallucination: no TODOs, no pass, no stubs, no invented imports
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -120,7 +122,11 @@ class CodeQualityEngine:
         """
         report = QualityReport(files_checked=len(files))
 
-        # Run each check category
+        # Level 1: Syntax validation (Gap 218)
+        self._check_python_syntax(files, report)
+        self._check_bracket_balance(files, report)
+
+        # Level 2+: Structural and semantic checks
         self._check_anti_hallucination(files, report)
         self._check_python_imports(files, report)
         self._check_typescript_imports(files, report)
@@ -137,6 +143,140 @@ class CodeQualityEngine:
         )
 
         return report
+
+    # ── Level 1: Syntax Validation (Gap 218) ─────────────────────────
+
+    def _check_python_syntax(
+        self, files: dict[str, str], report: QualityReport
+    ) -> None:
+        """Parse every Python file with ast.parse() to catch syntax errors."""
+        for path, content in files.items():
+            if not path.endswith(".py"):
+                continue
+            try:
+                ast.parse(content, filename=path)
+            except SyntaxError as e:
+                report.add(QualityIssue(
+                    severity=Severity.ERROR,
+                    category="syntax_error",
+                    file_path=path,
+                    line=e.lineno,
+                    message=f"Python syntax error: {e.msg}",
+                    suggestion="Fix the syntax error before execution.",
+                ))
+
+    def _check_bracket_balance(
+        self, files: dict[str, str], report: QualityReport
+    ) -> None:
+        """Check bracket/brace/paren balance in TypeScript and JavaScript files."""
+        openers = {"(": ")", "[": "]", "{": "}"}
+        closers = {")", "]", "}"}
+
+        for path, content in files.items():
+            if not path.endswith((".ts", ".tsx", ".js", ".jsx")):
+                continue
+
+            stack: list[tuple[str, int]] = []  # (char, line_num)
+            in_string: str | None = None
+            in_template = False
+            # R30-FIX-13: Track single-line and multi-line comment state.
+            # Previously, the `//` handler only skipped the `/` characters
+            # but didn't skip to end of line — brackets inside comments like
+            # `// check if (x > 0)` were tracked as real brackets, causing
+            # false "unclosed" errors. Multi-line comments `/* ... */` were
+            # not handled at all.
+            in_line_comment = False
+            in_block_comment = False
+            prev_char = ""
+            line_num = 1
+
+            for ch in content:
+                if ch == "\n":
+                    line_num += 1
+                    if in_line_comment:
+                        in_line_comment = False
+                    prev_char = ch
+                    continue
+
+                # Skip characters inside block comments
+                if in_block_comment:
+                    if ch == "/" and prev_char == "*":
+                        in_block_comment = False
+                    prev_char = ch
+                    continue
+
+                # Skip characters inside line comments
+                if in_line_comment:
+                    prev_char = ch
+                    continue
+
+                # Track string state (skip bracket checks inside strings)
+                if in_string:
+                    if ch == in_string and prev_char != "\\":
+                        if in_string == "`":
+                            in_template = False
+                        in_string = None
+                    prev_char = ch
+                    continue
+
+                if ch in ("'", '"', "`"):
+                    in_string = ch
+                    if ch == "`":
+                        in_template = True
+                    prev_char = ch
+                    continue
+
+                # Detect comment starts
+                if ch == "/" and prev_char == "/":
+                    in_line_comment = True
+                    prev_char = ch
+                    continue
+
+                if ch == "*" and prev_char == "/":
+                    in_block_comment = True
+                    prev_char = ch
+                    continue
+
+                if ch in openers:
+                    stack.append((ch, line_num))
+                elif ch in closers:
+                    if not stack:
+                        report.add(QualityIssue(
+                            severity=Severity.ERROR,
+                            category="bracket_balance",
+                            file_path=path,
+                            line=line_num,
+                            message=f"Unexpected closing '{ch}' with no matching opener",
+                            suggestion="Check for missing opening bracket/brace/paren.",
+                        ))
+                    else:
+                        opener, open_line = stack.pop()
+                        expected = openers[opener]
+                        if ch != expected:
+                            report.add(QualityIssue(
+                                severity=Severity.ERROR,
+                                category="bracket_balance",
+                                file_path=path,
+                                line=line_num,
+                                message=(
+                                    f"Mismatched brackets: '{opener}' on line {open_line} "
+                                    f"closed by '{ch}' on line {line_num}"
+                                ),
+                                suggestion="Fix the mismatched bracket/brace/paren.",
+                            ))
+
+                prev_char = ch
+
+            # Unclosed brackets at end of file
+            for opener, open_line in stack:
+                report.add(QualityIssue(
+                    severity=Severity.ERROR,
+                    category="bracket_balance",
+                    file_path=path,
+                    line=open_line,
+                    message=f"Unclosed '{opener}' opened on line {open_line}",
+                    suggestion="Add the matching closing bracket/brace/paren.",
+                ))
 
     # ── Anti-Hallucination Check ────────────────────────────────────
 

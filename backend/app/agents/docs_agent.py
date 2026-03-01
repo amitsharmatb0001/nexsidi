@@ -17,9 +17,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -90,15 +91,16 @@ All endpoints require Bearer token authentication unless marked as public.
 """
 
 
-class DocsAgent(BaseAgent):
+class DocsAgent:
     """Documentation Agent — generates API docs, user guide, README."""
 
     name = "docs_agent"
     display_name = "Documentation Agent"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="generate_readme",
@@ -120,6 +122,24 @@ class DocsAgent(BaseAgent):
                 "properties": {},
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -156,7 +176,7 @@ class DocsAgent(BaseAgent):
             "project_name": project_name,
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "docs_generated",

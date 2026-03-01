@@ -14,6 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import AuditLog
 
 
+# R20-FIX: Maximum length for user_agent to prevent DB bloat via large headers.
+# An attacker can send a 100MB User-Agent header per request; without truncation,
+# each login/register writes that to the audit.logs Text column, filling the DB.
+_MAX_USER_AGENT_LENGTH = 512
+
+# R20-FIX: Maximum length for ip_address. IPv6 max is 39 chars, with zone ID up to 45.
+_MAX_IP_LENGTH = 45
+
+
 async def log_action(
     session: AsyncSession,
     *,
@@ -46,6 +55,27 @@ async def log_action(
     Returns:
         The created AuditLog instance.
     """
+    # R20-FIX: Truncate user_agent to prevent DB bloat from oversized headers.
+    if user_agent and len(user_agent) > _MAX_USER_AGENT_LENGTH:
+        user_agent = user_agent[:_MAX_USER_AGENT_LENGTH]
+
+    # R20-FIX: Validate ip_address format before hitting INET column.
+    # An invalid string (e.g., from X-Forwarded-For injection) causes
+    # PostgreSQL DataError, rolling back the entire transaction (including
+    # the business operation like login that triggered the audit write).
+    if ip_address:
+        import ipaddress as _ipaddress
+        try:
+            # R35-FIX: Strip brackets from IPv6 addresses. Some proxies send
+            # bracketed IPv6 like "[::1]" in X-Forwarded-For. Without stripping,
+            # ipaddress.ip_address("[::1]") raises ValueError, dropping the IP
+            # from the audit trail (IPv6 clients become invisible in forensics).
+            cleaned = ip_address.strip().strip("[]")
+            _ipaddress.ip_address(cleaned)
+            ip_address = cleaned
+        except (ValueError, AttributeError):
+            ip_address = None  # Drop invalid IPs rather than crash the tx
+
     entry = AuditLog(
         user_id=user_id,
         organization_id=organization_id,

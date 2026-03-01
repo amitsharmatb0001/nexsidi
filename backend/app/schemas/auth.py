@@ -40,13 +40,28 @@ class UserLogin(BaseModel):
     """Login request."""
 
     email: EmailStr
-    password: str
+    # R8-FIX: max_length prevents 10MB+ password strings from consuming
+    # memory. While bcrypt truncates to 72 bytes, the full string is still
+    # parsed by Pydantic and held in memory — a lightweight DoS vector.
+    password: str = Field(..., max_length=1024)
 
 
 class TokenRefresh(BaseModel):
     """Refresh token request."""
 
-    refresh_token: str
+    # R9-FIX: max_length prevents multi-MB payloads from being parsed
+    # into memory. Valid JWTs are typically ~500 bytes.
+    refresh_token: str = Field(..., max_length=4096)
+
+
+class LogoutRequest(BaseModel):
+    """Logout request. Optionally includes refresh token to revoke both tokens.
+
+    R16-FIX: Without the refresh token, /logout only revokes the access token.
+    An attacker with the refresh token can still mint new access tokens.
+    """
+
+    refresh_token: str | None = Field(None, max_length=4096)
 
 
 # --- Responses ---

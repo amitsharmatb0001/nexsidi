@@ -17,19 +17,21 @@ from app.services.ai_router import (
 class TestAIRouter:
     """Test the AI routing and model selection layer."""
 
-    def test_select_model_returns_model_spec(self):
+    @pytest.mark.asyncio
+    async def test_select_model_returns_model_spec(self):
         router = get_ai_router()
         req = AIRequest(
             messages=[AIMessage(role="user", content="test")],
             complexity=TaskComplexity.LOW,
             task_type="test",
         )
-        model = router.select_model(req)
+        model = await router.select_model(req)
         assert isinstance(model, ModelSpec)
         assert model.model_id
         assert model.provider.value in ("anthropic", "google")
 
-    def test_select_model_different_complexities(self):
+    @pytest.mark.asyncio
+    async def test_select_model_different_complexities(self):
         router = get_ai_router()
         low_req = AIRequest(
             messages=[AIMessage(role="user", content="test")],
@@ -41,8 +43,8 @@ class TestAIRouter:
             complexity=TaskComplexity.HIGH,
             task_type="test",
         )
-        low_model = router.select_model(low_req)
-        high_model = router.select_model(high_req)
+        low_model = await router.select_model(low_req)
+        high_model = await router.select_model(high_req)
         assert isinstance(low_model, ModelSpec)
         assert isinstance(high_model, ModelSpec)
 
@@ -127,7 +129,7 @@ class TestPipelineAudit:
 
     def test_event_types(self):
         from app.services.pipeline_audit import AuditEventType
-        assert len(AuditEventType) == 21
+        assert len(AuditEventType) == 36  # 21 original + 15 Phase 5 types
 
     def test_pipeline_created_event(self):
         from app.services.pipeline_audit import PipelineAuditService

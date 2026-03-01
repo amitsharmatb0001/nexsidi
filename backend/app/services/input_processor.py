@@ -351,19 +351,106 @@ class InputProcessor:
         return requirements if requirements else [text[:500]]
 
 
+def _is_ip_unsafe(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
+    """Check if an IP address is internal (SSRF target).
+
+    R36-FIX: Extracted to avoid duplicating the check across IP literal
+    validation and DNS resolution paths.
+    """
+    import ipaddress
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        v4 = ip.ipv4_mapped
+        if v4.is_private or v4.is_loopback or v4.is_link_local or v4.is_reserved or v4.is_unspecified:
+            return True
+    return False
+
+
 def _is_valid_url(url: str) -> bool:
-    """Basic URL validation."""
-    return bool(re.match(r"^https?://[^\s]+$", url))
+    """Validate URL and block SSRF-prone targets.
+
+    R32-FIX-SSRF: The previous regex only checked for http(s)://,
+    allowing access to internal networks (169.254.169.254, localhost,
+    127.0.0.1, metadata.google.internal, etc.). Now blocks private IPs
+    and cloud metadata endpoints.
+    """
+    if not re.match(r"^https?://[^\s]+$", url):
+        return False
+    from urllib.parse import urlparse
+    import ipaddress
+    import socket
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+    except Exception:
+        return False
+    # Block known SSRF targets
+    _blocked = {
+        "localhost", "metadata.google.internal",
+        "metadata", "kubernetes.default.svc",
+    }
+    if hostname in _blocked:
+        return False
+    # Block IP address ranges: loopback, link-local, private, metadata
+    is_ip_literal = False
+    try:
+        ip = ipaddress.ip_address(hostname)
+        is_ip_literal = True
+        if _is_ip_unsafe(ip):
+            return False
+    except ValueError:
+        pass  # Not an IP literal — hostname needs DNS resolution check
+
+    # R36-FIX: DNS rebinding defense. Resolve hostname at validation time
+    # and verify the resolved IP is not internal. Classic DNS rebinding:
+    # 1. Attacker DNS returns 8.8.8.8 → validation passes
+    # 2. Attacker DNS returns 127.0.0.1 → fetch hits localhost/metadata
+    # Resolving here narrows the TOCTOU window. For full protection, use a
+    # DNS-pinning HTTP client that resolves + connects atomically.
+    if not is_ip_literal:
+        try:
+            # R38-FIX: Use per-socket timeout instead of process-global
+            # setdefaulttimeout(). The global timeout races with all other
+            # socket creation in the process (Valkey, GCP, AI calls).
+            # getaddrinfo doesn't support per-call timeout, so we wrap
+            # it in a thread with a timeout via concurrent.futures.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(socket.getaddrinfo, hostname, None, type=socket.SOCK_STREAM)
+                try:
+                    addrs = future.result(timeout=3)
+                except concurrent.futures.TimeoutError:
+                    return False  # DNS timeout — fail-closed
+            if not addrs:
+                return False
+            for _family, _, _, _, sockaddr in addrs:
+                resolved_ip = ipaddress.ip_address(sockaddr[0])
+                if _is_ip_unsafe(resolved_ip):
+                    logger.warning(
+                        "ssrf_dns_rebinding_blocked",
+                        hostname=hostname,
+                        resolved_ip=str(resolved_ip),
+                    )
+                    return False
+        except (socket.gaierror, OSError):
+            return False
+    return True
 
 
 # ── Singleton ───────────────────────────────────────────────────
 
+import threading as _threading
+_processor_lock = _threading.Lock()
 _processor: InputProcessor | None = None
 
 
 def get_input_processor() -> InputProcessor:
     """Get or create the input processor singleton."""
     global _processor
-    if _processor is None:
-        _processor = InputProcessor()
-    return _processor
+    if _processor is not None:
+        return _processor
+    with _processor_lock:
+        if _processor is None:
+            _processor = InputProcessor()
+        return _processor

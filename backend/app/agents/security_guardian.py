@@ -29,9 +29,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -191,7 +192,7 @@ class SecurityScanReport:
         }
 
 
-class SecurityGuardian(BaseAgent):
+class SecurityGuardian:
     """Security Guardian -- continuous vulnerability scanning + auto-updater.
 
     Runs on schedule and on-demand. Combines:
@@ -207,7 +208,7 @@ class SecurityGuardian(BaseAgent):
     default_model = "claude-sonnet-4-6"  # Security-critical
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="scan_dependencies",
@@ -262,6 +263,24 @@ class SecurityGuardian(BaseAgent):
             },
         ))
 
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
+
     async def execute(
         self,
         pipeline_run_id: str,
@@ -287,6 +306,9 @@ class SecurityGuardian(BaseAgent):
         status = AgentStatus.COMPLETED
         if report.has_blocking:
             status = AgentStatus.FAILED
+
+        # STORE-FIX: Persist output to context engine for downstream agents
+        await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
             agent_name=self.name,

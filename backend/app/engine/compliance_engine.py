@@ -1,4 +1,4 @@
-"""Compliance Engine: DPDP Act 2023, OWASP Top 10 (2021), WCAG 2.2 checks.
+"""Compliance Engine: DPDP, OWASP, WCAG, GDPR, PCI-DSS, HIPAA checks.
 
 Runs as a standalone engine called by Karan during the COMPLIANCE_CHECK stage.
 Each compliance framework has its own check suite producing structured findings.
@@ -8,6 +8,14 @@ Design:
 - AI-augmented path: deep analysis for ambiguous cases (optional)
 - Karan calls this engine; Karan owns the SecurityReport
 - Results feed into CHECKPOINT 2 pre-deploy review
+
+Supported frameworks:
+- DPDP Act 2023 (India data protection)
+- OWASP Top 10 (2021)
+- WCAG 2.2 (accessibility)
+- GDPR (EU data protection) — Gap 222
+- PCI-DSS (payment card security) — Gap 222
+- HIPAA (US health data protection) — Gap 222
 """
 
 from __future__ import annotations
@@ -31,6 +39,9 @@ class ComplianceFramework(str, Enum):
     DPDP_2023 = "dpdp_2023"            # India Digital Personal Data Protection Act
     OWASP_TOP10_2021 = "owasp_top10"   # OWASP Top 10 (2021 edition)
     WCAG_22 = "wcag_2.2"               # Web Content Accessibility Guidelines 2.2
+    GDPR = "gdpr"                      # EU General Data Protection Regulation
+    PCI_DSS = "pci_dss"                # Payment Card Industry Data Security Standard
+    HIPAA = "hipaa"                    # US Health Insurance Portability and Accountability Act
 
 
 class ComplianceSeverity(str, Enum):
@@ -320,6 +331,183 @@ _WCAG_RULES: list[tuple[str, re.Pattern, ComplianceSeverity, str, str]] = [
     ),
 ]
 
+# ── GDPR Patterns (Gap 222) ──────────────────────────────────────
+
+_GDPR_RULES: list[tuple[str, re.Pattern, ComplianceSeverity, str, str]] = [
+    (
+        "GDPR-01",
+        re.compile(
+            r"""(?:"""
+            r"""(?:email|phone|name|address|ssn|date_of_birth)\b.*(?:log|print|console)"""
+            r"""|"""
+            r"""(?:log|print|console)\b.*(?:email|phone|address|ssn|date_of_birth)\b"""
+            r""")""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.HIGH,
+        "PII logged in plain text — violates GDPR Article 5 (data minimization)",
+        "Never log PII. Use structured logging with PII fields masked or pseudonymized.",
+    ),
+    (
+        "GDPR-02",
+        re.compile(
+            r"""(?:cookie|tracking|analytics).*(?:without|no).*(?:consent|permission)""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.HIGH,
+        "Tracking without consent — violates GDPR Article 6 (lawful basis for processing)",
+        "Implement a cookie consent banner and only track after explicit user consent.",
+    ),
+    (
+        "GDPR-03",
+        re.compile(
+            r"""(?:data_retention|retain|store).*(?:indefinite|forever|no_expiry|permanent)""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.MEDIUM,
+        "Indefinite data retention — GDPR Article 5(1)(e) requires storage limitation",
+        "Define a retention period and implement automatic data deletion or anonymization.",
+    ),
+    (
+        "GDPR-04",
+        re.compile(
+            r"""(?:transfer|send|export).*(?:third_party|external|partner|vendor).*(?:data|pii|personal)""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.HIGH,
+        "Data transfer to third parties — GDPR Article 28 requires data processing agreements",
+        "Document data processing agreements with all third-party recipients.",
+    ),
+    (
+        "GDPR-05",
+        re.compile(
+            r"""(?:race|ethnicity|religion|political|health|sexual|genetic|biometric)""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "Special category data processing — GDPR Article 9 requires explicit consent",
+        "Processing sensitive personal data requires explicit consent and documented legal basis.",
+    ),
+]
+
+# ── PCI-DSS Patterns (Gap 222) ───────────────────────────────────
+
+_PCI_DSS_RULES: list[tuple[str, re.Pattern, ComplianceSeverity, str, str]] = [
+    (
+        "PCI-01",
+        re.compile(
+            r"""(?:card_number|credit_card|pan|cc_num)\s*[:=]""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "Cardholder data stored in code — PCI-DSS Requirement 3",
+        "Never store full card numbers. Use tokenization or a PCI-compliant payment provider.",
+    ),
+    (
+        "PCI-02",
+        re.compile(
+            r"""(?:cvv|cvc|security_code|card_verification)\s*[:=]""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "CVV/CVC stored — PCI-DSS Requirement 3.2 prohibits storing security codes",
+        "Never store CVV/CVC data. Process it in memory only and discard immediately.",
+    ),
+    (
+        "PCI-03",
+        re.compile(
+            r"""(?:"""
+            r"""(?:card|pan|cc)\b.*(?:log|print|console)"""
+            r"""|"""
+            r"""(?:log|print|console)\b.*(?:card|pan|cc_num)\b"""
+            r""")""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "Payment card data in logs — PCI-DSS Requirement 3.4",
+        "Never log cardholder data. Mask all but the last 4 digits in any output.",
+    ),
+    (
+        "PCI-04",
+        re.compile(
+            r"""(?:http://(?!localhost|127\.0\.0\.1))""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.HIGH,
+        "Non-TLS connection detected — PCI-DSS Requirement 4.1 requires encryption in transit",
+        "Use HTTPS for all external connections. Enforce TLS 1.2+ everywhere.",
+    ),
+    (
+        "PCI-05",
+        re.compile(
+            r"""(?:stripe_key|payment_secret|merchant_id)\s*=\s*["'][^"']+["']""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "Payment credentials hardcoded — PCI-DSS Requirement 6.5",
+        "Store payment API keys in environment variables or a secret manager.",
+    ),
+]
+
+# ── HIPAA Patterns (Gap 222) ─────────────────────────────────────
+
+_HIPAA_RULES: list[tuple[str, re.Pattern, ComplianceSeverity, str, str]] = [
+    (
+        "HIPAA-01",
+        re.compile(
+            r"""(?:"""
+            r"""(?:patient|diagnosis|medical|health|prescription|ssn)\b.*(?:log|print|console)"""
+            r"""|"""
+            r"""(?:log|print|console)\b.*(?:patient|diagnosis|medical|health|prescription|ssn)\b"""
+            r""")""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "Protected Health Information (PHI) in logs — HIPAA Privacy Rule violation",
+        "Never log PHI. Use de-identification or Safe Harbor method for any health data output.",
+    ),
+    (
+        "HIPAA-02",
+        re.compile(
+            r"""(?:medical_record|health_data|diagnosis|prescription|lab_result)\s*[:=]""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.HIGH,
+        "PHI field without encryption — HIPAA Security Rule requires encryption at rest",
+        "Encrypt all PHI at rest using AES-256. Use field-level encryption for sensitive columns.",
+    ),
+    (
+        "HIPAA-03",
+        re.compile(
+            r"""(?:patient|health|medical).*(?:share|send|transfer|export).*(?:email|sms|webhook)""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.HIGH,
+        "PHI transmitted via insecure channel — HIPAA Security Rule requires encryption in transit",
+        "Use encrypted channels (TLS) for all PHI transmissions. Never send PHI via unencrypted email.",
+    ),
+    (
+        "HIPAA-04",
+        re.compile(
+            r"""(?:medical|health|patient).*(?:without|no).*(?:consent|authorization|permission)""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "PHI access without authorization check — HIPAA Privacy Rule violation",
+        "Implement role-based access control for all PHI endpoints. Log every access.",
+    ),
+    (
+        "HIPAA-05",
+        re.compile(
+            r"""(?:social_security|ssn|medicare|medicaid)\s*[:=]""",
+            re.IGNORECASE,
+        ),
+        ComplianceSeverity.CRITICAL,
+        "Government health ID stored — HIPAA requires special handling of identifiers",
+        "Encrypt and restrict access to government health identifiers. Apply minimum necessary principle.",
+    ),
+]
+
 
 # ── Compliance Engine ─────────────────────────────────────────────
 
@@ -360,6 +548,12 @@ class ComplianceEngine:
                 self._check_owasp(files, report)
             elif fw == ComplianceFramework.WCAG_22:
                 self._check_wcag(files, report)
+            elif fw == ComplianceFramework.GDPR:
+                self._check_gdpr(files, report)
+            elif fw == ComplianceFramework.PCI_DSS:
+                self._check_pci_dss(files, report)
+            elif fw == ComplianceFramework.HIPAA:
+                self._check_hipaa(files, report)
 
         report.passed = report.blocking_count == 0
 
@@ -385,6 +579,18 @@ class ComplianceEngine:
     def check_wcag(self, files: dict[str, str]) -> ComplianceReport:
         """Run only WCAG 2.2 compliance checks."""
         return self.check_all(files, frameworks=[ComplianceFramework.WCAG_22])
+
+    def check_gdpr(self, files: dict[str, str]) -> ComplianceReport:
+        """Run only GDPR compliance checks."""
+        return self.check_all(files, frameworks=[ComplianceFramework.GDPR])
+
+    def check_pci_dss(self, files: dict[str, str]) -> ComplianceReport:
+        """Run only PCI-DSS compliance checks."""
+        return self.check_all(files, frameworks=[ComplianceFramework.PCI_DSS])
+
+    def check_hipaa(self, files: dict[str, str]) -> ComplianceReport:
+        """Run only HIPAA compliance checks."""
+        return self.check_all(files, frameworks=[ComplianceFramework.HIPAA])
 
     # ── Internal Check Methods ────────────────────────────────────
 
@@ -436,6 +642,63 @@ class ComplianceEngine:
                     line_num = content[:match.start()].count("\n") + 1
                     report.findings.append(ComplianceFinding(
                         framework=ComplianceFramework.WCAG_22,
+                        rule_id=rule_id,
+                        severity=severity,
+                        title=title,
+                        description=f"{match.group(0)[:80]}",
+                        file_path=path,
+                        line=line_num,
+                        fix_hint=fix_hint,
+                    ))
+
+    def _check_gdpr(self, files: dict[str, str], report: ComplianceReport) -> None:
+        """GDPR compliance scan."""
+        for path, content in files.items():
+            if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+                continue
+            for rule_id, pattern, severity, title, fix_hint in _GDPR_RULES:
+                for match in pattern.finditer(content):
+                    line_num = content[:match.start()].count("\n") + 1
+                    report.findings.append(ComplianceFinding(
+                        framework=ComplianceFramework.GDPR,
+                        rule_id=rule_id,
+                        severity=severity,
+                        title=title,
+                        description=f"{match.group(0)[:80]}",
+                        file_path=path,
+                        line=line_num,
+                        fix_hint=fix_hint,
+                    ))
+
+    def _check_pci_dss(self, files: dict[str, str], report: ComplianceReport) -> None:
+        """PCI-DSS compliance scan."""
+        for path, content in files.items():
+            if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".env")):
+                continue
+            for rule_id, pattern, severity, title, fix_hint in _PCI_DSS_RULES:
+                for match in pattern.finditer(content):
+                    line_num = content[:match.start()].count("\n") + 1
+                    report.findings.append(ComplianceFinding(
+                        framework=ComplianceFramework.PCI_DSS,
+                        rule_id=rule_id,
+                        severity=severity,
+                        title=title,
+                        description=f"{match.group(0)[:80]}",
+                        file_path=path,
+                        line=line_num,
+                        fix_hint=fix_hint,
+                    ))
+
+    def _check_hipaa(self, files: dict[str, str], report: ComplianceReport) -> None:
+        """HIPAA compliance scan."""
+        for path, content in files.items():
+            if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+                continue
+            for rule_id, pattern, severity, title, fix_hint in _HIPAA_RULES:
+                for match in pattern.finditer(content):
+                    line_num = content[:match.start()].count("\n") + 1
+                    report.findings.append(ComplianceFinding(
+                        framework=ComplianceFramework.HIPAA,
                         rule_id=rule_id,
                         severity=severity,
                         title=title,

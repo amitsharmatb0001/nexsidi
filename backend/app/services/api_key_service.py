@@ -83,10 +83,17 @@ class ApiKeyRecord:
         if self.expires_at:
             try:
                 exp = datetime.fromisoformat(self.expires_at)
+                # R37-FIX: Handle naive datetime comparison. fromisoformat()
+                # can return naive datetime; comparing with aware raises TypeError.
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
                 if exp < datetime.now(timezone.utc):
                     return ApiKeyStatus.EXPIRED
-            except ValueError:
-                pass
+            except (ValueError, TypeError):
+                # R37-FIX: Fail closed — malformed expiry treated as EXPIRED.
+                # Previously returned ACTIVE, bypassing expiration entirely.
+                logger.warning("api_key_unparseable_expiry", key_id=self.id, expires_at=self.expires_at)
+                return ApiKeyStatus.EXPIRED
         return ApiKeyStatus.ACTIVE
 
     def to_dict(self) -> dict[str, Any]:
@@ -142,9 +149,12 @@ class ApiKeyService:
     Currently: in-memory store for pipeline integration.
     """
 
+    _RATE_EVICTION_INTERVAL = 100  # R32-FIX-MEM: evict stale keys every N checks
+
     def __init__(self) -> None:
         self._keys: dict[str, ApiKeyRecord] = {}  # key_hash -> record
         self._rate_counts: dict[str, list[float]] = {}  # key_hash -> timestamps
+        self._rate_check_count: int = 0  # R32-FIX-MEM
 
     def create_key(
         self,
@@ -228,6 +238,20 @@ class ApiKeyService:
 
         active.append(now)
         self._rate_counts[key_hash] = active
+
+        # R32-FIX-MEM: Periodically evict stale rate-count entries for
+        # keys that haven't been used recently. Without this, every unique
+        # API key that's ever been rate-checked stays in memory forever.
+        self._rate_check_count += 1
+        if self._rate_check_count >= self._RATE_EVICTION_INTERVAL:
+            self._rate_check_count = 0
+            stale = [
+                k for k, v in self._rate_counts.items()
+                if not v or v[-1] < window_start
+            ]
+            for k in stale:
+                del self._rate_counts[k]
+
         return True
 
     def revoke_key(self, key_id: str, user_id: str) -> bool:
@@ -286,10 +310,24 @@ class ApiKeyService:
             if r.organization_id == organization_id and r.is_active
         ]
 
-    def get_key_by_id(self, key_id: str) -> ApiKeyRecord | None:
-        """Get a key record by its ID."""
+    def get_key_by_id(
+        self,
+        key_id: str,
+        organization_id: str | None = None,
+    ) -> ApiKeyRecord | None:
+        """Get a key record by its ID.
+
+        R36-FIX: Added organization_id for defense-in-depth tenant isolation.
+        Previously, get_key_by_id() searched across ALL orgs — a cross-tenant
+        attacker could retrieve another org's key record by guessing the key_id.
+        list_keys() and list_org_keys() already filter by tenant, but this
+        method did not. When organization_id is provided, only returns records
+        belonging to that org.
+        """
         for record in self._keys.values():
             if record.id == key_id:
+                if organization_id is not None and record.organization_id != organization_id:
+                    return None
                 return record
         return None
 
@@ -301,12 +339,17 @@ class ApiKeyService:
 
 # ── Singleton ───────────────────────────────────────────────────
 
+import threading as _threading
+_api_key_lock = _threading.Lock()
 _service: ApiKeyService | None = None
 
 
 def get_api_key_service() -> ApiKeyService:
     """Get or create the API key service singleton."""
     global _service
-    if _service is None:
-        _service = ApiKeyService()
-    return _service
+    if _service is not None:
+        return _service
+    with _api_key_lock:
+        if _service is None:
+            _service = ApiKeyService()
+        return _service

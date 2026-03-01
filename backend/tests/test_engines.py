@@ -10,7 +10,7 @@ class TestComplianceEngine:
 
     def test_frameworks(self):
         from app.engine.compliance_engine import ComplianceFramework
-        assert len(ComplianceFramework) == 3
+        assert len(ComplianceFramework) == 6  # 3 original + GDPR + PCI-DSS + HIPAA
 
     def test_dpdp_rules_exist(self):
         from app.engine.compliance_engine import _DPDP_RULES

@@ -34,9 +34,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -132,7 +133,7 @@ class SandboxTestReport:
 # ── Aarav Agent ────────────────────────────────────────────────────
 
 
-class Aarav(BaseAgent):
+class Aarav:
     """Sandbox Test Executor — Docker build + API test + browser test.
 
     PURE AUTOMATION: No AI calls. Orchestrates the execution engine.
@@ -141,9 +142,10 @@ class Aarav(BaseAgent):
     name = "aarav"
     display_name = "Aarav — Sandbox Test Executor"
     default_complexity = TaskComplexity.HIGH
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="run_docker",
@@ -227,6 +229,24 @@ class Aarav(BaseAgent):
             },
         ))
 
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
+
     async def execute(
         self,
         pipeline_run_id: str,
@@ -254,19 +274,25 @@ class Aarav(BaseAgent):
         )
         report.add(build_result)
         if not build_result.passed:
-            return self._build_result(report, sandbox_start)
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
 
         # Phase 2: Server Start + Health Check
         start_result = await self._phase_server_start(pipeline_run_id, contract)
         report.add(start_result)
         if not start_result.passed:
-            return self._build_result(report, sandbox_start)
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
 
         # Phase 3: Database Migration + Seed
         migration_result = await self._phase_db_migration(pipeline_run_id, contract)
         report.add(migration_result)
         if not migration_result.passed:
-            return self._build_result(report, sandbox_start)
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
 
         # Phase 4: API Testing
         api_result = await self._phase_api_test(pipeline_run_id, contract)
@@ -289,7 +315,10 @@ class Aarav(BaseAgent):
                 max_ms=TOTAL_SANDBOX_TIMEOUT * 1000,
             )
 
-        return self._build_result(report, sandbox_start)
+        # STORE-FIX: Persist output to context engine for downstream agents
+        result = self._build_result(report, sandbox_start)
+        await store_output(self, pipeline_run_id, result.output)
+        return result
 
     # ── Test Phase Implementations ─────────────────────────────────
 
@@ -353,14 +382,15 @@ class Aarav(BaseAgent):
                 )
 
         except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
             elapsed = (time.monotonic() - phase_start) * 1000
-            logger.error("docker_build_error", error=str(exc))
+            logger.error("docker_build_error", error=_sanitize_error(exc))
             return TestPhaseResult(
                 phase=TestPhase.DOCKER_BUILD,
                 status=TestStatus.ERROR,
                 duration_ms=elapsed,
-                errors=[{"type": "exception", "details": str(exc)}],
-                output=f"Docker build error: {exc}",
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
+                output=f"Docker build error: {_sanitize_error(exc)}",
             )
 
     async def _phase_server_start(
@@ -402,12 +432,13 @@ class Aarav(BaseAgent):
                 )
 
         except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
             elapsed = (time.monotonic() - phase_start) * 1000
             return TestPhaseResult(
                 phase=TestPhase.SERVER_START,
                 status=TestStatus.ERROR,
                 duration_ms=elapsed,
-                errors=[{"type": "exception", "details": str(exc)}],
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
     async def _phase_db_migration(
@@ -439,12 +470,13 @@ class Aarav(BaseAgent):
             )
 
         except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
             elapsed = (time.monotonic() - phase_start) * 1000
             return TestPhaseResult(
                 phase=TestPhase.DB_MIGRATION,
                 status=TestStatus.ERROR,
                 duration_ms=elapsed,
-                errors=[{"type": "exception", "details": str(exc)}],
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
     async def _phase_api_test(
@@ -491,12 +523,13 @@ class Aarav(BaseAgent):
             )
 
         except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
             elapsed = (time.monotonic() - phase_start) * 1000
             return TestPhaseResult(
                 phase=TestPhase.API_TEST,
                 status=TestStatus.ERROR,
                 duration_ms=elapsed,
-                errors=[{"type": "exception", "details": str(exc)}],
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
     async def _phase_browser_test(
@@ -542,12 +575,13 @@ class Aarav(BaseAgent):
             )
 
         except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
             elapsed = (time.monotonic() - phase_start) * 1000
             return TestPhaseResult(
                 phase=TestPhase.BROWSER_TEST,
                 status=TestStatus.ERROR,
                 duration_ms=elapsed,
-                errors=[{"type": "exception", "details": str(exc)}],
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
     async def _phase_db_verify(
@@ -594,12 +628,13 @@ class Aarav(BaseAgent):
             )
 
         except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
             elapsed = (time.monotonic() - phase_start) * 1000
             return TestPhaseResult(
                 phase=TestPhase.DB_VERIFY,
                 status=TestStatus.ERROR,
                 duration_ms=elapsed,
-                errors=[{"type": "exception", "details": str(exc)}],
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
     # ── Helpers ────────────────────────────────────────────────────

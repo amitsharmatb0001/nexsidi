@@ -47,7 +47,7 @@ logger = logging.getLogger("nexsidi.secret_manager")
 
 SECRET_TO_ENV: dict[str, str] = {
     "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
-    "databse-paasword": "DB_PASSWORD",
+    "databse-paasword": "DB_PASSWORD",  # Note: GCP secret name has typo, kept for backward compat
     "GOOGLE_API_KEY": "GOOGLE_AI_API_KEY",
     "JWT_SECRET": "JWT_SECRET_KEY",
     "REDIS_URL": "VALKEY_URL",
@@ -230,10 +230,14 @@ class VertexAICredentialManager:
     """
 
     def __init__(self) -> None:
+        import threading
+
         self._credentials: Any = None
         self._token: str | None = None
         self._token_expiry: float = 0
         self._initialized = False
+        # R8-FIX: Thread-safe token refresh (called from asyncio.to_thread)
+        self._refresh_lock = threading.Lock()
 
     def initialize(self) -> bool:
         """Load YugNex service account credentials.
@@ -244,48 +248,60 @@ class VertexAICredentialManager:
 
         Returns True if credentials are available.
         """
-        if self._initialized:
-            return self._credentials is not None
+        # R19-FIX: Guard initialization with _refresh_lock for thread safety.
+        # get_access_token() is called via asyncio.to_thread(), so multiple OS
+        # threads can call initialize() concurrently. Without the lock, both
+        # threads see _initialized=False, both set _initialized=True, and both
+        # proceed to create credentials — one overwriting the other.
+        with self._refresh_lock:
+            if self._initialized:
+                return self._credentials is not None
 
-        self._initialized = True
+            self._initialized = True
 
-        # Method 1: From env var (populated by Secret Manager)
-        creds_json = os.environ.get("YUGNEX_AI_CREDENTIALS")
-        if creds_json:
-            try:
-                from google.oauth2 import service_account
-                key_data = json.loads(creds_json)
-                self._credentials = service_account.Credentials.from_service_account_info(
-                    key_data,
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                )
-                logger.info("Vertex AI credentials loaded from YUGNEX_AI_CREDENTIALS")
-                return True
-            except Exception as exc:
-                logger.error("Failed to parse YUGNEX_AI_CREDENTIALS: %s", exc)
+            # Method 1: From env var (populated by Secret Manager)
+            creds_json = os.environ.get("YUGNEX_AI_CREDENTIALS")
+            if creds_json:
+                try:
+                    from google.oauth2 import service_account
+                    key_data = json.loads(creds_json)
+                    self._credentials = service_account.Credentials.from_service_account_info(
+                        key_data,
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                    )
+                    logger.info("Vertex AI credentials loaded from YUGNEX_AI_CREDENTIALS")
+                    return True
+                except Exception as exc:
+                    logger.error("Failed to parse YUGNEX_AI_CREDENTIALS: %s", exc)
 
-        # Method 2: Local file fallback (dev)
-        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds_path and os.path.isfile(creds_path):
-            try:
-                from google.oauth2 import service_account
-                self._credentials = service_account.Credentials.from_service_account_file(
-                    creds_path,
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                )
-                logger.info("Vertex AI credentials loaded from file: %s", creds_path)
-                return True
-            except Exception as exc:
-                logger.error("Failed to load credentials file: %s", exc)
+            # Method 2: Local file fallback (dev)
+            creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if creds_path and os.path.isfile(creds_path):
+                try:
+                    from google.oauth2 import service_account
+                    self._credentials = service_account.Credentials.from_service_account_file(
+                        creds_path,
+                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                    )
+                    logger.info("Vertex AI credentials loaded from file: %s", creds_path)
+                    return True
+                except Exception as exc:
+                    logger.error("Failed to load credentials file: %s", exc)
 
-        logger.warning("No Vertex AI credentials available -- Gemini models disabled")
-        return False
+            logger.warning("No Vertex AI credentials available -- Gemini models disabled")
+            return False
 
     def get_access_token(self) -> str | None:
         """Get a valid access token for Vertex AI REST API.
 
         Automatically refreshes if expired (tokens last ~1 hour).
         Returns None if no credentials are available.
+
+        R8-FIX: Thread-safe via _refresh_lock. This method now runs inside
+        asyncio.to_thread() (see ai_router._get_vertex_token), meaning
+        concurrent async requests can call it from different OS threads.
+        google.oauth2.Credentials.refresh() is NOT thread-safe, so we
+        serialize refresh calls with a threading.Lock.
         """
         if self._credentials is None:
             if not self.initialize():
@@ -295,19 +311,40 @@ class VertexAICredentialManager:
         if self._token and time.time() < (self._token_expiry - 300):
             return self._token
 
-        # Refresh token
-        try:
-            import google.auth.transport.requests
-            auth_req = google.auth.transport.requests.Request()
-            self._credentials.refresh(auth_req)
-            self._token = self._credentials.token
-            self._token_expiry = time.time() + 3600  # 1 hour
-            logger.info("Vertex AI token refreshed")
-            return self._token
-        except Exception as exc:
-            logger.error("Token refresh failed: %s", exc)
-            self._token = None
-            return None
+        # R8-FIX: Serialize credential refresh with a lock.
+        # Multiple OS threads may call this concurrently from asyncio.to_thread().
+        with self._refresh_lock:
+            # Double-check after acquiring lock (another thread may have refreshed)
+            if self._token and time.time() < (self._token_expiry - 300):
+                return self._token
+
+            try:
+                import google.auth.transport.requests
+                auth_req = google.auth.transport.requests.Request()
+                self._credentials.refresh(auth_req)
+                self._token = self._credentials.token
+                # R17-FIX: Use actual expiry from Google's response instead of
+                # hardcoded 3600s. Google may return shorter-lived tokens under
+                # high load. Hardcoding causes stale token usage → 401 errors
+                # → circuit breaker trips → pipeline failures.
+                if hasattr(self._credentials, 'expiry') and self._credentials.expiry:
+                    # R18-FIX: google-auth stores expiry as naive UTC datetime.
+                    # datetime.timestamp() on naive datetime uses LOCAL timezone,
+                    # causing wrong expiry on non-UTC servers (e.g., IST servers
+                    # expire tokens 5.5h too early → constant refresh storms).
+                    expiry = self._credentials.expiry
+                    if expiry.tzinfo is None:
+                        from datetime import timezone as _tz
+                        expiry = expiry.replace(tzinfo=_tz.utc)
+                    self._token_expiry = expiry.timestamp()
+                else:
+                    self._token_expiry = time.time() + 3600  # Fallback: 1 hour
+                logger.info("Vertex AI token refreshed")
+                return self._token
+            except Exception as exc:
+                logger.error("Token refresh failed: %s", exc)
+                self._token = None
+                return None
 
     @property
     def has_credentials(self) -> bool:
@@ -318,18 +355,33 @@ class VertexAICredentialManager:
 
     @property
     def ai_project_id(self) -> str:
-        """The YugNex GCP project ID for Vertex AI calls."""
-        return os.environ.get("GCP_AI_PROJECT_ID", "yugnex-ai")
+        """The YugNex GCP project ID for Vertex AI calls.
+
+        R36-FIX: Removed hardcoded "yugnex-ai" default. Must be set via
+        GCP_AI_PROJECT_ID env var or config. Empty string signals to callers
+        that Vertex AI is not configured.
+        """
+        return os.environ.get("GCP_AI_PROJECT_ID", "")
 
 
 # ── Singleton ──────────────────────────────────────────────────
 
 _vertex_mgr: VertexAICredentialManager | None = None
+# R21-FIX: Thread-safe singleton. get_vertex_credentials() is called from
+# both the asyncio event loop (FastAPI) and Celery worker threads. Without
+# a lock, two threads can both see `_vertex_mgr is None` and each create
+# a separate instance — racing on internal credential state.
+import threading as _threading
+_vertex_lock = _threading.Lock()
 
 
 def get_vertex_credentials() -> VertexAICredentialManager:
-    """Get or create the Vertex AI credential manager singleton."""
+    """Get or create the Vertex AI credential manager singleton (thread-safe)."""
     global _vertex_mgr
-    if _vertex_mgr is None:
-        _vertex_mgr = VertexAICredentialManager()
-    return _vertex_mgr
+    if _vertex_mgr is not None:
+        return _vertex_mgr
+    with _vertex_lock:
+        # Double-check after acquiring lock
+        if _vertex_mgr is None:
+            _vertex_mgr = VertexAICredentialManager()
+        return _vertex_mgr

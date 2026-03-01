@@ -22,9 +22,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -111,15 +112,16 @@ _ESCALATION_MAP: dict[IssueComponent, str] = {
 }
 
 
-class SupportAgent(BaseAgent):
+class SupportAgent:
     """Support Agent — triages bug reports and user issues."""
 
     name = "support_agent"
     display_name = "Support Agent"
     default_complexity = TaskComplexity.LOW
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="classify_issue",
@@ -145,6 +147,24 @@ class SupportAgent(BaseAgent):
                 "required": ["issue_type", "component"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -178,7 +198,7 @@ class SupportAgent(BaseAgent):
             "by_component": self._count_by_key(triaged, "component"),
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "support_triage_complete",

@@ -42,10 +42,21 @@ class User(Base, UUIDPrimaryKeyMixin, TenantMixin, TimestampMixin):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
-class WhatsAppAccount(Base, UUIDPrimaryKeyMixin):
-    __tablename__ = "whatsapp_accounts"
-    __table_args__ = {"schema": "auth"}
+class WhatsAppAccount(Base, UUIDPrimaryKeyMixin, TenantMixin):
+    """R26-FIX-5: Added TenantMixin for organization_id and RLS tenant isolation.
 
+    Previously had no organization_id column, so no tenant-scoped RLS policy
+    could be applied — any authenticated user from any tenant could potentially
+    access another tenant's WhatsApp accounts.
+    """
+
+    __tablename__ = "whatsapp_accounts"
+    __table_args__ = (
+        Index("ix_whatsapp_accounts_organization_id", "organization_id"),
+        {"schema": "auth"},
+    )
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("auth.users.id", ondelete="CASCADE"), unique=True, nullable=False
     )

@@ -25,9 +25,11 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
+    call_ai,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -302,7 +304,7 @@ _DPDP_PATTERNS: list[tuple[re.Pattern, str, str]] = [
 # ── Karan Agent ────────────────────────────────────────────────────
 
 
-class Karan(BaseAgent):
+class Karan:
     """Security Auditor — static analysis + compliance scanning.
 
     ALWAYS uses Sonnet 4.6 for AI calls (security-critical, AUDIT FIX #17).
@@ -314,7 +316,7 @@ class Karan(BaseAgent):
     default_model = "claude-sonnet-4-6"  # Security-critical: ALWAYS Sonnet 4.6
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="read_file",
@@ -366,6 +368,24 @@ class Karan(BaseAgent):
             },
         ))
 
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
+
     async def execute(
         self,
         pipeline_run_id: str,
@@ -400,7 +420,8 @@ class Karan(BaseAgent):
             for finding in ai_findings:
                 report.add(finding)
         except Exception as exc:
-            logger.warning("ai_deep_scan_failed", error=str(exc))
+            from app.services.ai_router import _sanitize_error  # R27-FIX
+            logger.warning("ai_deep_scan_failed", error=_sanitize_error(exc))
 
         # Phase 3: OWASP Top 10 checklist
         self._check_owasp_top10(all_files, report)
@@ -430,7 +451,7 @@ class Karan(BaseAgent):
             "total_findings": len(report.findings),
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "security_scan_complete",
@@ -597,10 +618,14 @@ class Karan(BaseAgent):
         # Build a summary of files for AI analysis
         file_summaries: list[str] = []
         for path, content in files.items():
-            # Truncate large files to keep prompt manageable
-            truncated = content[:3000] if len(content) > 3000 else content
+            # Scan full file in overlapping windows (never truncate)
+            from app.agents.scan_utils import split_into_windows
+
             lang = "python" if path.endswith(".py") else "typescript"
-            file_summaries.append(f"### {path}\n```{lang}\n{truncated}\n```")
+            windows = split_into_windows(content, window_size=3000, overlap=500)
+            for i, window in enumerate(windows):
+                label = f"### {path}" if len(windows) == 1 else f"### {path} (part {i + 1}/{len(windows)})"
+                file_summaries.append(f"{label}\n```{lang}\n{window}\n```")
 
         if not file_summaries:
             return []
@@ -620,7 +645,7 @@ class Karan(BaseAgent):
 
         files_context = "\n\n".join(file_summaries[:10])  # Cap at 10 files
 
-        response = await self.call_ai(
+        response = await call_ai(self, 
             messages=[{"role": "user", "content": f"Scan these files:\n\n{files_context}"}],
             system_prompt=system_prompt,
             task_type="auth_code",  # Forces Sonnet 4.6
@@ -638,7 +663,10 @@ class Karan(BaseAgent):
 
             if isinstance(parsed, list):
                 for item in parsed:
-                    sev = FindingSeverity(item.get("severity", "info"))
+                    try:
+                        sev = FindingSeverity(item.get("severity", "info"))
+                    except ValueError:
+                        sev = FindingSeverity.INFO
                     cat_str = item.get("category", "misconfiguration")
                     try:
                         cat = FindingCategory(cat_str)
@@ -655,7 +683,8 @@ class Karan(BaseAgent):
                         fix_hint=item.get("fix_hint", "Review and fix manually"),
                     ))
         except Exception as exc:
-            logger.warning("ai_finding_parse_failed", error=str(exc))
+            from app.services.ai_router import _sanitize_error  # R27-FIX
+            logger.warning("ai_finding_parse_failed", error=_sanitize_error(exc))
 
         return findings
 

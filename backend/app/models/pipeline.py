@@ -39,9 +39,12 @@ class PipelineRun(Base, UUIDPrimaryKeyMixin, TenantMixin):
     project_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("core.projects.id", ondelete="CASCADE"), nullable=False
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, nullable=True)
     temporal_workflow_id: Mapped[str | None] = mapped_column(String(255), unique=True, default=None)
     status: Mapped[str] = mapped_column(String(20), default="running", nullable=False)
     current_step: Mapped[str | None] = mapped_column(String(50), default=None)
+    execution_mode: Mapped[str] = mapped_column(String(20), default="checkpoint", nullable=False)
+    context_snapshot: Mapped[dict | None] = mapped_column(JSONB, default=None)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default="now()", nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     error_summary: Mapped[str | None] = mapped_column(Text, default=None)
@@ -65,9 +68,15 @@ class PipelineStep(Base, UUIDPrimaryKeyMixin, TenantMixin):
         Uuid, ForeignKey("pipeline.runs.id", ondelete="CASCADE"), nullable=False
     )
     agent_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    stage: Mapped[str | None] = mapped_column(String(50), default=None)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    # DEFERRED-FIX-6: Changed from SmallInteger to Integer.
+    # SmallInteger has a max of 32,767. Pipelines with many fix-retest cycles
+    # (3 cycles × 18 stages × multiple agents) can exceed this in long runs.
+    step_order: Mapped[int | None] = mapped_column(Integer, default=None)
     input_summary: Mapped[dict | None] = mapped_column(JSONB, default=None)
     output_summary: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    output_data: Mapped[dict | None] = mapped_column(JSONB, default=None)
     model_used: Mapped[str | None] = mapped_column(String(50), default=None)
     input_tokens: Mapped[int | None] = mapped_column(Integer, default=None)
     output_tokens: Mapped[int | None] = mapped_column(Integer, default=None)

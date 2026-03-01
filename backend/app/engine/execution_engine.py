@@ -310,13 +310,14 @@ class ExecutionEngine:
             if normalized == "scratch":
                 continue
 
-            # Check against approved list (exact match or with version suffix)
-            approved = False
-            for approved_image in APPROVED_BASE_IMAGES:
-                base_name = approved_image.split(":")[0]
-                if normalized == approved_image or normalized.startswith(f"{base_name}:"):
-                    approved = True
-                    break
+            # R38-FIX: Match exact image name, not prefix. "node" prefix
+            # would match "node-evil:malware", bypassing the whitelist.
+            image_name = normalized.split(":")[0]  # Strip tag
+            approved_image_names = {img.split(":")[0] for img in APPROVED_BASE_IMAGES}
+            approved = (
+                normalized in APPROVED_BASE_IMAGES
+                or image_name in approved_image_names
+            )
 
             if not approved:
                 errors.append(

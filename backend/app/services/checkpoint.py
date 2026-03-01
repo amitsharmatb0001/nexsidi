@@ -78,6 +78,10 @@ class CheckpointData:
 class CheckpointService:
     """Manages checkpoint creation, presentation, and approval."""
 
+    # R32-FIX-MEM: Maximum checkpoints in memory. Once exceeded, oldest
+    # terminal (approved/rejected/expired) checkpoints are evicted.
+    _MAX_CHECKPOINTS = 500
+
     def __init__(self) -> None:
         self._checkpoints: dict[str, CheckpointData] = {}
 
@@ -128,6 +132,7 @@ class CheckpointService:
         )
 
         self._checkpoints[checkpoint.checkpoint_id] = checkpoint
+        self._evict_terminal()
 
         logger.info(
             "checkpoint_created",
@@ -165,6 +170,7 @@ class CheckpointService:
         )
 
         self._checkpoints[checkpoint.checkpoint_id] = checkpoint
+        self._evict_terminal()
 
         logger.info(
             "checkpoint_created",
@@ -174,6 +180,21 @@ class CheckpointService:
         )
 
         return checkpoint
+
+    def _evict_terminal(self) -> None:
+        """R32-FIX-MEM: Remove oldest terminal checkpoints when over capacity."""
+        if len(self._checkpoints) <= self._MAX_CHECKPOINTS:
+            return
+        terminal = {ApprovalStatus.APPROVED, ApprovalStatus.REJECTED, ApprovalStatus.EXPIRED}
+        candidates = [
+            (k, v) for k, v in self._checkpoints.items()
+            if v.status in terminal
+        ]
+        # Sort by created_at ascending (oldest first)
+        candidates.sort(key=lambda kv: kv[1].created_at)
+        to_remove = len(self._checkpoints) - self._MAX_CHECKPOINTS
+        for k, _ in candidates[:to_remove]:
+            del self._checkpoints[k]
 
     def get_checkpoint(self, checkpoint_id: str) -> CheckpointData | None:
         """Get a checkpoint by ID."""
@@ -189,12 +210,17 @@ class CheckpointService:
     def approve(
         self,
         checkpoint_id: str,
+        organization_id: str,
         comments: str | None = None,
     ) -> CheckpointData:
         """Approve a checkpoint."""
         cp = self._checkpoints.get(checkpoint_id)
         if cp is None:
             raise KeyError(f"Checkpoint not found: {checkpoint_id}")
+
+        # R37-FIX: Authorization — verify caller belongs to same org
+        if cp.organization_id != organization_id:
+            raise PermissionError(f"Not authorized to approve checkpoint {checkpoint_id}")
 
         if cp.status != ApprovalStatus.PENDING:
             raise ValueError(f"Checkpoint {checkpoint_id} is not pending (status: {cp.status})")
@@ -214,12 +240,28 @@ class CheckpointService:
     def reject(
         self,
         checkpoint_id: str,
+        organization_id: str,
         comments: str | None = None,
     ) -> CheckpointData:
         """Reject a checkpoint."""
         cp = self._checkpoints.get(checkpoint_id)
         if cp is None:
             raise KeyError(f"Checkpoint not found: {checkpoint_id}")
+
+        # R37-FIX: Authorization — verify caller belongs to same org
+        if cp.organization_id != organization_id:
+            raise PermissionError(f"Not authorized to reject checkpoint {checkpoint_id}")
+
+        # R35-FIX: Add same status + expiry guards that approve() has.
+        # Without this, an expired or already-approved checkpoint can be
+        # rejected, reverting its status — potentially re-activating a
+        # completed pipeline or overwriting an earlier decision.
+        if cp.status != ApprovalStatus.PENDING:
+            raise ValueError(f"Checkpoint {checkpoint_id} is not pending (status: {cp.status})")
+
+        if cp.expires_at and datetime.now(timezone.utc) > cp.expires_at:
+            cp.status = ApprovalStatus.EXPIRED
+            raise ValueError(f"Checkpoint {checkpoint_id} has expired")
 
         cp.status = ApprovalStatus.REJECTED
         cp.reviewer_comments = comments
@@ -230,6 +272,7 @@ class CheckpointService:
     def request_changes(
         self,
         checkpoint_id: str,
+        organization_id: str,
         changes: list[str],
         comments: str | None = None,
     ) -> CheckpointData:
@@ -237,6 +280,18 @@ class CheckpointService:
         cp = self._checkpoints.get(checkpoint_id)
         if cp is None:
             raise KeyError(f"Checkpoint not found: {checkpoint_id}")
+
+        # R37-FIX: Authorization — verify caller belongs to same org
+        if cp.organization_id != organization_id:
+            raise PermissionError(f"Not authorized to request changes on checkpoint {checkpoint_id}")
+
+        # R35-FIX: Same status + expiry guards as approve() and reject().
+        if cp.status != ApprovalStatus.PENDING:
+            raise ValueError(f"Checkpoint {checkpoint_id} is not pending (status: {cp.status})")
+
+        if cp.expires_at and datetime.now(timezone.utc) > cp.expires_at:
+            cp.status = ApprovalStatus.EXPIRED
+            raise ValueError(f"Checkpoint {checkpoint_id} has expired")
 
         cp.status = ApprovalStatus.CHANGES_REQUESTED
         cp.change_requests = changes
@@ -252,12 +307,17 @@ class CheckpointService:
 
 # ── Singleton ───────────────────────────────────────────────────────
 
+import threading as _threading
+_checkpoint_lock = _threading.Lock()
 _service: CheckpointService | None = None
 
 
 def get_checkpoint_service() -> CheckpointService:
     """Get or create the checkpoint service singleton."""
     global _service
-    if _service is None:
-        _service = CheckpointService()
-    return _service
+    if _service is not None:
+        return _service
+    with _checkpoint_lock:
+        if _service is None:
+            _service = CheckpointService()
+        return _service

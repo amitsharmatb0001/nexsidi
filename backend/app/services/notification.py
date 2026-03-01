@@ -16,6 +16,7 @@ Design:
 
 from __future__ import annotations
 
+import uuid as _uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -130,10 +131,18 @@ class NotificationPayload:
     link: str = ""
     data: dict[str, Any] | None = None
     created_at: str = ""
+    # R36-FIX: Track read/unread status. Previously missing — notification_count()
+    # returned total notifications and there was no way to count unread.
+    # The DB model (notify.notifications) has a `read` column with a partial
+    # index on unread notifications, but the in-memory payload had no field.
+    is_read: bool = False
+    notification_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.created_at:
             self.created_at = datetime.now(timezone.utc).isoformat()
+        if not self.notification_id:
+            self.notification_id = str(_uuid.uuid4())
 
 
 class NotificationService:
@@ -143,10 +152,18 @@ class NotificationService:
     Email notifications are queued via SMTP.
     """
 
+    # MEM-FIX: Bound in-memory notification storage to prevent OOM.
+    _MAX_SENT: int = 10_000
+    _MAX_RATE_KEYS: int = 5_000
+
     def __init__(self) -> None:
-        self._sent: list[NotificationPayload] = []  # In-memory for now
-        self._rate_counts: dict[str, int] = {}       # user_id -> count this hour
+        from collections import deque
+
+        self._sent: deque[NotificationPayload] = deque(maxlen=self._MAX_SENT)
+        # M7-FIX: Use sliding window with timestamps instead of simple counter
+        self._rate_windows: dict[str, list[float]] = {}  # user_id -> [timestamps]
         self._max_per_hour: int = 100
+        self._rate_check_count: int = 0
 
     async def send(
         self,
@@ -175,8 +192,10 @@ class NotificationService:
         Raises:
             ValueError: If rate limit exceeded.
         """
-        # Rate limiting
-        if not self._check_rate_limit(user_id):
+        # RATE-TOCTOU-FIX: Atomically check and increment rate limit.
+        # Previously, _check_rate_limit() and _increment_rate() were separate,
+        # allowing concurrent coroutines to both pass the check.
+        if not self._check_and_increment_rate(user_id):
             raise ValueError(f"Rate limit exceeded for user {user_id}")
 
         # Render template
@@ -206,7 +225,7 @@ class NotificationService:
             await self._send_email(payload)
 
         self._sent.append(payload)
-        self._increment_rate(user_id)
+        # Rate already incremented atomically in _check_and_increment_rate()
 
         logger.info(
             "notification_sent",
@@ -244,15 +263,78 @@ class NotificationService:
         user_id: str,
         limit: int = 50,
         unread_only: bool = False,
+        organization_id: str | None = None,
     ) -> list[NotificationPayload]:
-        """Get notifications for a user (most recent first)."""
-        user_notifs = [n for n in self._sent if n.user_id == user_id]
+        """Get notifications for a user (most recent first).
+
+        R8-FIX: Added organization_id filter for defense-in-depth tenant
+        isolation. While user_ids are globally unique UUIDs, filtering by
+        org_id prevents cross-tenant data leakage if a user_id collision
+        or misconfiguration occurs.
+        """
+        user_notifs = [
+            n for n in self._sent
+            if n.user_id == user_id
+            and (organization_id is None or n.organization_id == organization_id)
+            # R36-FIX: Actually filter by unread status. Previously, the
+            # unread_only parameter was accepted but never used in the filter.
+            and (not unread_only or not n.is_read)
+        ]
         user_notifs.sort(key=lambda n: n.created_at, reverse=True)
         return user_notifs[:limit]
 
-    def notification_count(self, user_id: str) -> int:
+    def mark_as_read(
+        self,
+        user_id: str,
+        notification_ids: list[str] | None = None,
+        organization_id: str | None = None,
+    ) -> int:
+        """R36-FIX: Mark notifications as read.
+
+        If notification_ids is None, marks ALL notifications for the user as read.
+        Returns the count of notifications marked as read.
+        """
+        count = 0
+        for n in self._sent:
+            if n.user_id != user_id:
+                continue
+            if organization_id is not None and n.organization_id != organization_id:
+                continue
+            if n.is_read:
+                continue
+            # If specific IDs provided, only mark those
+            if notification_ids is not None:
+                # Use created_at as a proxy ID since NotificationPayload has no id field
+                if n.notification_id not in notification_ids:
+                    continue
+            n.is_read = True
+            count += 1
+        return count
+
+    def notification_count(
+        self, user_id: str, organization_id: str | None = None,
+    ) -> int:
         """Total notifications for a user."""
-        return sum(1 for n in self._sent if n.user_id == user_id)
+        return sum(
+            1 for n in self._sent
+            if n.user_id == user_id
+            and (organization_id is None or n.organization_id == organization_id)
+        )
+
+    def unread_count(
+        self, user_id: str, organization_id: str | None = None,
+    ) -> int:
+        """R36-FIX: Count of unread notifications for a user.
+
+        Previously missing — notification_count() returned total but there
+        was no way to get unread count. The API returned unread=total always.
+        """
+        return sum(
+            1 for n in self._sent
+            if n.user_id == user_id
+            and not n.is_read
+            and (organization_id is None or n.organization_id == organization_id)
+        )
 
     # ── Channel Handlers ──────────────────────────────────────────
 
@@ -274,36 +356,103 @@ class NotificationService:
 
     # ── Rate Limiting ─────────────────────────────────────────────
 
-    def _check_rate_limit(self, user_id: str) -> bool:
-        """Check if user is within rate limit (100/hour)."""
-        return self._rate_counts.get(user_id, 0) < self._max_per_hour
+    def _check_and_increment_rate(self, user_id: str) -> bool:
+        """Atomically check and increment rate limit (100/hour).
 
-    def _increment_rate(self, user_id: str) -> None:
-        """Increment rate counter for user."""
-        self._rate_counts[user_id] = self._rate_counts.get(user_id, 0) + 1
+        RATE-TOCTOU-FIX: Combines check + increment into a single operation
+        to prevent concurrent coroutines from both passing the check.
+        M7-FIX: Uses a sliding window with timestamp pruning.
+        MEM-FIX: Periodic key eviction to prevent unbounded dict growth.
+        """
+        import time
+
+        now = time.monotonic()
+
+        # MEM-FIX: Periodically evict stale rate window keys
+        self._rate_check_count += 1
+        if self._rate_check_count >= 500:
+            self._evict_stale_rate_keys(now)
+            self._rate_check_count = 0
+
+        window = self._rate_windows.get(user_id, [])
+        # Prune entries older than 1 hour
+        window = [t for t in window if now - t < 3600]
+
+        if len(window) >= self._max_per_hour:
+            self._rate_windows[user_id] = window
+            return False
+
+        # Atomically increment after passing check
+        window.append(now)
+        self._rate_windows[user_id] = window
+        return True
+
+    # R35-FIX: Removed dead code `_check_rate_limit()`. This was the pre-TOCTOU-FIX
+    # version replaced by `_check_and_increment_rate()`. Despite the docstring
+    # claiming "Read-only check", it mutated `self._rate_windows[user_id]`. Keeping
+    # dead code with misleading docs invites misuse if a future dev calls it
+    # thinking it's a safe read-only probe.
+
+    def _evict_stale_rate_keys(self, now: float) -> None:
+        """Remove rate window entries for users with no recent activity.
+
+        MEM-FIX: Prevents unbounded growth of _rate_windows dict.
+        """
+        stale = [
+            uid for uid, ts in self._rate_windows.items()
+            if not ts or (now - ts[-1]) >= 3600
+        ]
+        for uid in stale:
+            del self._rate_windows[uid]
+
+        # Hard cap: evict oldest if still over limit
+        if len(self._rate_windows) > self._MAX_RATE_KEYS:
+            sorted_keys = sorted(
+                self._rate_windows,
+                key=lambda k: self._rate_windows[k][-1] if self._rate_windows[k] else 0,
+            )
+            for k in sorted_keys[: len(self._rate_windows) - self._MAX_RATE_KEYS]:
+                del self._rate_windows[k]
 
 
 def _safe_format(template: str, vars: dict[str, str]) -> str:
-    """Format a template string, leaving unknown vars as-is."""
-    try:
-        return template.format(**vars)
-    except KeyError:
-        # Fill what we can
-        import re
-        def replacer(m: re.Match) -> str:
-            key = m.group(1)
-            return vars.get(key, m.group(0))
-        return re.sub(r"\{(\w+)\}", replacer, template)
+    """Format a template string, leaving unknown vars as-is.
+
+    R8-FIX: Uses regex-based substitution exclusively instead of
+    str.format(). Python's str.format() allows attribute access and
+    indexing (e.g. {0.__class__.__init__.__globals__}) which could
+    leak internal state if template_vars contain user-controlled values
+    like project_name.
+
+    R9-FIX: HTML-escapes variable values for defense-in-depth against
+    stored XSS. User-controlled strings like project_name may contain
+    <script> tags that render in browser notification UIs.
+    """
+    import html
+    import re
+
+    def replacer(m: re.Match) -> str:
+        key = m.group(1)
+        value = vars.get(key, m.group(0))
+        # R37-FIX: Strip newlines to prevent log injection.
+        value = str(value).replace("\n", " ").replace("\r", " ")
+        return html.escape(value)
+    return re.sub(r"\{(\w+)\}", replacer, template)
 
 
 # ── Singleton ───────────────────────────────────────────────────
 
+import threading as _threading
+_notification_lock = _threading.Lock()
 _service: NotificationService | None = None
 
 
 def get_notification_service() -> NotificationService:
     """Get or create the notification service singleton."""
     global _service
-    if _service is None:
-        _service = NotificationService()
-    return _service
+    if _service is not None:
+        return _service
+    with _notification_lock:
+        if _service is None:
+            _service = NotificationService()
+        return _service

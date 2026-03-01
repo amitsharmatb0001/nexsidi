@@ -23,9 +23,11 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
+    call_ai,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -201,15 +203,16 @@ _TS_PERF_PATTERNS: list[tuple[re.Pattern, str, PerfSeverity, PerfCategory, str, 
 # ── Deepika Agent ──────────────────────────────────────────────────
 
 
-class Deepika(BaseAgent):
+class Deepika:
     """Performance Analyst — detects performance issues and anti-patterns."""
 
     name = "deepika"
     display_name = "Deepika — Performance Analyst"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="read_file",
@@ -241,6 +244,24 @@ class Deepika(BaseAgent):
                 "required": ["severity", "category", "file_path", "title", "description", "impact", "suggestion"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -276,7 +297,8 @@ class Deepika(BaseAgent):
             for finding in ai_findings:
                 report.add(finding)
         except Exception as exc:
-            logger.warning("ai_perf_analysis_failed", error=str(exc))
+            from app.services.ai_router import _sanitize_error  # R27-FIX
+            logger.warning("ai_perf_analysis_failed", error=_sanitize_error(exc))
 
         findings_output = [
             {
@@ -301,7 +323,7 @@ class Deepika(BaseAgent):
             "total_findings": len(report.findings),
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         logger.info(
             "perf_analysis_complete",
@@ -458,8 +480,12 @@ class Deepika(BaseAgent):
         critical_files: list[str] = []
         for path, content in files.items():
             if path.endswith(".py") and ("router" in path or "service" in path):
-                truncated = content[:2500]
-                critical_files.append(f"### {path}\n```python\n{truncated}\n```")
+                from app.agents.scan_utils import split_into_windows
+
+                windows = split_into_windows(content, window_size=2500, overlap=500)
+                for i, window in enumerate(windows):
+                    label = f"### {path}" if len(windows) == 1 else f"### {path} (part {i + 1}/{len(windows)})"
+                    critical_files.append(f"{label}\n```python\n{window}\n```")
 
         if not critical_files:
             return []
@@ -478,8 +504,8 @@ class Deepika(BaseAgent):
             "Output ONLY valid JSON.",
         ])
 
-        response = await self.call_ai(
-            messages=[{"role": "user", "content": f"Analyze:\n\n{''.join(critical_files[:5])}"}],
+        response = await call_ai(self, 
+            messages=[{"role": "user", "content": f"Analyze:\n\n{'\n\n'.join(critical_files[:5])}"}],
             system_prompt=system_prompt,
             task_type="general",
             temperature=0.1,
@@ -494,7 +520,10 @@ class Deepika(BaseAgent):
 
             if isinstance(parsed, list):
                 for item in parsed:
-                    sev = PerfSeverity(item.get("severity", "low"))
+                    try:
+                        sev = PerfSeverity(item.get("severity", "low"))
+                    except ValueError:
+                        sev = PerfSeverity.MEDIUM
                     cat_str = item.get("category", "inefficient_algorithm")
                     try:
                         cat = PerfCategory(cat_str)
@@ -512,7 +541,8 @@ class Deepika(BaseAgent):
                         suggestion=item.get("suggestion", "Review and optimize"),
                     ))
         except Exception as exc:
-            logger.warning("ai_perf_parse_failed", error=str(exc))
+            from app.services.ai_router import _sanitize_error  # R27-FIX
+            logger.warning("ai_perf_parse_failed", error=_sanitize_error(exc))
 
         return findings
 

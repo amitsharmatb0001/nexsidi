@@ -29,9 +29,10 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -205,7 +206,7 @@ class TokenSession:
         self.is_destroyed = True
 
 
-class GitAgent(BaseAgent):
+class GitAgent:
     """Git Agent -- manages source code repositories.
 
     Handles repo creation, code push, branching, and PRs
@@ -215,9 +216,10 @@ class GitAgent(BaseAgent):
     name = "git_agent"
     display_name = "Git Agent"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="create_repo",
@@ -259,6 +261,24 @@ class GitAgent(BaseAgent):
                 "required": ["repo_url", "title"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -334,6 +354,9 @@ class GitAgent(BaseAgent):
             files=push_result.files_pushed,
             pr=pr_result.pr_number,
         )
+
+        # STORE-FIX: Persist output to context engine for downstream agents
+        await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
             agent_name=self.name,

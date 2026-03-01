@@ -19,24 +19,27 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    BaseAgent,
     ToolDefinition,
+    call_ai,
     register_agent,
+    run_agent,
+    store_output,
 )
 from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
 
 
-class Vanya(BaseAgent):
+class Vanya:
     """UI/UX Designer — design tokens and wireframe specifications."""
 
     name = "vanya"
     display_name = "Vanya — UI/UX Designer"
     default_complexity = TaskComplexity.MEDIUM
+    default_model: str | None = None
 
     def __init__(self) -> None:
-        super().__init__()
+        self._tools: dict[str, ToolDefinition] = {}
 
         self.register_tool(ToolDefinition(
             name="write_design_spec",
@@ -65,6 +68,24 @@ class Vanya(BaseAgent):
                 "required": ["page_name", "layout"],
             },
         ))
+
+
+    def register_tool(self, tool: "ToolDefinition") -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
+    @property
+    def tools(self) -> list["ToolDefinition"]:
+        """All registered tools."""
+        return list(self._tools.values())
+
+    async def run(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> AgentResult:
+        """Execute with timing, logging, and error handling."""
+        return await run_agent(self, pipeline_run_id, context)
 
     async def execute(
         self,
@@ -120,17 +141,19 @@ class Vanya(BaseAgent):
         )
 
         try:
-            response = await self.call_ai(
+            response = await call_ai(self, 
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 task_type="general",
                 temperature=0.5,  # Moderate creativity for design
             )
         except Exception as exc:
+            # R21-FIX: Sanitize exception to prevent API key leakage.
+            from app.services.ai_router import _sanitize_error
             return AgentResult(
                 agent_name=self.name,
                 status=AgentStatus.FAILED,
-                error=f"AI call failed: {exc}",
+                error=f"AI call failed: {_sanitize_error(exc)}",
             )
 
         output = {
@@ -143,7 +166,7 @@ class Vanya(BaseAgent):
             },
         }
 
-        await self.store_output(pipeline_run_id, output)
+        await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
             agent_name=self.name,
