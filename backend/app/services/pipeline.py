@@ -34,6 +34,7 @@ from typing import Any
 import structlog
 
 from app.agents.base import AgentResult, AgentStatus, get_agent
+from app.services.ai_router import PipelineCostLimitError  # COST-CAP-FIX
 
 logger = structlog.get_logger(__name__)
 
@@ -985,6 +986,23 @@ class PipelineOrchestrator:
                     run_id=run.run_id,
                     timeout_minutes=self._timeout_seconds // 60,
                 )
+                return run
+            except PipelineCostLimitError as exc:  # COST-CAP-FIX
+                # COST-CAP-FIX: Per-pipeline cost cap exceeded. Mark as FAILED
+                # with a clear error message so the user knows why it stopped.
+                run.status = PipelineRunStatus.FAILED
+                run.error = str(exc)  # COST-CAP-FIX
+                try:
+                    await self._persist_run(run)
+                except Exception:
+                    logger.error("persist_after_cost_cap_failed", run_id=run.run_id)
+                self._active_runs.pop(run.run_id, None)
+                self._run_locks.pop(run.run_id, None)
+                logger.error(
+                    "pipeline_cost_cap_exceeded",
+                    run_id=run.run_id,
+                    error=str(exc),
+                )  # COST-CAP-FIX
                 return run
             except Exception as exc:
                 # R9-FIX: Catch ALL exceptions from _run_pipeline_inner.

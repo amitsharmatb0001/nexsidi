@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import random
 import time
 import uuid
@@ -31,6 +32,11 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
 logger = structlog.get_logger(__name__)
+
+
+# COST-CAP-FIX: Raised when cumulative pipeline AI cost exceeds the hard cap.
+class PipelineCostLimitError(RuntimeError):
+    """Pipeline cost exceeded _HARD_CAP_USD; raised inside ProjectCostTracker.record()."""
 
 
 def _sanitize_error(exc: Exception) -> str:
@@ -1825,6 +1831,8 @@ class ProjectCostTracker:
     """
 
     _MAX_ENTRIES: int = 10_000  # Safety cap for in-memory entries
+    # COST-CAP-FIX: Hard cost cap in USD; override via PIPELINE_COST_CAP_USD env var.
+    _HARD_CAP_USD: float = float(os.environ.get("PIPELINE_COST_CAP_USD", "50.0"))  # COST-CAP-FIX
 
     def __init__(self, pipeline_run_id: str = "") -> None:
         from collections import deque
@@ -1891,6 +1899,12 @@ class ProjectCostTracker:
         self._total_output_tokens += response.output_tokens
         self._total_cost += total_cost
         self._total_call_count += 1
+
+        # COST-CAP-FIX: Enforce hard cost cap per pipeline run.
+        if self._total_cost > self._HARD_CAP_USD:  # COST-CAP-FIX
+            raise PipelineCostLimitError(
+                f"Pipeline cost {self._total_cost:.2f} exceeded cap {self._HARD_CAP_USD:.2f}"
+            )  # COST-CAP-FIX
 
         # DEFERRED-FIX-17: Update incremental breakdown dicts
         if model_key not in self._per_model:

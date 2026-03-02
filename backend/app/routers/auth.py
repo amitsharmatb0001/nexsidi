@@ -57,8 +57,8 @@ _DUMMY_HASH = hash_password("__timing_oracle_dummy_pw__")
 class _AuthRateLimiter:
     """In-memory sliding-window rate limiter for auth endpoints.
 
-    Limits per IP address:
-    - login: 10 attempts per 15 minutes
+    Limits per email (primary) + per IP (secondary):
+    - login: 10 attempts per email per 15 minutes, 30 per IP  # RATEFIX
     - register: 5 attempts per 15 minutes
 
     REFIX: Added key eviction to prevent memory leak when many distinct IPs
@@ -286,7 +286,8 @@ async def register(body: UserRegister, request: Request) -> TokenResponse:
 @router.post("/login", response_model=TokenResponse)
 async def login(body: UserLogin, request: Request) -> TokenResponse:
     """Authenticate with email + password, return JWT tokens."""
-    _rate_limiter.check(f"login:{_client_ip(request)}", max_attempts=10)
+    _rate_limiter.check(f"login:{body.email.lower()}", max_attempts=10)          # per-email (primary)  # RATEFIX
+    _rate_limiter.check(f"login_ip:{_client_ip(request)}", max_attempts=30)     # per-IP (secondary)   # RATEFIX
     settings = get_settings()
     factory = get_session_factory()
 

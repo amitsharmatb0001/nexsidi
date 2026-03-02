@@ -720,19 +720,22 @@ class TestRateLimiting:
         _reset_rate_limiter()
 
     async def test_login_rate_limit(self, real_client):
-        """More than 10 login attempts from same IP should be rate-limited."""
+        """More than 10 login attempts for the same email should be rate-limited."""
+        # RATEFIX: Rate limit is now per-email (primary). Use same email address
+        # for all attempts so the per-email limit of 10 is triggered.
+        target_email = f"bruteforce-target@{_TEST_DOMAIN}"
         responses = []
-        for i in range(12):
+        for _i in range(12):
             resp = await real_client.post(
                 "/api/v1/auth/login",
                 json={
-                    "email": f"nonexistent-{i}@{_TEST_DOMAIN}",
+                    "email": target_email,
                     "password": "WrongPass123!",
                 },
             )
             responses.append(resp.status_code)
 
-        # At least one should be 429 (limit is 10 per 15min)
+        # At least one should be 429 (limit is 10 per email per 15min)
         assert 429 in responses, f"No login rate limiting! Statuses: {responses}"
 
 

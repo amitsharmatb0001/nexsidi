@@ -106,6 +106,7 @@ class Settings(BaseSettings):
 
     # --- Deployment ---
     nexsidi_deploy_key: str = ""
+    railway_token: str = ""  # DEPLOY-FIX: Railway API/CLI token for real deployments
 
     # --- CORS ---
     cors_origins: list[str] = ["http://localhost:3000"]

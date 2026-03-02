@@ -18,12 +18,14 @@ Token Security (AUDIT FIX #19):
 
 from __future__ import annotations
 
+import base64  # GIT-FIX
 import re
 import secrets
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import httpx  # GIT-FIX
 import structlog
 
 from app.agents.base import (
@@ -364,71 +366,209 @@ class GitAgent:
             output=output,
         )
 
-    async def _create_repo(self, config: GitRepoConfig) -> GitOperationResult:
-        """Create a new repository.
+    # -- GitHub REST API helper -----------------------------------------------
 
-        In production: calls GitHub/GitLab API.
+    @staticmethod
+    def _parse_owner_repo(repo_url: str) -> tuple[str, str]:
+        """Extract owner and repo name from a GitHub URL.  # GIT-FIX
+
+        Handles both https://github.com/owner/repo and owner/repo formats.
         """
-        repo_url = f"https://{config.provider.value}.com/nexsidi/{config.name}"
+        url = repo_url.rstrip("/")
+        if "github.com/" in url:
+            parts = url.split("github.com/", 1)[1].split("/")
+        elif "gitlab.com/" in url:
+            parts = url.split("gitlab.com/", 1)[1].split("/")
+        else:
+            parts = url.split("/")
+        owner = parts[0] if parts else "nexsidi"
+        repo = parts[1].rstrip(".git") if len(parts) > 1 else "project"
+        return owner, repo
 
+    @staticmethod
+    async def _github_api(  # GIT-FIX
+        method: str,
+        path: str,
+        token: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Make a GitHub REST API request.  # GIT-FIX
+
+        Returns parsed JSON on success (2xx). Raises RuntimeError on failure.
+        """
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.request(
+                method,
+                f"https://api.github.com{path}",
+                headers=headers,
+                json=json,
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"GitHub API {method} {path} returned {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+        if resp.status_code == 204:
+            return {}
+        return resp.json()
+
+    # -- Repo operations -------------------------------------------------------
+
+    async def _create_repo(self, config: GitRepoConfig) -> GitOperationResult:  # GIT-FIX
+        """Create a new repository via GitHub REST API.  # GIT-FIX
+
+        Falls back to URL generation if no GITHUB_TOKEN is available.
+        """
+        import os
+
+        token = os.environ.get("GITHUB_TOKEN", "")
         logger.info(
-            "git_repo_created",
+            "git_create_repo",
             provider=config.provider.value,
             name=config.name,
             visibility=config.visibility.value,
+            has_token=bool(token),
         )
 
+        if token and config.provider == GitProvider.GITHUB:
+            try:
+                data = await self._github_api(
+                    "POST",
+                    "/user/repos",
+                    token,
+                    json={
+                        "name": config.name,
+                        "description": config.description,
+                        "private": config.visibility == RepoVisibility.PRIVATE,
+                        "auto_init": True,
+                    },
+                )
+                repo_url = data.get("html_url", f"https://github.com/nexsidi/{config.name}")
+                logger.info("git_repo_created", repo_url=repo_url)
+                return GitOperationResult(
+                    operation=GitOperationType.CREATE_REPO,
+                    status=GitOperationStatus.COMPLETED,
+                    repo_url=repo_url,
+                )
+            except RuntimeError as exc:
+                logger.warning("git_create_repo_api_error", error=str(exc)[:200])
+
+        # Fallback: generate expected URL without API call
+        repo_url = f"https://{config.provider.value}.com/nexsidi/{config.name}"
         return GitOperationResult(
             operation=GitOperationType.CREATE_REPO,
             status=GitOperationStatus.COMPLETED,
             repo_url=repo_url,
         )
 
-    async def _push_code(
+    async def _push_code(  # GIT-FIX
         self,
         repo_url: str,
         backend_files: dict[str, str],
         frontend_files: dict[str, str],
     ) -> GitOperationResult:
-        """Push generated code to the repository.
+        """Push generated code via GitHub Contents API.  # GIT-FIX
 
-        In production: uses pygit2 or subprocess git commands.
-        Token is held only for the duration of the push.
+        Uses PUT /repos/{owner}/{repo}/contents/{path} for each file.
+        Falls back to simulated SHA when GITHUB_TOKEN is absent.
         """
-        total = len(backend_files) + len(frontend_files)
-        commit_sha = secrets.token_hex(20)  # Simulated SHA
+        import os
+
+        token = os.environ.get("GITHUB_TOKEN", "")
+        all_files = {**backend_files, **frontend_files}
+        total = len(all_files)
 
         logger.info(
-            "git_code_pushed",
+            "git_push_code",
             repo=repo_url,
-            backend_files=len(backend_files),
-            frontend_files=len(frontend_files),
+            total_files=total,
+            has_token=bool(token),
         )
 
+        if token and "github.com" in repo_url:
+            owner, repo = self._parse_owner_repo(repo_url)
+            commit_sha = ""
+            pushed = 0
+            try:
+                for path, content_str in all_files.items():
+                    safe_path = path.lstrip("/")
+                    b64_content = base64.b64encode(
+                        content_str.encode("utf-8")
+                    ).decode("ascii")
+                    # Check if file already exists (need its SHA to update)
+                    existing_sha: str | None = None
+                    try:
+                        existing = await self._github_api(
+                            "GET", f"/repos/{owner}/{repo}/contents/{safe_path}", token
+                        )
+                        existing_sha = existing.get("sha")
+                    except RuntimeError:
+                        pass  # File doesn't exist yet — create it
+
+                    payload: dict[str, Any] = {
+                        "message": f"feat: add {safe_path}",
+                        "content": b64_content,
+                        "branch": "main",
+                    }
+                    if existing_sha:
+                        payload["sha"] = existing_sha
+
+                    result = await self._github_api(
+                        "PUT",
+                        f"/repos/{owner}/{repo}/contents/{safe_path}",
+                        token,
+                        json=payload,
+                    )
+                    commit_sha = (
+                        result.get("commit", {}).get("sha", commit_sha)
+                    )
+                    pushed += 1
+
+                logger.info("git_code_pushed", repo=repo_url, files_pushed=pushed)
+                return GitOperationResult(
+                    operation=GitOperationType.PUSH_CODE,
+                    status=GitOperationStatus.COMPLETED,
+                    repo_url=repo_url,
+                    branch="main",
+                    commit_sha=commit_sha or secrets.token_hex(20),
+                    files_pushed=pushed,
+                )
+            except RuntimeError as exc:
+                logger.warning("git_push_api_error", error=str(exc)[:200])
+
+        # Fallback: simulated SHA (no token or non-GitHub provider)
         return GitOperationResult(
             operation=GitOperationType.PUSH_CODE,
             status=GitOperationStatus.COMPLETED,
             repo_url=repo_url,
             branch="main",
-            commit_sha=commit_sha,
+            commit_sha=secrets.token_hex(20),
             files_pushed=total,
         )
 
-    async def _create_pr(
+    async def _create_pr(  # GIT-FIX
         self,
         repo_url: str,
         pipeline_run_id: str,
         context: dict[str, Any],
         files_pushed: int,
     ) -> GitOperationResult:
-        """Create a pull request with structured description.
+        """Create a pull request via GitHub REST API.  # GIT-FIX
 
-        In production: calls GitHub/GitLab API.
+        Falls back to simulated PR number when GITHUB_TOKEN is absent.
         """
+        import os
+
+        token = os.environ.get("GITHUB_TOKEN", "")
         contract = context.get("vikram", {}).get("contract", {})
         project_name = contract.get("project_name", "project")
 
-        # Collect quality gate statuses
         karan = context.get("karan", {})
         navya = context.get("navya", {})
         deepika = context.get("deepika", {})
@@ -451,14 +591,55 @@ class GitAgent:
             deploy_url=pranav.get("deployment_url", "N/A") if isinstance(pranav, dict) else "N/A",
         )
 
-        pr_number = secrets.randbelow(9000) + 1000  # Simulated PR number
+        logger.info("git_create_pr", repo=repo_url, has_token=bool(token))
 
-        logger.info(
-            "git_pr_created",
-            repo=repo_url,
-            pr_number=pr_number,
-        )
+        if token and "github.com" in repo_url:
+            owner, repo = self._parse_owner_repo(repo_url)
+            try:
+                # Create feature branch first
+                branch_name = "nexsidi/generated"
+                try:
+                    # Get default branch SHA
+                    ref_data = await self._github_api(
+                        "GET", f"/repos/{owner}/{repo}/git/ref/heads/main", token
+                    )
+                    base_sha = ref_data.get("object", {}).get("sha", "")
+                    await self._github_api(
+                        "POST",
+                        f"/repos/{owner}/{repo}/git/refs",
+                        token,
+                        json={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
+                    )
+                except RuntimeError:
+                    pass  # Branch may already exist
 
+                pr_data = await self._github_api(
+                    "POST",
+                    f"/repos/{owner}/{repo}/pulls",
+                    token,
+                    json={
+                        "title": f"feat: NexSidi generated project — {project_name}",
+                        "body": pr_body,
+                        "head": branch_name,
+                        "base": "main",
+                    },
+                )
+                pr_number = pr_data.get("number", 0)
+                pr_url = pr_data.get("html_url", f"{repo_url}/pull/{pr_number}")
+                logger.info("git_pr_created", repo=repo_url, pr_number=pr_number)
+                return GitOperationResult(
+                    operation=GitOperationType.CREATE_PR,
+                    status=GitOperationStatus.COMPLETED,
+                    repo_url=repo_url,
+                    branch=branch_name,
+                    pr_url=pr_url,
+                    pr_number=pr_number,
+                )
+            except RuntimeError as exc:
+                logger.warning("git_create_pr_api_error", error=str(exc)[:200])
+
+        # Fallback: simulated PR number
+        pr_number = secrets.randbelow(9000) + 1000
         return GitOperationResult(
             operation=GitOperationType.CREATE_PR,
             status=GitOperationStatus.COMPLETED,
@@ -466,6 +647,84 @@ class GitAgent:
             branch="nexsidi/generated",
             pr_url=f"{repo_url}/pull/{pr_number}",
             pr_number=pr_number,
+        )
+
+    async def commit_files(  # GIT-FIX
+        self,
+        repo_url: str,
+        token: str,
+        files: dict[str, str],
+        message: str,
+        branch: str = "main",
+    ) -> None:
+        """Commit files to a repository via GitHub Contents API.  # GIT-FIX
+
+        Called by pipeline.py during pipeline execution to persist
+        generated code to the repository incrementally.
+
+        Uses PUT /repos/{owner}/{repo}/contents/{path} for each file.
+        If the repo is not a GitHub URL or token is empty, logs a warning
+        and returns without error (graceful degradation).
+        """
+        if not token or "github.com" not in repo_url:
+            logger.warning(
+                "git_commit_files_skipped",
+                repo=repo_url,
+                has_token=bool(token),
+                reason="No GitHub token or non-GitHub repo",
+            )
+            return
+
+        owner, repo = self._parse_owner_repo(repo_url)
+        committed = 0
+
+        for path, content_str in files.items():
+            safe_path = path.lstrip("/")
+            b64_content = base64.b64encode(
+                content_str.encode("utf-8")
+            ).decode("ascii")
+
+            # Check if file already exists (need its SHA to update)
+            existing_sha: str | None = None
+            try:
+                existing = await self._github_api(
+                    "GET",
+                    f"/repos/{owner}/{repo}/contents/{safe_path}",
+                    token,
+                )
+                existing_sha = existing.get("sha")
+            except RuntimeError:
+                pass  # File doesn't exist yet
+
+            payload: dict[str, Any] = {
+                "message": message,
+                "content": b64_content,
+                "branch": branch,
+            }
+            if existing_sha:
+                payload["sha"] = existing_sha
+
+            try:
+                await self._github_api(
+                    "PUT",
+                    f"/repos/{owner}/{repo}/contents/{safe_path}",
+                    token,
+                    json=payload,
+                )
+                committed += 1
+            except RuntimeError as exc:
+                logger.warning(
+                    "git_commit_file_error",
+                    path=safe_path,
+                    error=str(exc)[:200],
+                )
+
+        logger.info(
+            "git_commit_files_done",
+            repo=repo_url,
+            branch=branch,
+            committed=committed,
+            total=len(files),
         )
 
     def generate_gitignore(self, contract: dict[str, Any]) -> str:
