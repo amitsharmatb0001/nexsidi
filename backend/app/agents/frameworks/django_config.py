@@ -184,6 +184,35 @@ DJANGO_CONFIG = FrameworkConfig(
     file_structure=DJANGO_FILE_STRUCTURE,
     rules=DJANGO_RULES,
     golden_examples=DJANGO_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/core/models.py", "task_type": "general",
+         "description": "Django ORM models from architecture contract tables"},
+        {"name": "serializers", "path": "backend/core/serializers.py", "task_type": "general",
+         "description": "DRF serializers matching models"},
+        {"name": "permissions", "path": "backend/core/permissions.py", "task_type": "auth_code",
+         "description": "Custom DRF permissions and auth classes"},
+        {"name": "views", "path": "backend/core/views.py", "task_type": "general",
+         "description": "DRF viewsets and API views"},
+        {"name": "urls", "path": "backend/core/urls.py", "task_type": "general",
+         "description": "URL routing with DRF router"},
+        {"name": "services", "path": "backend/core/services.py", "task_type": "general",
+         "description": "Business logic services called by views"},
+        {"name": "tests", "path": "backend/core/tests/", "task_type": "general",
+         "description": "Django tests for all endpoints and services"},
+        {"name": "management", "path": "backend/core/management/commands/seed.py", "task_type": "general",
+         "description": "Django management command for database seeding"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "serializers": {"models"},
+        "permissions": {"models", "serializers"},
+        "views": {"models", "serializers", "permissions"},
+        "urls": {"views"},
+        "services": {"models", "serializers", "permissions"},
+        "tests": {"models", "serializers", "permissions", "views", "urls", "services"},
+        "management": {"models"},
+    },
 )
 
 register_framework(DJANGO_CONFIG)

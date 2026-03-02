@@ -262,6 +262,38 @@ RAILS_CONFIG = FrameworkConfig(
     file_structure=RAILS_FILE_STRUCTURE,
     rules=RAILS_RULES,
     golden_examples=RAILS_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/app/models/", "task_type": "general",
+         "description": "ActiveRecord models from architecture contract tables"},
+        {"name": "migrations", "path": "backend/db/migrate/", "task_type": "general",
+         "description": "Rails migrations matching models"},
+        {"name": "auth_concern", "path": "backend/app/controllers/concerns/authenticatable.rb", "task_type": "auth_code",
+         "description": "Authentication concern with JWT, bcrypt, before_action callbacks"},
+        {"name": "serializers", "path": "backend/app/serializers/", "task_type": "general",
+         "description": "ActiveModel Serializers for API responses"},
+        {"name": "controllers", "path": "backend/app/controllers/api/v1/", "task_type": "general",
+         "description": "API controllers with strong params"},
+        {"name": "services", "path": "backend/app/services/", "task_type": "general",
+         "description": "Service objects with business logic"},
+        {"name": "routes", "path": "backend/config/routes.rb", "task_type": "general",
+         "description": "Rails routes with API namespace"},
+        {"name": "tests", "path": "backend/spec/", "task_type": "general",
+         "description": "RSpec tests for all endpoints and services"},
+        {"name": "seeds", "path": "backend/db/seeds.rb", "task_type": "general",
+         "description": "Database seed file for development"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "migrations": {"models"},
+        "auth_concern": {"models"},
+        "serializers": {"models"},
+        "controllers": {"models", "auth_concern", "serializers"},
+        "services": {"models", "serializers"},
+        "routes": {"controllers"},
+        "tests": {"models", "migrations", "auth_concern", "serializers", "controllers", "services", "routes"},
+        "seeds": {"models"},
+    },
 )
 
 register_framework(RAILS_CONFIG)

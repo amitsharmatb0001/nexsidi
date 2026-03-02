@@ -5,6 +5,35 @@ Key design decisions:
 - Session factory yields scoped sessions with proper cleanup
 - Alembic migrations run automatically on server startup
 - RLS context setting is in dependencies.py (single source of truth)
+
+RLS Enforcement Architecture (NOT an illusion):
+    Row-Level Security is enforced at three layers — not just in migrations.
+
+    1. Authenticated routes → get_tenant_session (dependencies.py)
+       Every session yielded by this dependency calls set_tenant_context()
+       BEFORE yielding, inside an active transaction:
+           SET LOCAL app.current_tenant = '<org_uuid>'
+           SET LOCAL app.current_user_id = '<user_uuid>'
+           SET LOCAL app.user_role = '<role>'
+       SET LOCAL is transaction-scoped and resets automatically when the
+       transaction commits or rolls back — no risk of context leaking between
+       requests.
+
+    2. Pre-auth routes (/register, /login, /refresh) → auth_mode bypass
+       These routes cannot provide a tenant ID (user is not yet authenticated).
+       They execute SET LOCAL app.auth_mode = 'true' instead.
+       Migration 005 defines permissive policies for auth_mode=true that allow
+       registration/login operations without a tenant context.
+
+    3. Background / pipeline services → manual _set_rls_context()
+       Pipeline service code (pipeline.py) runs outside HTTP request scope.
+       It manually calls _set_rls_context(session, org_id, user_id) before
+       every query that touches tenant-scoped tables.
+
+    WHY NOT IN POOL CHECKOUT: SET LOCAL is transaction-scoped. Hooking pool
+    checkout (connect event) would set session-level variables that persist
+    across transactions in the same connection — wrong semantics and a
+    tenant-isolation bug. The application-layer pattern is intentional.
 """
 
 from __future__ import annotations

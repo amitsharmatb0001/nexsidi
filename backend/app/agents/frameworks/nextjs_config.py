@@ -247,6 +247,32 @@ NEXTJS_CONFIG = FrameworkConfig(
     file_structure=NEXTJS_FILE_STRUCTURE,
     rules=NEXTJS_RULES,
     golden_examples=NEXTJS_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "db_schema", "path": "backend/prisma/schema.prisma", "task_type": "general",
+         "description": "Prisma schema from architecture contract tables"},
+        {"name": "types", "path": "backend/src/types/index.ts", "task_type": "general",
+         "description": "Zod schemas and TypeScript types"},
+        {"name": "middleware", "path": "backend/src/middleware.ts", "task_type": "auth_code",
+         "description": "Next.js middleware for auth and request validation"},
+        {"name": "routes", "path": "backend/src/app/api/", "task_type": "general",
+         "description": "Next.js App Router API route handlers"},
+        {"name": "services", "path": "backend/src/services/", "task_type": "general",
+         "description": "Business logic services called by route handlers"},
+        {"name": "tests", "path": "backend/src/__tests__/", "task_type": "general",
+         "description": "Jest tests for all API routes and services"},
+        {"name": "seed", "path": "backend/prisma/seed.ts", "task_type": "general",
+         "description": "Prisma seed script for development"},
+    ),
+    dependency_graph={
+        "db_schema": set(),
+        "types": {"db_schema"},
+        "middleware": {"db_schema", "types"},
+        "routes": {"db_schema", "types", "middleware"},
+        "services": {"db_schema", "types", "middleware"},
+        "tests": {"db_schema", "types", "middleware", "routes", "services"},
+        "seed": {"db_schema"},
+    },
 )
 
 register_framework(NEXTJS_CONFIG)

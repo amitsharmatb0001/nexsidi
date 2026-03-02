@@ -251,6 +251,32 @@ FLASK_CONFIG = FrameworkConfig(
     file_structure=FLASK_FILE_STRUCTURE,
     rules=FLASK_RULES,
     golden_examples=FLASK_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/app/models.py", "task_type": "general",
+         "description": "SQLAlchemy models from architecture contract tables"},
+        {"name": "schemas", "path": "backend/app/schemas.py", "task_type": "general",
+         "description": "Marshmallow schemas matching models"},
+        {"name": "auth", "path": "backend/app/auth.py", "task_type": "auth_code",
+         "description": "Flask-Login auth, password hashing, JWT handling"},
+        {"name": "routes", "path": "backend/app/routes/", "task_type": "general",
+         "description": "Flask Blueprints with route handlers"},
+        {"name": "services", "path": "backend/app/services/", "task_type": "general",
+         "description": "Business logic services called by routes"},
+        {"name": "tests", "path": "backend/tests/", "task_type": "general",
+         "description": "Pytest tests for all endpoints and services"},
+        {"name": "seed", "path": "backend/scripts/seed.py", "task_type": "general",
+         "description": "Database seed script for development"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "schemas": {"models"},
+        "auth": {"models", "schemas"},
+        "routes": {"models", "schemas", "auth"},
+        "services": {"models", "schemas", "auth"},
+        "tests": {"models", "schemas", "auth", "routes", "services"},
+        "seed": {"models"},
+    },
 )
 
 register_framework(FLASK_CONFIG)

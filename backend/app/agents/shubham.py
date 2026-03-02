@@ -313,6 +313,8 @@ _GENERATION_ORDERS: dict[str, list[dict[str, str]]] = {
 }
 
 
+# OCP-FIX: Deprecated — use fw_config.generation_order instead.
+# Kept for backward compatibility with tests. Will be removed in next cleanup pass.
 def get_backend_generation_order(framework: str = "fastapi") -> list[dict[str, str]]:
     """Get the generation order for a specific backend framework."""
     return _GENERATION_ORDERS.get(framework.lower(), FASTAPI_GENERATION_ORDER)
@@ -476,6 +478,8 @@ _DEPENDENCY_GRAPHS: dict[str, dict[str, set[str]]] = {
 }
 
 
+# OCP-FIX: Deprecated — use fw_config.dependency_graph instead.
+# Kept for backward compatibility with tests. Will be removed in next cleanup pass.
 def get_dependency_graph(framework: str = "fastapi") -> dict[str, set[str]]:
     """Get the dependency graph for a backend framework."""
     return _DEPENDENCY_GRAPHS.get(framework.lower(), FASTAPI_DEPENDENCIES)
@@ -721,12 +725,11 @@ class Shubham:
         }
         backend_framework = _fw_aliases.get(backend_framework, backend_framework)
 
-        generation_order = get_backend_generation_order(backend_framework)
-
         # Load framework config for rich prompts
         from app.agents.frameworks import get_framework_config
 
         fw_config = get_framework_config(backend_framework)
+        generation_order = list(fw_config.generation_order)  # OCP-FIX: read from plugin
 
         # Read user feedback if available (from checkpoint feedback loop)
         user_feedback = context.get("__user_feedback__", "")
@@ -768,7 +771,7 @@ class Shubham:
         cost_tracker = ProjectCostTracker(pipeline_run_id=pipeline_run_id)
 
         # Compute parallel execution levels
-        dep_graph = get_dependency_graph(backend_framework)
+        dep_graph = fw_config.dependency_graph  # OCP-FIX: read from plugin
         levels = compute_parallel_levels(generation_order, dep_graph)
 
         logger.info(
@@ -878,13 +881,31 @@ class Shubham:
         estimated = estimate_file_complexity(contract, step["name"])
         model_key = select_model_for_generation(estimated, step["task_type"])
 
+        # CACHE-FIX: accumulated_code goes in dynamic_system_context, NOT system_prompt,
+        # so the static system_prompt prefix stays stable for cache hits.
+        dynamic_ctx: str | None = None
+        if accumulated_code:
+            lang = fw_config.code_block_lang if fw_config else "python"
+            _MAX_ACCUMULATED_CHARS = 50_000
+            parts: list[str] = ["## Previously Generated Files\n"]
+            budget = _MAX_ACCUMULATED_CHARS
+            for name, code in reversed(list(accumulated_code.items())):
+                entry = f"\n### {name}\n```{lang}\n{code}\n```"
+                if budget - len(entry) < 0 and budget < _MAX_ACCUMULATED_CHARS:
+                    parts.append("\n_(older generated files omitted for prompt size)_")
+                    break
+                parts.append(entry)
+                budget -= len(entry)
+            dynamic_ctx = "".join(parts)
+
         try:
-            response = await call_ai_with_continuation(self, 
+            response = await call_ai_with_continuation(self,
                 messages=[{
                     "role": "user",
                     "content": f"Generate the {step['description']} for this project.",
                 }],
-                system_prompt=system_prompt,
+                system_prompt=system_prompt,      # STATIC — gets cache hits
+                dynamic_system_context=dynamic_ctx,  # DYNAMIC — no caching
                 task_type=step["task_type"],
                 temperature=0.1,
                 max_continuations=5,
@@ -940,12 +961,30 @@ class Shubham:
         estimated = estimate_file_complexity(contract, step["name"])
         model_key = select_model_for_generation(estimated, step["task_type"])
 
-        response = await call_ai_with_continuation(self, 
+        # CACHE-FIX: accumulated_code goes in dynamic_system_context, NOT system_prompt,
+        # so the static system_prompt prefix stays stable for cache hits.
+        dynamic_ctx: str | None = None
+        if accumulated_code:
+            lang = fw_config.code_block_lang if fw_config else "python"
+            _MAX_ACCUMULATED_CHARS = 50_000
+            parts: list[str] = ["## Previously Generated Files\n"]
+            budget = _MAX_ACCUMULATED_CHARS
+            for name, code in reversed(list(accumulated_code.items())):
+                entry = f"\n### {name}\n```{lang}\n{code}\n```"
+                if budget - len(entry) < 0 and budget < _MAX_ACCUMULATED_CHARS:
+                    parts.append("\n_(older generated files omitted for prompt size)_")
+                    break
+                parts.append(entry)
+                budget -= len(entry)
+            dynamic_ctx = "".join(parts)
+
+        response = await call_ai_with_continuation(self,
             messages=[{
                 "role": "user",
                 "content": f"Generate the {step['description']} for this project.",
             }],
-            system_prompt=system_prompt,
+            system_prompt=system_prompt,      # STATIC — gets cache hits
+            dynamic_system_context=dynamic_ctx,  # DYNAMIC — no caching
             task_type=step["task_type"],
             temperature=0.1,
             max_continuations=5,
@@ -1047,20 +1086,9 @@ class Shubham:
             ])
 
         # ── 7. Previously Generated Files ──
-        if accumulated_code:
-            _MAX_ACCUMULATED_CHARS = 50_000
-            prompt_parts.append("## Previously Generated Files (REAL CODE — use exact names)")
-            budget = _MAX_ACCUMULATED_CHARS
-            # Iterate in reverse so the most recently generated files are included first
-            for name, code in reversed(list(accumulated_code.items())):
-                entry = f"\n### {name}\n```{lang}\n{code}\n```"
-                if budget - len(entry) < 0 and budget < _MAX_ACCUMULATED_CHARS:
-                    # Budget exhausted; skip older files
-                    prompt_parts.append(f"\n_(older generated files omitted for prompt size)_")
-                    break
-                prompt_parts.append(entry)
-                budget -= len(entry)
-            prompt_parts.append("")
+        # CACHE-FIX: accumulated_code is NO LONGER embedded here.
+        # It is passed as dynamic_system_context in the AIRequest so the static
+        # system_prompt prefix remains stable across calls, enabling cache hits.
 
         # ── 8. Completeness Rules ──
         prompt_parts.extend([

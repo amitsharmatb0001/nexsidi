@@ -299,6 +299,32 @@ KOTLIN_KTOR_CONFIG = FrameworkConfig(
     file_structure=KOTLIN_KTOR_FILE_STRUCTURE,
     rules=KOTLIN_KTOR_RULES,
     golden_examples=KOTLIN_KTOR_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/src/main/kotlin/com/app/models/", "task_type": "general",
+         "description": "Exposed tables and entity classes"},
+        {"name": "dto", "path": "backend/src/main/kotlin/com/app/dto/", "task_type": "general",
+         "description": "kotlinx.serialization data classes"},
+        {"name": "auth", "path": "backend/src/main/kotlin/com/app/plugins/Authentication.kt", "task_type": "auth_code",
+         "description": "Ktor JWT authentication plugin configuration"},
+        {"name": "routes", "path": "backend/src/main/kotlin/com/app/routes/", "task_type": "general",
+         "description": "Ktor routing DSL with request handling"},
+        {"name": "services", "path": "backend/src/main/kotlin/com/app/services/", "task_type": "general",
+         "description": "Business logic services with Exposed transactions"},
+        {"name": "repository", "path": "backend/src/main/kotlin/com/app/repository/", "task_type": "general",
+         "description": "Exposed DAO repository pattern"},
+        {"name": "tests", "path": "backend/src/test/kotlin/com/app/", "task_type": "general",
+         "description": "Ktor test engine tests for all routes"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "dto": {"models"},
+        "auth": {"models", "dto"},
+        "routes": {"models", "dto", "auth"},
+        "services": {"models", "dto", "auth"},
+        "repository": {"models", "dto"},
+        "tests": {"models", "dto", "auth", "routes", "services", "repository"},
+    },
 )
 
 register_framework(KOTLIN_KTOR_CONFIG)

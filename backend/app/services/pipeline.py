@@ -1083,6 +1083,17 @@ class PipelineOrchestrator:
         # len(run.step_results) which is 0 after resume (step history not loaded).
         step_count = await self._get_max_step_order(run)
 
+        # WS-FIX: Notify clients pipeline has begun
+        from app.routers.websocket import notify_pipeline_event, notify_stage_event
+        try:
+            await notify_pipeline_event(
+                run.run_id,
+                "pipeline_started",
+                data={"execution_mode": run.execution_mode.value},
+            )
+        except Exception:
+            pass  # WebSocket notification failures must NEVER crash the pipeline
+
         while run.current_stage != PipelineStage.COMPLETED:
             # R27-FIX-21: Only rate-limit stages that actually make AI calls.
             # Checkpoints, delivery, and completed stages consume rate tokens
@@ -1090,9 +1101,34 @@ class PipelineOrchestrator:
             if run.current_stage not in CHECKPOINT_STAGES:
                 await self._rate_limiter.acquire(run.project_id)
 
+            # WS-FIX: Notify stage starting
+            try:
+                agent_for_stage = STAGE_AGENTS.get(run.current_stage)
+                agent_name_ws = agent_for_stage if isinstance(agent_for_stage, str) else ""
+                await notify_stage_event(
+                    run.run_id,
+                    "stage_started",
+                    stage=run.current_stage.value,
+                    agent=agent_name_ws,
+                )
+            except Exception:
+                pass
+
             step_result = await self.execute_stage(run)
             run.step_results.append(step_result)
             step_count += 1
+
+            # WS-FIX: Notify stage completed + emit per-file events for generated files
+            try:
+                await notify_stage_event(
+                    run.run_id,
+                    "stage_completed",
+                    stage=step_result.stage.value,
+                    agent=step_result.agent_name,
+                )
+                await self._emit_file_events(run, step_result)
+            except Exception:
+                pass
 
             # REVIEW-FIX: Track per-step status in context for observability.
             # Stores the last completed/failed stage name and agent so the
@@ -1208,6 +1244,26 @@ class PipelineOrchestrator:
 
         # Final persist
         await self._persist_run(run)
+
+        # WS-FIX: Emit terminal pipeline-level events
+        if run.status == PipelineRunStatus.COMPLETED:
+            try:
+                await notify_pipeline_event(
+                    run.run_id,
+                    "pipeline_completed",
+                    data={"run_id": run.run_id},
+                )
+            except Exception:
+                pass
+        elif run.status == PipelineRunStatus.FAILED:
+            try:
+                await notify_pipeline_event(
+                    run.run_id,
+                    "pipeline_failed",
+                    data={"error": str(run.error or "")[:200]},
+                )
+            except Exception:
+                pass
 
         # S-7-FIX: Evict terminal runs from hot cache to prevent OOM.
         # The DB is the source of truth; completed/failed runs don't need
@@ -1355,6 +1411,41 @@ class PipelineOrchestrator:
             self._paused_at.pop(run_id, None)  # R17-FIX: Clean up tracking
 
         return result
+
+    async def cancel_run(self, run_id: str, organization_id: str | None = None) -> bool | None:
+        """Cancel a running or paused pipeline run.
+
+        IDE-FIX: Returns True if cancelled, False if already in terminal state,
+        None if run not found. Sets status to CANCELLED and persists to DB.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            # Check DB
+            run_data = await self._persistence.find_run_by_id(run_id, organization_id=organization_id)
+            if run_data is None:
+                return None
+            run = self._persistence.rebuild_run(run_data)
+            self._active_runs[run.run_id] = run
+
+        if organization_id and run.organization_id != organization_id:
+            return None  # Treat cross-tenant as not found
+
+        terminal = {PipelineRunStatus.COMPLETED, PipelineRunStatus.FAILED, PipelineRunStatus.CANCELLED}
+        if run.status in terminal:
+            return False
+
+        # Mark cancelled
+        run.status = PipelineRunStatus.CANCELLED
+        run.error = "Cancelled by user"
+
+        # Persist to DB
+        try:
+            await self._persist_run(run)
+        except Exception:
+            pass  # Status is set in-memory; DB update is best-effort
+
+        logger.info("pipeline_cancelled", run_id=run_id, organization_id=organization_id)
+        return True
 
     async def recover_interrupted_runs(self) -> int:
         """Find and mark interrupted runs on server startup.
@@ -1663,6 +1754,55 @@ class PipelineOrchestrator:
 
         step.completed_at = datetime.now(timezone.utc)
         return step
+
+    async def _emit_file_events(self, run: PipelineRun, step_result: StepResult) -> None:
+        """Emit file_created WebSocket events for files generated in this stage.
+
+        WS-FIX: Reads file_contents from the agent's context output and emits
+        one file_created event per file so the frontend IDE can show real-time
+        'Creating backend/app/models.py...' progress.
+        """
+        from app.routers.websocket import notify_file_created
+
+        agent = step_result.agent_name.lower() if step_result.agent_name else ""
+
+        # Determine which context key this agent writes to
+        context_keys = {
+            "shubham": ("shubham", "file_contents"),
+            "aanya": ("aanya", "file_contents"),
+            "dhruv": ("dhruv", "sql_files"),
+        }
+
+        if agent not in context_keys:
+            return
+
+        outer_key, inner_key = context_keys[agent]
+        file_map: dict[str, str] = run.context.get(outer_key, {}).get(inner_key, {})
+
+        if not file_map:
+            return
+
+        # Determine language from file extension
+        def _lang_from_path(path: str) -> str:
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            return {
+                "py": "python", "ts": "typescript", "tsx": "typescript",
+                "js": "javascript", "jsx": "javascript", "sql": "sql",
+                "html": "html", "css": "css", "json": "json", "yaml": "yaml",
+                "yml": "yaml", "md": "markdown", "sh": "bash",
+            }.get(ext, ext)
+
+        for file_path, content in file_map.items():
+            try:
+                await notify_file_created(
+                    run.run_id,
+                    file_path=file_path,
+                    agent_name=agent,
+                    size=len(content.encode("utf-8")),
+                    language=_lang_from_path(file_path),
+                )
+            except Exception:
+                pass  # Never crash pipeline on WS failure
 
     async def _handle_checkpoint(
         self, run: PipelineRun, stage: PipelineStage

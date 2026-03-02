@@ -451,6 +451,7 @@ class AIRequest:
     cache_system_prompt: bool = True  # Enable prompt caching for system prompt
     tools: list[dict[str, Any]] | None = None  # Tool definitions for tool use
     shared_context: SharedContext | None = None  # Cacheable shared project context
+    dynamic_system_context: str | None = None  # CACHE-FIX: appended to system AFTER cached blocks
 
 
 @dataclass(slots=True)
@@ -1100,6 +1101,14 @@ class AIRouter:
                     "text": request.system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 })
+                # CACHE-FIX: Dynamic context (e.g., previously generated files) appended WITHOUT
+                # cache_control so it doesn't pollute the stable cache prefix.
+                if request.dynamic_system_context:
+                    system_blocks.append({
+                        "type": "text",
+                        "text": request.dynamic_system_context,
+                        # No cache_control — this changes every call
+                    })
                 body["system"] = system_blocks
             else:
                 body["system"] = request.system_prompt

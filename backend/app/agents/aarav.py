@@ -306,14 +306,28 @@ class Aarav:
         db_result = await self._phase_db_verify(pipeline_run_id, contract)
         report.add(db_result)
 
-        # Check total sandbox timeout
+        # SANDBOX-FIX E: Enforce total sandbox timeout — don't just warn, stop.
+        # If we've already exceeded the budget, record a TIMEOUT phase result
+        # and return early rather than silently continuing to completion.
         elapsed = (time.monotonic() - sandbox_start) * 1000
         if elapsed > TOTAL_SANDBOX_TIMEOUT * 1000:
             logger.warning(
-                "sandbox_timeout",
+                "sandbox_total_timeout_exceeded",
                 elapsed_ms=elapsed,
                 max_ms=TOTAL_SANDBOX_TIMEOUT * 1000,
             )
+            report.add(TestPhaseResult(
+                phase=TestPhase.DB_VERIFY,   # Sentinel: whichever phase we're past
+                status=TestStatus.TIMEOUT,
+                duration_ms=elapsed,
+                output=(
+                    f"Sandbox total timeout exceeded: {elapsed:.0f} ms "
+                    f"> {TOTAL_SANDBOX_TIMEOUT * 1000} ms limit"
+                ),
+            ))
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
 
         # STORE-FIX: Persist output to context engine for downstream agents
         result = self._build_result(report, sandbox_start)

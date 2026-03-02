@@ -170,6 +170,32 @@ FASTAPI_CONFIG = FrameworkConfig(
     file_structure=FASTAPI_FILE_STRUCTURE,
     rules=FASTAPI_RULES,
     golden_examples=FASTAPI_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/app/models.py", "task_type": "general",
+         "description": "SQLAlchemy models from architecture contract tables"},
+        {"name": "schemas", "path": "backend/app/schemas.py", "task_type": "general",
+         "description": "Pydantic request/response schemas matching models"},
+        {"name": "security", "path": "backend/app/security.py", "task_type": "auth_code",
+         "description": "Auth middleware, password hashing, JWT handling"},
+        {"name": "routers", "path": "backend/app/routers/", "task_type": "general",
+         "description": "FastAPI route handlers using schemas and services"},
+        {"name": "services", "path": "backend/app/services/", "task_type": "general",
+         "description": "Business logic services called by routers"},
+        {"name": "tests", "path": "backend/tests/", "task_type": "general",
+         "description": "Pytest tests for all endpoints and services"},
+        {"name": "seed_db", "path": "backend/scripts/seed.py", "task_type": "general",
+         "description": "Database seed script for development"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "schemas": {"models"},
+        "security": {"models", "schemas"},
+        "routers": {"models", "schemas", "security"},
+        "services": {"models", "schemas", "security"},
+        "tests": {"models", "schemas", "security", "routers", "services"},
+        "seed_db": {"models"},
+    },
 )
 
 register_framework(FASTAPI_CONFIG)

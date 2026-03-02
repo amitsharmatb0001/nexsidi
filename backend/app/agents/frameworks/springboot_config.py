@@ -259,6 +259,32 @@ SPRINGBOOT_CONFIG = FrameworkConfig(
     file_structure=SPRINGBOOT_FILE_STRUCTURE,
     rules=SPRINGBOOT_RULES,
     golden_examples=SPRINGBOOT_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "entity", "path": "backend/src/main/java/com/app/entity/", "task_type": "general",
+         "description": "JPA entities from architecture contract tables"},
+        {"name": "repository", "path": "backend/src/main/java/com/app/repository/", "task_type": "general",
+         "description": "Spring Data JPA repositories"},
+        {"name": "dto", "path": "backend/src/main/java/com/app/dto/", "task_type": "general",
+         "description": "DTOs with validation annotations"},
+        {"name": "security", "path": "backend/src/main/java/com/app/security/", "task_type": "auth_code",
+         "description": "Spring Security configuration and JWT handling"},
+        {"name": "service", "path": "backend/src/main/java/com/app/service/", "task_type": "general",
+         "description": "Service layer with business logic"},
+        {"name": "controller", "path": "backend/src/main/java/com/app/controller/", "task_type": "general",
+         "description": "REST controllers using services and DTOs"},
+        {"name": "tests", "path": "backend/src/test/java/com/app/", "task_type": "general",
+         "description": "JUnit tests for all endpoints and services"},
+    ),
+    dependency_graph={
+        "entity": set(),
+        "repository": {"entity"},
+        "dto": {"entity"},
+        "security": {"entity", "repository"},
+        "service": {"entity", "repository", "dto"},
+        "controller": {"entity", "repository", "dto", "security", "service"},
+        "tests": {"entity", "repository", "dto", "security", "service", "controller"},
+    },
 )
 
 register_framework(SPRINGBOOT_CONFIG)

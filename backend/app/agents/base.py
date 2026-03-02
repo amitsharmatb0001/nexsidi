@@ -345,11 +345,14 @@ async def call_ai(
     max_tokens: int | None = None,
     enable_thinking: bool = False,
     shared_context: Any | None = None,
+    dynamic_system_context: str | None = None,  # CACHE-FIX: dynamic part of system prompt
 ) -> AIResponse:
     """Make an AI call through the AI Router.
 
     ``agent`` must have ``.default_complexity`` and ``.default_model`` attributes.
     ``shared_context`` is an optional :class:`SharedContext` for prompt caching.
+    ``dynamic_system_context`` is appended AFTER the cached system_prompt block
+    without cache_control, so it doesn't invalidate the stable prompt cache.
     """
     from app.services.ai_router import get_ai_router
 
@@ -366,6 +369,7 @@ async def call_ai(
         max_tokens=max_tokens,
         enable_thinking=enable_thinking,
         shared_context=shared_context,
+        dynamic_system_context=dynamic_system_context,  # CACHE-FIX
     )
 
     return await router.call(request)
@@ -382,6 +386,7 @@ async def call_ai_with_continuation(
     max_continuations: int = 5,
     shared_context: Any | None = None,
     enable_thinking: bool = False,  # M3-FIX: Forward enable_thinking to call_ai
+    dynamic_system_context: str | None = None,  # CACHE-FIX: forwarded to call_ai
 ) -> AIResponse:
     """AI call with automatic continuation if response is truncated.
 
@@ -413,6 +418,7 @@ async def call_ai_with_continuation(
             max_tokens=max_tokens,
             shared_context=shared_context,
             enable_thinking=enable_thinking,
+            dynamic_system_context=dynamic_system_context,  # CACHE-FIX
         )
 
         full_content += response.content

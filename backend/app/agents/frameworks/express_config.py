@@ -207,6 +207,32 @@ EXPRESS_CONFIG = FrameworkConfig(
     file_structure=EXPRESS_FILE_STRUCTURE,
     rules=EXPRESS_RULES,
     golden_examples=EXPRESS_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "db_schema", "path": "backend/src/db/schema.ts", "task_type": "general",
+         "description": "Drizzle ORM schema from architecture contract tables"},
+        {"name": "types", "path": "backend/src/types/index.ts", "task_type": "general",
+         "description": "Zod schemas and TypeScript types matching DB schema"},
+        {"name": "middleware", "path": "backend/src/middleware/auth.ts", "task_type": "auth_code",
+         "description": "JWT auth middleware and helpers"},
+        {"name": "routes", "path": "backend/src/routes/", "task_type": "general",
+         "description": "Express route handlers using types and services"},
+        {"name": "services", "path": "backend/src/services/", "task_type": "general",
+         "description": "Business logic services called by routes"},
+        {"name": "tests", "path": "backend/src/__tests__/", "task_type": "general",
+         "description": "Jest tests for all endpoints and services"},
+        {"name": "seed", "path": "backend/src/scripts/seed.ts", "task_type": "general",
+         "description": "Database seed script for development"},
+    ),
+    dependency_graph={
+        "db_schema": set(),
+        "types": {"db_schema"},
+        "middleware": {"db_schema", "types"},
+        "routes": {"db_schema", "types", "middleware"},
+        "services": {"db_schema", "types", "middleware"},
+        "tests": {"db_schema", "types", "middleware", "routes", "services"},
+        "seed": {"db_schema"},
+    },
 )
 
 register_framework(EXPRESS_CONFIG)

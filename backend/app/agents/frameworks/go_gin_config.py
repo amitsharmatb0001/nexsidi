@@ -352,6 +352,32 @@ GO_GIN_CONFIG = FrameworkConfig(
     file_structure=GO_GIN_FILE_STRUCTURE,
     rules=GO_GIN_RULES,
     golden_examples=GO_GIN_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/internal/models/", "task_type": "general",
+         "description": "GORM models from architecture contract tables"},
+        {"name": "middleware", "path": "backend/internal/middleware/", "task_type": "auth_code",
+         "description": "Gin middleware for auth, CORS, logging"},
+        {"name": "handlers", "path": "backend/internal/handlers/", "task_type": "general",
+         "description": "Gin handler functions for API endpoints"},
+        {"name": "services", "path": "backend/internal/services/", "task_type": "general",
+         "description": "Business logic services called by handlers"},
+        {"name": "routes", "path": "backend/internal/routes/routes.go", "task_type": "general",
+         "description": "Gin router setup wiring handlers and middleware"},
+        {"name": "tests", "path": "backend/internal/handlers/", "task_type": "general",
+         "description": "Go tests for all handlers and services"},
+        {"name": "seed", "path": "backend/cmd/seed/main.go", "task_type": "general",
+         "description": "Database seed command for development"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "middleware": {"models"},
+        "handlers": {"models", "middleware"},
+        "services": {"models", "middleware"},
+        "routes": {"models", "middleware", "handlers", "services"},
+        "tests": {"models", "middleware", "handlers", "services", "routes"},
+        "seed": {"models"},
+    },
 )
 
 register_framework(GO_GIN_CONFIG)

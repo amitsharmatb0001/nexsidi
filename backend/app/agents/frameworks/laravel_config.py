@@ -342,6 +342,35 @@ LARAVEL_CONFIG = FrameworkConfig(
     file_structure=LARAVEL_FILE_STRUCTURE,
     rules=LARAVEL_RULES,
     golden_examples=LARAVEL_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/app/Models/", "task_type": "general",
+         "description": "Eloquent models from architecture contract tables"},
+        {"name": "migrations", "path": "backend/database/migrations/", "task_type": "general",
+         "description": "Laravel migrations matching models"},
+        {"name": "form_requests", "path": "backend/app/Http/Requests/", "task_type": "general",
+         "description": "FormRequest validation classes"},
+        {"name": "middleware", "path": "backend/app/Http/Middleware/", "task_type": "auth_code",
+         "description": "Auth middleware and custom middleware"},
+        {"name": "controllers", "path": "backend/app/Http/Controllers/", "task_type": "general",
+         "description": "API Controllers using FormRequests and services"},
+        {"name": "services", "path": "backend/app/Services/", "task_type": "general",
+         "description": "Business logic services called by controllers"},
+        {"name": "tests", "path": "backend/tests/Feature/", "task_type": "general",
+         "description": "PHPUnit tests for all endpoints and services"},
+        {"name": "seeders", "path": "backend/database/seeders/", "task_type": "general",
+         "description": "Database seeder classes for development"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "migrations": {"models"},
+        "form_requests": {"models"},
+        "middleware": {"models"},
+        "controllers": {"models", "form_requests", "middleware"},
+        "services": {"models", "form_requests"},
+        "tests": {"models", "migrations", "form_requests", "middleware", "controllers", "services"},
+        "seeders": {"models"},
+    },
 )
 
 register_framework(LARAVEL_CONFIG)

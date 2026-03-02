@@ -274,6 +274,32 @@ RUST_AXUM_CONFIG = FrameworkConfig(
     file_structure=RUST_AXUM_FILE_STRUCTURE,
     rules=RUST_AXUM_RULES,
     golden_examples=RUST_AXUM_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/src/models/", "task_type": "general",
+         "description": "SQLx + Serde models from architecture contract tables"},
+        {"name": "error", "path": "backend/src/error.rs", "task_type": "general",
+         "description": "AppError type implementing IntoResponse"},
+        {"name": "middleware", "path": "backend/src/middleware/", "task_type": "auth_code",
+         "description": "Axum middleware for auth and request validation"},
+        {"name": "handlers", "path": "backend/src/handlers/", "task_type": "general",
+         "description": "Axum handler functions using extractors"},
+        {"name": "services", "path": "backend/src/services/", "task_type": "general",
+         "description": "Business logic services called by handlers"},
+        {"name": "routes", "path": "backend/src/routes.rs", "task_type": "general",
+         "description": "Axum Router setup wiring handlers"},
+        {"name": "tests", "path": "backend/tests/", "task_type": "general",
+         "description": "Integration tests for all endpoints"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "error": set(),
+        "middleware": {"models", "error"},
+        "handlers": {"models", "error", "middleware"},
+        "services": {"models", "error"},
+        "routes": {"models", "error", "middleware", "handlers", "services"},
+        "tests": {"models", "error", "middleware", "handlers", "services", "routes"},
+    },
 )
 
 register_framework(RUST_AXUM_CONFIG)

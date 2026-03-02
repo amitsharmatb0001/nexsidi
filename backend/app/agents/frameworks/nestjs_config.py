@@ -348,6 +348,35 @@ NESTJS_CONFIG = FrameworkConfig(
     file_structure=NESTJS_FILE_STRUCTURE,
     rules=NESTJS_RULES,
     golden_examples=NESTJS_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "entity", "path": "backend/src/entities/", "task_type": "general",
+         "description": "TypeORM entities from architecture contract tables"},
+        {"name": "dto", "path": "backend/src/dto/", "task_type": "general",
+         "description": "class-validator DTOs matching entities"},
+        {"name": "guards", "path": "backend/src/guards/auth.guard.ts", "task_type": "auth_code",
+         "description": "NestJS Guards for authentication and authorization"},
+        {"name": "controllers", "path": "backend/src/controllers/", "task_type": "general",
+         "description": "NestJS Controllers with dependency injection"},
+        {"name": "services", "path": "backend/src/services/", "task_type": "general",
+         "description": "NestJS Services with business logic"},
+        {"name": "modules", "path": "backend/src/modules/", "task_type": "general",
+         "description": "NestJS Modules wiring controllers, services, entities"},
+        {"name": "tests", "path": "backend/src/__tests__/", "task_type": "general",
+         "description": "Jest tests for all controllers and services"},
+        {"name": "seed", "path": "backend/src/scripts/seed.ts", "task_type": "general",
+         "description": "Database seed script for development"},
+    ),
+    dependency_graph={
+        "entity": set(),
+        "dto": {"entity"},
+        "guards": {"entity", "dto"},
+        "controllers": {"entity", "dto", "guards"},
+        "services": {"entity", "dto", "guards"},
+        "modules": {"entity", "dto", "guards", "controllers", "services"},
+        "tests": {"entity", "dto", "guards", "controllers", "services", "modules"},
+        "seed": {"entity"},
+    },
 )
 
 register_framework(NESTJS_CONFIG)

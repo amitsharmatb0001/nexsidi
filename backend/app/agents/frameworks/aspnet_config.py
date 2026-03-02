@@ -367,6 +367,32 @@ ASPNET_CONFIG = FrameworkConfig(
     file_structure=ASPNET_FILE_STRUCTURE,
     rules=ASPNET_RULES,
     golden_examples=ASPNET_GOLDEN_EXAMPLES,
+    # OCP-FIX: generation DAG moved here from shubham.py module-level dicts
+    generation_order=(
+        {"name": "models", "path": "backend/Models/", "task_type": "general",
+         "description": "EF Core entities from architecture contract tables"},
+        {"name": "dbcontext", "path": "backend/Data/AppDbContext.cs", "task_type": "general",
+         "description": "Entity Framework DbContext configuration"},
+        {"name": "dto", "path": "backend/DTOs/", "task_type": "general",
+         "description": "DTOs with AutoMapper profiles"},
+        {"name": "middleware", "path": "backend/Middleware/", "task_type": "auth_code",
+         "description": "Auth middleware and JWT validation"},
+        {"name": "services", "path": "backend/Services/", "task_type": "general",
+         "description": "Service layer with business logic"},
+        {"name": "controllers", "path": "backend/Controllers/", "task_type": "general",
+         "description": "API Controllers with DI"},
+        {"name": "tests", "path": "backend/Tests/", "task_type": "general",
+         "description": "xUnit tests for all controllers and services"},
+    ),
+    dependency_graph={
+        "models": set(),
+        "dbcontext": {"models"},
+        "dto": {"models"},
+        "middleware": {"models", "dbcontext"},
+        "services": {"models", "dbcontext", "dto"},
+        "controllers": {"models", "dbcontext", "dto", "middleware", "services"},
+        "tests": {"models", "dbcontext", "dto", "middleware", "services", "controllers"},
+    },
 )
 
 register_framework(ASPNET_CONFIG)

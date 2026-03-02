@@ -6,10 +6,12 @@ All routes under /api/v1/pipeline/. Tenant-scoped.
 from __future__ import annotations
 
 import asyncio
+import io as _io
 import uuid as _uuid
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
 from app.config import get_settings
@@ -553,3 +555,211 @@ async def resume_pipeline(
         created_at=run.created_at.isoformat(),
         error=run.error,
     )
+
+
+# ── IDE-FIX Phase 1 Endpoints ────────────────────────────────────────────────
+
+
+def _lang_from_ext(filename: str) -> str:
+    """IDE-FIX: Map file extension to language identifier for syntax highlighting."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "py": "python",
+        "ts": "typescript",
+        "tsx": "typescript",
+        "js": "javascript",
+        "jsx": "javascript",
+        "sql": "sql",
+        "html": "html",
+        "css": "css",
+        "json": "json",
+    }.get(ext, ext)
+
+
+@router.get("/{run_id}/files/tree")
+async def get_file_tree(
+    run_id: str,
+    ctx: CurrentContext,
+) -> dict:
+    """Return the hierarchical file tree for a completed/running pipeline run.
+
+    IDE-FIX: Enables the frontend IDE sidebar to show the project file structure
+    while the pipeline is running or after it completes.
+    """
+    run_id = _validate_run_id(run_id)
+    orch = get_orchestrator()
+    run = orch.get_run(run_id)
+
+    # Also check DB if not in hot cache
+    if run is None:
+        run = await orch.load_run_metadata(run_id, organization_id=ctx.organization_id)
+
+    if run is None or str(run.organization_id) != str(ctx.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+
+    # Collect files from all agents
+    all_files: dict[str, str] = {}
+    for agent_key in ("shubham", "aanya", "dhruv"):
+        agent_ctx = run.context.get(agent_key, {})
+        if isinstance(agent_ctx, dict):
+            files = agent_ctx.get("file_contents") or agent_ctx.get("sql_files", {})
+            if isinstance(files, dict):
+                all_files.update(files)
+
+    # Build hierarchical tree
+    def _build_tree(paths: dict[str, str]) -> dict:
+        tree: dict = {}
+        for file_path, content in paths.items():
+            parts = file_path.replace("\\", "/").split("/")
+            node = tree
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = {
+                "type": "file",
+                "size": len(content.encode("utf-8")),
+                "language": _lang_from_ext(parts[-1]),
+            }
+        return tree
+
+    return {
+        "run_id": run_id,
+        "total_files": len(all_files),
+        "tree": _build_tree(all_files),
+        "flat": [
+            {
+                "path": p,
+                "size": len(c.encode("utf-8")),
+                "language": _lang_from_ext(p.split("/")[-1]),
+            }
+            for p, c in all_files.items()
+        ],
+    }
+
+
+@router.get("/{run_id}/file")
+async def get_file_content(
+    run_id: str,
+    path: str,
+    ctx: CurrentContext,
+) -> dict:
+    """Return the content of a single generated file.
+
+    IDE-FIX: Enables the frontend Monaco/CodeMirror editor to display
+    individual files with syntax highlighting.
+
+    Query parameter: ?path=backend/app/models.py
+    """
+    run_id = _validate_run_id(run_id)
+    if not path or len(path) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="path query parameter required (max 500 chars)",
+        )
+    # Sanitise path — no traversal
+    safe_path = path.replace("\\", "/").lstrip("/")
+    if ".." in safe_path:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Path traversal not allowed",
+        )
+
+    orch = get_orchestrator()
+    run = orch.get_run(run_id)
+    if run is None:
+        run = await orch.load_run_metadata(run_id, organization_id=ctx.organization_id)
+
+    if run is None or str(run.organization_id) != str(ctx.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+
+    for agent_key in ("shubham", "aanya", "dhruv"):
+        agent_ctx = run.context.get(agent_key, {})
+        if isinstance(agent_ctx, dict):
+            files = agent_ctx.get("file_contents") or agent_ctx.get("sql_files", {})
+            if isinstance(files, dict) and safe_path in files:
+                content = files[safe_path]
+                return {
+                    "path": safe_path,
+                    "content": content,
+                    "language": _lang_from_ext(safe_path.split("/")[-1]),
+                    "size": len(content.encode("utf-8")),
+                    "agent": agent_key,
+                }
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {safe_path}")
+
+
+@router.get("/{run_id}/download")
+async def download_project(
+    run_id: str,
+    ctx: CurrentContext,
+) -> StreamingResponse:
+    """Stream the generated project as a ZIP archive.
+
+    IDE-FIX: Allows users to download the complete generated project.
+    Rebuilds the ZIP on-demand from the persisted context_snapshot.
+    """
+    run_id = _validate_run_id(run_id)
+    orch = get_orchestrator()
+    run = orch.get_run(run_id)
+    if run is None:
+        run = await orch.load_run_metadata(run_id, organization_id=ctx.organization_id)
+
+    if run is None or str(run.organization_id) != str(ctx.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+
+    if run.status not in (PipelineRunStatus.COMPLETED, PipelineRunStatus.PAUSED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Project download unavailable — pipeline status: {run.status.value}. "
+                "Wait for pipeline to complete."
+            ),
+        )
+
+    # Build ZIP from context (DeliveryEngine reads shubham/aanya/karan outputs)
+    from app.engine.delivery import DeliveryEngine  # IDE-FIX: local import avoids circular deps
+    engine = DeliveryEngine()
+    try:
+        package = engine.build_package(run_id, run.context)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build download package: {exc}",
+        ) from exc
+
+    zip_bytes = package.zip_bytes
+    filename = f"nexsidi-project-{run_id[:8]}.zip"
+
+    return StreamingResponse(
+        _io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(zip_bytes)),
+            "X-Manifest-Files": str(package.manifest.total_files),
+        },
+    )
+
+
+@router.post("/{run_id}/cancel", status_code=status.HTTP_200_OK)
+async def cancel_pipeline(
+    run_id: str,
+    ctx: CurrentContext,
+    session: TenantSession,
+) -> dict:
+    """Cancel a running or paused pipeline run.
+
+    IDE-FIX: Emergency stop button — prevents users being locked for 2 hours
+    if they started a pipeline by mistake or with wrong requirements.
+    """
+    run_id = _validate_run_id(run_id)
+    orch = get_orchestrator()
+    cancelled = await orch.cancel_run(run_id, organization_id=ctx.organization_id)
+    if cancelled is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+    if not cancelled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pipeline cannot be cancelled — already in terminal state.",
+        )
+    return {"run_id": run_id, "status": "cancelled", "message": "Pipeline cancellation requested."}

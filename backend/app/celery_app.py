@@ -16,6 +16,34 @@ Usage:
 
     In production, run multiple worker processes behind a process manager
     (systemd, Kubernetes Deployment, Cloud Run Jobs).
+
+Crash Recovery Architecture (NOT fire-and-forget):
+    This Celery setup implements DURABLE pipeline execution via four layers:
+
+    1. acks_late=True + reject_on_worker_lost=True
+       The task stays in the broker queue until fully ACK'd. If the worker
+       process is OOM-killed or crashes, the broker re-delivers the task
+       to the next available worker automatically.
+
+    2. Per-stage DB persistence (pipeline.py _persist_step + _persist_run)
+       After EVERY agent completes, both the step result AND the run state
+       (current_stage, context snapshot) are written to PostgreSQL. The DB
+       is the single source of truth for resumable state.
+
+    3. SoftTimeLimitExceeded handler (pipeline_tasks.py _handle_soft_timeout)
+       200 seconds before the 2h hard kill, a soft timeout fires. The handler
+       updates the run status to INTERRUPTED in the DB via a fresh session,
+       then retries via self.retry(countdown=10).  On retry, the pipeline
+       resumes from the last persisted stage.
+
+    4. Startup crash recovery (pipeline.py recover_interrupted_runs)
+       On server startup, any RUNNING runs are marked INTERRUPTED so the
+       /resume endpoint can pick them up without manual intervention.
+
+    WHY NOT TEMPORAL: Temporal would add operational complexity (separate
+    cluster, SDK dependency, workflow versioning). The four-layer approach
+    above achieves equivalent durability for NexSidi's use case with zero
+    additional infrastructure.
 """
 
 from __future__ import annotations

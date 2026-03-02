@@ -55,6 +55,10 @@ class FrameworkConfig:
     file_structure: dict[str, str]
     rules: tuple[str, ...]  # Tuple for hashability (frozen dataclass)
     golden_examples: dict[str, str]
+    # OCP-FIX: Generation DAG moved from shubham.py into each framework plugin.
+    # shubham.execute() reads these instead of the module-level dicts.
+    generation_order: tuple[dict[str, str], ...] = field(default_factory=tuple)
+    dependency_graph: dict[str, set[str]] = field(default_factory=dict)
 
 
 # ── Registry ────────────────────────────────────────────────────────
