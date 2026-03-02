@@ -1094,6 +1094,17 @@ class PipelineOrchestrator:
         except Exception:
             pass  # WebSocket notification failures must NEVER crash the pipeline
 
+        # WEBHOOK-FIX: Also deliver pipeline.started to registered webhooks
+        try:
+            from app.services.webhook_service import broadcast_webhook_event
+            await broadcast_webhook_event(
+                run.organization_id,
+                "pipeline.started",
+                {"run_id": run.run_id, "project_id": run.project_id},
+            )
+        except Exception:
+            pass
+
         while run.current_stage != PipelineStage.COMPLETED:
             # R27-FIX-21: Only rate-limit stages that actually make AI calls.
             # Checkpoints, delivery, and completed stages consume rate tokens
@@ -1129,6 +1140,42 @@ class PipelineOrchestrator:
                 await self._emit_file_events(run, step_result)
             except Exception:
                 pass
+
+            # WEBHOOK-FIX: Also deliver stage.completed to registered webhooks
+            try:
+                from app.services.webhook_service import broadcast_webhook_event
+                await broadcast_webhook_event(
+                    run.organization_id,
+                    "stage.completed",
+                    {"run_id": run.run_id, "stage": step_result.stage.value, "agent": step_result.agent_name},
+                )
+            except Exception:
+                pass
+
+            # ARTIFACT-FIX: Persist ZIP bytes to DB so download endpoint doesn't
+            # rebuild on every request and ZIP survives context_snapshot purges.
+            if step_result.stage.value == "delivery" and not step_result.skipped:
+                try:
+                    from app.engine.delivery import DeliveryEngine
+                    _engine = DeliveryEngine()
+                    _pkg = _engine.build_package(run.run_id, run.context)
+                    await self._persist_artifact(run.run_id, run.organization_id, _pkg.zip_bytes)
+                except Exception as _e:
+                    logger.warning("artifact_persist_failed", run_id=run.run_id, error=str(_e)[:200])
+
+            # GIT-FIX: Per-stage commit — creates a commit in the repo for each
+            # completed stage so version history is preserved per stage.
+            try:
+                await self._git_stage_commit(run, step_result)
+            except Exception as _git_exc:
+                logger.debug("git_stage_commit_skipped", stage=step_result.stage.value, reason=str(_git_exc)[:100])
+
+            # GIT-FIX: Auto-create PR after delivery stage
+            if step_result.stage.value == "delivery":
+                try:
+                    await self._git_create_pr(run)
+                except Exception as _pr_exc:
+                    logger.debug("git_auto_pr_skipped", reason=str(_pr_exc)[:100])
 
             # REVIEW-FIX: Track per-step status in context for observability.
             # Stores the last completed/failed stage name and agent so the
@@ -1255,12 +1302,32 @@ class PipelineOrchestrator:
                 )
             except Exception:
                 pass
+            # WEBHOOK-FIX: Also deliver pipeline.completed to registered webhooks
+            try:
+                from app.services.webhook_service import broadcast_webhook_event
+                await broadcast_webhook_event(
+                    run.organization_id,
+                    "pipeline.completed",
+                    {"run_id": run.run_id, "project_id": run.project_id},
+                )
+            except Exception:
+                pass
         elif run.status == PipelineRunStatus.FAILED:
             try:
                 await notify_pipeline_event(
                     run.run_id,
                     "pipeline_failed",
                     data={"error": str(run.error or "")[:200]},
+                )
+            except Exception:
+                pass
+            # WEBHOOK-FIX: Also deliver pipeline.failed to registered webhooks
+            try:
+                from app.services.webhook_service import broadcast_webhook_event
+                await broadcast_webhook_event(
+                    run.organization_id,
+                    "pipeline.failed",
+                    {"run_id": run.run_id, "project_id": run.project_id, "error": str(run.error or "")[:200]},
                 )
             except Exception:
                 pass
@@ -1445,6 +1512,18 @@ class PipelineOrchestrator:
             pass  # Status is set in-memory; DB update is best-effort
 
         logger.info("pipeline_cancelled", run_id=run_id, organization_id=organization_id)
+
+        # WEBHOOK-FIX: Also deliver pipeline.cancelled to registered webhooks
+        try:
+            from app.services.webhook_service import broadcast_webhook_event
+            await broadcast_webhook_event(
+                run.organization_id,
+                "pipeline.cancelled",
+                {"run_id": run.run_id, "project_id": run.project_id},
+            )
+        except Exception:
+            pass
+
         return True
 
     async def recover_interrupted_runs(self) -> int:
@@ -1804,6 +1883,77 @@ class PipelineOrchestrator:
             except Exception:
                 pass  # Never crash pipeline on WS failure
 
+    async def _persist_artifact(self, run_id: str, organization_id: str, zip_bytes: bytes) -> None:
+        """Persist ZIP artifact to DB. ARTIFACT-FIX."""
+        from app.database import get_admin_session_factory, get_session_factory
+        from sqlalchemy import text
+        factory = get_admin_session_factory() or get_session_factory()
+        async with factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text("UPDATE pipeline.runs SET artifact_data = :data WHERE id = :id::uuid"),
+                    {"data": zip_bytes, "id": run_id},
+                )
+
+    async def _git_stage_commit(self, run: PipelineRun, step_result: StepResult) -> None:
+        """Commit generated files to git after each stage. GIT-FIX.
+
+        Only commits if git_config exists in run.context (set by user when
+        starting pipeline with git integration enabled).
+        """
+        git_config = run.context.get("git_config")
+        if not git_config or step_result.skipped:
+            return
+
+        from app.agents.git_agent import GitAgent
+        agent = GitAgent()
+
+        # Collect files generated in this stage
+        files: dict[str, str] = {}
+        agent_name = step_result.agent_name.lower() if step_result.agent_name else ""
+        for key in ("shubham", "aanya", "dhruv"):
+            if agent_name == key or not agent_name:
+                sub = run.context.get(key, {})
+                if isinstance(sub, dict):
+                    files.update(sub.get("file_contents", {}))
+                    files.update(sub.get("sql_files", {}))
+
+        if not files:
+            return
+
+        # Create branch for checkpoints
+        branch = git_config.get("branch", "main")
+        if step_result.stage.value in ("checkpoint_design", "checkpoint_testing"):
+            branch = f"checkpoint/{step_result.stage.value}"
+
+        await agent.commit_files(
+            repo_url=git_config["repo_url"],
+            token=git_config["token"],
+            files=files,
+            message=f"feat({step_result.stage.value}): generated by {step_result.agent_name or 'pipeline'} [{run.run_id[:8]}]",
+            branch=branch,
+        )
+
+    async def _git_create_pr(self, run: PipelineRun) -> None:
+        """Auto-create PR after delivery stage if git_config has auto_pr. GIT-FIX."""
+        git_config = run.context.get("git_config")
+        if not git_config:
+            return
+        # Only create PR when auto_pr is truthy
+        auto_pr = git_config.get("auto_pr", "false")
+        if str(auto_pr).lower() not in ("true", "1", "yes"):
+            return
+
+        from app.agents.git_agent import GitAgent
+        agent = GitAgent()
+        if hasattr(agent, "create_pull_request"):
+            await agent.create_pull_request(
+                repo_url=git_config["repo_url"],
+                token=git_config.get("token", ""),
+                pipeline_run_id=run.run_id,
+                context=run.context,
+            )
+
     async def _handle_checkpoint(
         self, run: PipelineRun, stage: PipelineStage
     ) -> StepResult:
@@ -1854,6 +2004,18 @@ class PipelineOrchestrator:
             run_id=run.run_id,
             stage=stage.value,
         )
+
+        # WEBHOOK-FIX: Deliver checkpoint.waiting to registered webhooks
+        try:
+            from app.services.webhook_service import broadcast_webhook_event
+            await broadcast_webhook_event(
+                run.organization_id,
+                "checkpoint.waiting",
+                {"run_id": run.run_id, "project_id": run.project_id, "stage": stage.value},
+            )
+        except Exception:
+            pass
+
         return step
 
 

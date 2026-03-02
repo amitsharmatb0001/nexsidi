@@ -320,6 +320,21 @@ class Pranav:
         if result.error:
             output["error"] = result.error
 
+        # SMOKE-FIX: Run automated smoke tests against deployed URL
+        if result.status == DeployStatus.LIVE and result.deployment_url:
+            try:
+                smoke_results = await _run_smoke_tests(result.deployment_url)
+                output["smoke_tests"] = smoke_results
+                logger.info(
+                    "smoke_tests_complete",
+                    url=result.deployment_url,
+                    passed=smoke_results["passed"],
+                    failed=smoke_results["failed"],
+                )
+            except Exception as exc:
+                logger.warning("smoke_tests_error", url=result.deployment_url, error=str(exc)[:200])
+                output["smoke_tests"] = {"error": str(exc)[:200], "passed": 0, "failed": 0, "checks": []}
+
         await store_output(self, pipeline_run_id, output)
 
         logger.info(
@@ -465,6 +480,40 @@ class Pranav:
             health_check_passed=health_passed,
             duration_seconds=elapsed,
         )
+
+
+# -- Smoke Tests ---------------------------------------------------------------
+
+
+async def _run_smoke_tests(deployment_url: str) -> dict[str, Any]:
+    """Smoke test the deployed application. SMOKE-FIX."""
+    import httpx
+    results: dict[str, Any] = {"checks": [], "passed": 0, "failed": 0}
+
+    checks = [
+        ("health", "GET", f"{deployment_url}/health", 200),
+        ("root", "GET", deployment_url, [200, 301, 302]),
+        ("ssl", "HTTPS", deployment_url, None),
+    ]
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=True) as client:
+        for name, method, url, expected_status in checks:
+            if method == "HTTPS":
+                check: dict[str, Any] = {"name": "ssl", "passed": url.startswith("https://"), "detail": "HTTPS enforced"}
+                results["checks"].append(check)
+                results["passed" if check["passed"] else "failed"] += 1
+                continue
+            try:
+                resp = await client.get(url)
+                expected = [expected_status] if isinstance(expected_status, int) else expected_status
+                passed = resp.status_code in expected
+                results["checks"].append({"name": name, "url": url, "status": resp.status_code, "passed": passed, "latency_ms": int(resp.elapsed.total_seconds() * 1000)})
+                results["passed" if passed else "failed"] += 1
+            except Exception as exc:
+                results["checks"].append({"name": name, "url": url, "passed": False, "error": str(exc)[:100]})
+                results["failed"] += 1
+
+    return results
 
 
 # -- Helpers -------------------------------------------------------------------

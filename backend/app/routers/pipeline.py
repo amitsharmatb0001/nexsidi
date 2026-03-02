@@ -174,6 +174,11 @@ async def start_pipeline(
     if body.requirements:
         run.context["__requirements__"] = body.requirements
 
+    # GIT-FIX: Store git_config in context so pipeline can use it for
+    # per-stage commits and auto-PR creation.
+    if body.git_config:
+        run.context["git_config"] = body.git_config
+
     # R15-FIX: Persist the run to DB BEFORE dispatching to Celery or returning
     # the response. save_run() syncs run.run_id with the DB-generated UUID.
     # Without this, the Celery task receives the old in-memory UUID which
@@ -716,18 +721,36 @@ async def download_project(
             ),
         )
 
-    # Build ZIP from context (DeliveryEngine reads shubham/aanya/karan outputs)
-    from app.engine.delivery import DeliveryEngine  # IDE-FIX: local import avoids circular deps
-    engine = DeliveryEngine()
-    try:
-        package = engine.build_package(run_id, run.context)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to build download package: {exc}",
-        ) from exc
+    # ARTIFACT-FIX: Try DB-stored artifact first (fast path).
+    # Falls back to on-demand rebuild from context_snapshot if not stored yet.
+    from app.database import get_admin_session_factory, get_session_factory
+    from sqlalchemy import text as _text
 
-    zip_bytes = package.zip_bytes
+    factory = get_admin_session_factory() or get_session_factory()
+    zip_bytes: bytes | None = None
+    async with factory() as _session:
+        async with _session.begin():
+            row = await _session.execute(
+                _text("SELECT artifact_data FROM pipeline.runs WHERE id = :id::uuid"),
+                {"id": run_id},
+            )
+            result = row.fetchone()
+            if result and result[0]:
+                zip_bytes = bytes(result[0])
+
+    if not zip_bytes:
+        # On-demand rebuild from context_snapshot
+        from app.engine.delivery import DeliveryEngine  # IDE-FIX: local import avoids circular deps
+        engine = DeliveryEngine()
+        try:
+            package = engine.build_package(run_id, run.context)
+            zip_bytes = package.zip_bytes
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to build download package: {exc}",
+            ) from exc
+
     filename = f"nexsidi-project-{run_id[:8]}.zip"
 
     return StreamingResponse(
@@ -736,7 +759,6 @@ async def download_project(
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Content-Length": str(len(zip_bytes)),
-            "X-Manifest-Files": str(package.manifest.total_files),
         },
     )
 
@@ -763,3 +785,196 @@ async def cancel_pipeline(
             detail="Pipeline cannot be cancelled — already in terminal state.",
         )
     return {"run_id": run_id, "status": "cancelled", "message": "Pipeline cancellation requested."}
+
+
+# ── COST-FIX: Token usage and cost breakdown ──────────────────────────────────
+
+
+@router.get("/{run_id}/cost")
+async def get_pipeline_cost(
+    run_id: str,
+    ctx: CurrentContext,
+    session: TenantSession,
+) -> dict:
+    """Return token usage and cost breakdown per agent for this pipeline run.
+
+    COST-FIX: Reads token counts from pipeline.steps table and calculates
+    estimated API cost in USD and INR.
+    """
+    from sqlalchemy import text
+
+    from app.services.cost_service import calculate_pipeline_cost  # COST-FIX
+
+    run_id = _validate_run_id(run_id)
+    # Verify ownership
+    orch = get_orchestrator()
+    run = orch.get_run(run_id)
+    if run is None:
+        run = await orch.load_run_metadata(run_id, organization_id=ctx.organization_id)
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+    if str(run.organization_id) != str(ctx.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+
+    # Read steps from DB
+    rows = await session.execute(
+        text(
+            "SELECT agent_name, stage, model_used, input_tokens, output_tokens,"
+            " cache_read_tokens, cache_write_tokens"
+            " FROM pipeline.steps WHERE run_id = :rid::uuid ORDER BY step_order"
+        ),
+        {"rid": run_id},
+    )
+    steps_data = [dict(r._mapping) for r in rows.fetchall()]
+    cost = calculate_pipeline_cost(run_id, steps_data)
+
+    return {
+        "run_id": run_id,
+        "total_cost_usd": round(cost.total_cost_usd, 6),
+        "total_cost_inr": round(cost.total_cost_inr, 4),
+        "estimated_cache_savings_usd": round(cost.estimated_savings_usd, 6),
+        "total_input_tokens": cost.total_input_tokens,
+        "total_output_tokens": cost.total_output_tokens,
+        "total_cache_read_tokens": cost.total_cache_read_tokens,
+        "agents": [
+            {
+                "agent": a.agent,
+                "stage": a.stage,
+                "model": a.model,
+                "input_tokens": a.input_tokens,
+                "output_tokens": a.output_tokens,
+                "cache_read_tokens": a.cache_read_tokens,
+                "cost_usd": round(a.cost_usd, 6),
+                "cost_inr": round(a.cost_inr, 4),
+            }
+            for a in cost.agents
+        ],
+    }
+
+
+# ── VERSION-FIX: Stage history / version history view ────────────────────────
+
+
+@router.get("/{run_id}/stages")
+async def get_pipeline_stages(
+    run_id: str,
+    ctx: CurrentContext,
+    session: TenantSession,
+) -> dict:
+    """Return all completed stages with timing, tokens, and output summary.
+
+    VERSION-FIX: Enables version history view — user can see which agent
+    ran which stage, how long it took, and how many tokens it used.
+    """
+    from sqlalchemy import text
+
+    run_id = _validate_run_id(run_id)
+    orch = get_orchestrator()
+    run = orch.get_run(run_id)
+    if run is None:
+        run = await orch.load_run_metadata(run_id, organization_id=ctx.organization_id)
+    if run is None or str(run.organization_id) != str(ctx.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+
+    rows = await session.execute(
+        text("""
+            SELECT stage, agent_name, status, model_used,
+                   input_tokens, output_tokens, cache_read_tokens,
+                   started_at, completed_at, step_order, cycle,
+                   EXTRACT(EPOCH FROM (completed_at - started_at)) as duration_secs
+            FROM pipeline.steps WHERE run_id = :rid::uuid
+            ORDER BY step_order ASC
+        """),
+        {"rid": run_id},
+    )
+
+    stages = []
+    for r in rows.fetchall():
+        stages.append(
+            {
+                "stage": r.stage,
+                "agent": r.agent_name,
+                "status": r.status,
+                "model": r.model_used,
+                "input_tokens": r.input_tokens or 0,
+                "output_tokens": r.output_tokens or 0,
+                "cache_read_tokens": r.cache_read_tokens or 0,
+                "duration_secs": round(float(r.duration_secs or 0), 2),
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+                "cycle": r.cycle or 0,
+            }
+        )
+
+    return {"run_id": run_id, "total_stages": len(stages), "stages": stages}
+
+
+# ── PREVIEW-FIX: In-browser static preview ───────────────────────────────────
+
+from fastapi.responses import HTMLResponse  # PREVIEW-FIX
+
+
+@router.get("/{run_id}/preview", response_class=HTMLResponse)  # PREVIEW-FIX
+async def preview_project(run_id: str, ctx: CurrentContext) -> HTMLResponse:
+    """Serve a static in-browser preview of the generated frontend.
+
+    PREVIEW-FIX: For projects with a generated index.html, serves it directly
+    in the browser as an iframe preview. Only works for static/SSG frontends.
+    Falls back to a file listing page for non-static projects.
+    """
+    run_id = _validate_run_id(run_id)
+    orch = get_orchestrator()
+    run = orch.get_run(run_id)
+    if run is None:
+        run = await orch.load_run_metadata(run_id, organization_id=ctx.organization_id)
+    if run is None or str(run.organization_id) != str(ctx.organization_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline run not found")
+
+    # Try to find index.html in generated files
+    aanya_ctx = run.context.get("aanya", {})
+    files: dict[str, str] = aanya_ctx.get("file_contents", {}) if isinstance(aanya_ctx, dict) else {}
+
+    index_html = (
+        files.get("index.html") or
+        files.get("src/index.html") or
+        files.get("public/index.html") or
+        files.get("dist/index.html")
+    )
+
+    if index_html:
+        return HTMLResponse(content=index_html)
+
+    # No index.html — return a styled file listing page
+    file_list = "".join(
+        f"<li><code>{path}</code> <small>({len(content)} chars)</small></li>"
+        for path, content in sorted(files.items())[:50]
+    )
+    total_files = len(files)
+    shubham_ctx = run.context.get("shubham", {})
+    backend_files = shubham_ctx.get("file_contents", {}) if isinstance(shubham_ctx, dict) else {}
+    all_files = total_files + len(backend_files)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>NexSidi Project Preview — {run_id[:8]}</title>
+  <style>
+    body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 1rem; background: #0f0f0f; color: #e0e0e0; }}
+    h1 {{ color: #7c3aed; }} h2 {{ color: #a78bfa; }}
+    code {{ background: #1e1e2e; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }}
+    ul {{ list-style: none; padding: 0; }} li {{ padding: 4px 0; border-bottom: 1px solid #222; }}
+    .badge {{ background: #7c3aed; color: white; padding: 2px 8px; border-radius: 12px; font-size: 0.75em; margin-left: 8px; }}
+    .tip {{ background: #1e1e2e; border-left: 4px solid #7c3aed; padding: 1rem; margin: 1rem 0; border-radius: 0 8px 8px 0; }}
+  </style>
+</head>
+<body>
+  <h1>NexSidi Preview</h1>
+  <p>Run <code>{run_id}</code> <span class="badge">{run.status.value}</span></p>
+  <div class="tip">This project has <strong>{all_files} generated files</strong>. Use <code>GET /pipeline/{run_id}/download</code> to download the full ZIP or <code>GET /pipeline/{run_id}/files/tree</code> for the file tree.</div>
+  <h2>Frontend Files ({total_files})</h2>
+  <ul>{file_list or "<li>No frontend files generated yet</li>"}</ul>
+  {'<p><em>…and more</em></p>' if total_files > 50 else ''}
+</body>
+</html>"""
+    return HTMLResponse(content=html)

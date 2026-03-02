@@ -59,6 +59,11 @@ class PipelineStartRequest(BaseModel):
     project_id: uuid.UUID
     execution_mode: str = Field("checkpoint", pattern="^(step_by_step|checkpoint|direct)$")
     requirements: str = Field("", max_length=10000)
+    git_config: dict[str, str] | None = Field(
+        None,
+        description="Optional git integration config: {repo_url, token, branch, auto_pr}",
+        json_schema_extra={"example": {"repo_url": "https://github.com/user/repo", "branch": "main", "auto_pr": "true"}}
+    )  # GIT-FIX
 
 
 class PipelineStatusResponse(BaseModel):

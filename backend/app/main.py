@@ -293,6 +293,9 @@ def create_app() -> FastAPI:
     from app.routers.chat import router as chat_router
     from app.routers.notifications import router as notifications_router
     from app.routers.websocket import router as ws_router
+    from app.routers.analytics import router as analytics_router  # ANALYTICS-FIX
+    from app.routers.webhooks import router as webhooks_router
+    from app.routers.templates import router as templates_router  # TEMPLATE-FIX
 
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(projects_router, prefix="/api/v1/projects", tags=["projects"])
@@ -300,6 +303,9 @@ def create_app() -> FastAPI:
     app.include_router(chat_router, prefix="/api/v1/chat", tags=["chat"])
     app.include_router(notifications_router, prefix="/api/v1/notifications", tags=["notifications"])
     app.include_router(ws_router, prefix="/api/v1", tags=["websocket"])
+    app.include_router(analytics_router, prefix="/api/v1", tags=["analytics"])  # ANALYTICS-FIX
+    app.include_router(webhooks_router, prefix="/api/v1/webhooks", tags=["webhooks"])
+    app.include_router(templates_router, prefix="/api/v1/templates", tags=["templates"])  # TEMPLATE-FIX
 
     return app
 
