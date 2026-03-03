@@ -207,9 +207,12 @@ class VoiceToTextService:
         audio_format = self.detect_format(mime_type, filename)
         estimated_duration = len(content) / BYTES_PER_SECOND_ESTIMATE
 
+        import base64 as _base64  # VTT-FIX
         import os  # VTT-FIX
 
         import httpx as _httpx  # VTT-FIX
+
+        from app.config import get_settings  # VTT-FIX
 
         language_code = language_hint if language_hint in SUPPORTED_LANGUAGES else "en"
         language_name = SUPPORTED_LANGUAGES.get(language_code, "English")
@@ -224,39 +227,132 @@ class VoiceToTextService:
             language_hint=language_hint,
         )
 
-        # VTT-FIX: Try OpenAI Whisper API; fallback to placeholder if key absent
-        openai_key = os.environ.get("OPENAI_API_KEY", "")
-        if openai_key:
-            try:
-                async with _httpx.AsyncClient(timeout=60.0) as client:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/audio/transcriptions",
-                        headers={"Authorization": f"Bearer {openai_key}"},
-                        files={
-                            "file": (filename or "audio.ogg", content, mime_type),
-                        },
-                        data={
-                            "model": "whisper-1",
-                            "language": language_code if language_code != "en" else "",
-                            "response_format": "json",
-                        },
-                    )
-                if resp.status_code == 200:
-                    text = resp.json().get("text", "")
-                    return TranscriptionResult(
-                        status=TranscriptionStatus.COMPLETED,
-                        text=text,
-                        language_code=language_code,
-                        language_name=language_name,
-                        confidence=0.95,
-                        duration_seconds=estimated_duration,
-                        word_count=len(text.split()) if text else 0,
-                    )
-                logger.warning("whisper_api_error", status=resp.status_code)
-            except _httpx.RequestError as exc:
-                logger.warning("whisper_api_request_error", error=str(exc)[:80])
+        settings = get_settings()
+        google_key: str = settings.google_ai_api_key or os.environ.get("GOOGLE_AI_API_KEY", "")
 
-        # VTT-FIX: Structured placeholder when API key absent or API unavailable
+        # VTT-FIX: PATH A — Gemini 2.5 Flash audio transcription
+        # Gemini accepts inline base64 audio via the generateContent API.
+        # Uses the same google_ai_api_key already configured in ai_router.
+        if google_key:
+            try:
+                b64_audio = _base64.b64encode(content).decode("ascii")
+                prompt = (
+                    f"Transcribe the following audio exactly as spoken. "
+                    f"Language: {language_name}. "
+                    "Return ONLY the transcribed text, no commentary."
+                )
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": prompt},
+                            {
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": b64_audio,
+                                },
+                            },
+                        ],
+                    }],
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "maxOutputTokens": 2048,
+                    },
+                }
+                gemini_model = "gemini-2.5-flash"
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{gemini_model}:generateContent?key={google_key}"
+                )
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(url, json=payload)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    text = (
+                        data.get("candidates", [{}])[0]
+                        .get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                        .strip()
+                    )
+                    if text:
+                        logger.info("vtt_gemini_ok", chars=len(text))
+                        return TranscriptionResult(
+                            status=TranscriptionStatus.COMPLETED,
+                            text=text,
+                            language_code=language_code,
+                            language_name=language_name,
+                            confidence=0.95,
+                            duration_seconds=estimated_duration,
+                            word_count=len(text.split()),
+                        )
+                logger.warning("vtt_gemini_error", status=resp.status_code)
+            except _httpx.RequestError as exc:
+                logger.warning("vtt_gemini_request_error", error=str(exc)[:80])
+
+        # VTT-FIX: PATH B — Google Cloud Speech-to-Text REST API (v1)
+        # Uses the same Google API key as fallback.
+        if google_key:
+            try:
+                b64_audio = _base64.b64encode(content).decode("ascii")
+                # Map AudioFormat to Speech-to-Text encoding enum
+                _encoding_map = {
+                    "ogg": "OGG_OPUS",
+                    "mp3": "MP3",
+                    "wav": "LINEAR16",
+                    "webm": "WEBM_OPUS",
+                    "m4a": "MP4",
+                    "mp4": "MP4",
+                }
+                fmt_name = (
+                    audio_format.value if audio_format else "ogg"
+                )
+                encoding = _encoding_map.get(fmt_name, "OGG_OPUS")
+                stt_payload = {
+                    "config": {
+                        "encoding": encoding,
+                        "sampleRateHertz": 16000,
+                        "languageCode": language_code,
+                        "alternativeLanguageCodes": ["en-US"],
+                        "enableAutomaticPunctuation": True,
+                    },
+                    "audio": {"content": b64_audio},
+                }
+                stt_url = (
+                    "https://speech.googleapis.com/v1/speech:recognize"
+                    f"?key={google_key}"
+                )
+                async with _httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(stt_url, json=stt_payload)
+
+                if resp.status_code == 200:
+                    results = resp.json().get("results", [])
+                    text = " ".join(
+                        r.get("alternatives", [{}])[0].get("transcript", "")
+                        for r in results
+                    ).strip()
+                    if text:
+                        confidence = (
+                            results[0].get("alternatives", [{}])[0]
+                            .get("confidence", 0.9)
+                            if results else 0.9
+                        )
+                        logger.info("vtt_stt_ok", chars=len(text))
+                        return TranscriptionResult(
+                            status=TranscriptionStatus.COMPLETED,
+                            text=text,
+                            language_code=language_code,
+                            language_name=language_name,
+                            confidence=float(confidence),
+                            duration_seconds=estimated_duration,
+                            word_count=len(text.split()),
+                        )
+                logger.warning("vtt_stt_error", status=resp.status_code)
+            except _httpx.RequestError as exc:
+                logger.warning("vtt_stt_request_error", error=str(exc)[:80])
+
+        # VTT-FIX: PATH C — Placeholder fallback when no API key configured
+        logger.info("vtt_placeholder_fallback", reason="no_google_key" if not google_key else "api_failed")
         return TranscriptionResult(
             status=TranscriptionStatus.COMPLETED,
             text=f"[Transcription from {filename or 'audio'} ({language_name})]",
