@@ -40,7 +40,7 @@ class ResearchAgent:
 
     name = "research"
     display_name = "Research Agent"
-    default_complexity = TaskComplexity.SIMPLE
+    default_complexity = TaskComplexity.LOW
     default_model = "gemini-flash"  # Use Gemini for Google Search Grounding
 
     def __init__(self, pipeline_run_id: str) -> None:

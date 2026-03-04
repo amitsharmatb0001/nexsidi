@@ -191,7 +191,7 @@ def validate_contract(contract: Any) -> list[str]:
         value = getattr(contract, f.name)
 
         # Required string fields must be non-empty
-        if f.type in ("str", "str | None") and isinstance(value, str) and not value and f.default is not "":
+        if f.type in ("str", "str | None") and isinstance(value, str) and not value and f.default != "":
             # Only flag if there's no explicit default of ""
             if f.default != "":
                 violations.append(f"{contract_name}.{f.name}: required string is empty")

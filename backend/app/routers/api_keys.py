@@ -128,7 +128,7 @@ async def list_api_keys(
     return [_key_response(k) for k in keys]
 
 
-@router.delete("/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{key_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None)
 async def revoke_api_key(
     key_id: uuid.UUID,
     ctx: AdminContext,
