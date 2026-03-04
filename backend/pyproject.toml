@@ -39,6 +39,9 @@ dependencies = [
     "google-cloud-secret-manager>=2.21.0",
     "google-auth>=2.36.0",
 
+    # Email
+    "aiosmtplib>=3.0.0",
+
     # Utilities
     "python-dotenv>=1.0.1",
     "orjson>=3.10.0",
