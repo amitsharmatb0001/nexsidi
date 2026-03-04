@@ -122,10 +122,12 @@ MODELS: dict[str, ModelSpec] = {
         supports_thinking=True,
         max_output_tokens=65536,
     ),
+    # MODEL-FIX: gemini-3-flash-preview doesn't exist on Vertex AI yet.
+    # Use gemini-2.5-flash (best available flash model).
     "gemini-3-flash": ModelSpec(
-        model_id="gemini-3-flash-preview",
+        model_id="gemini-2.5-flash",
         provider=Provider.GOOGLE,
-        display_name="Gemini 3 Flash Preview",
+        display_name="Gemini 2.5 Flash (Mid)",
         cost_tier=2,
         supports_thinking=True,
         max_output_tokens=65536,
@@ -147,19 +149,22 @@ MODELS: dict[str, ModelSpec] = {
         supports_thinking=True,
         max_output_tokens=64000,
     ),
+    # MODEL-FIX: gemini-3-pro-preview and gemini-3.1-pro-preview don't exist
+    # on Vertex AI yet. Use gemini-2.5-pro (the best available Gemini model)
+    # for high/critical complexity tasks until Gemini 3 is released.
     "gemini-3-pro": ModelSpec(
-        model_id="gemini-3-pro-preview",
+        model_id="gemini-2.5-pro",
         provider=Provider.GOOGLE,
-        display_name="Gemini 3 Pro Preview",
+        display_name="Gemini 2.5 Pro (High)",
         cost_tier=3,
         supports_thinking=True,
         max_output_tokens=65536,
     ),
     # ── Tier 4: Advanced reasoning ──
     "gemini-3.1-pro": ModelSpec(
-        model_id="gemini-3.1-pro-preview",
+        model_id="gemini-2.5-pro",
         provider=Provider.GOOGLE,
-        display_name="Gemini 3.1 Pro Preview",
+        display_name="Gemini 2.5 Pro (Critical)",
         cost_tier=4,
         supports_thinking=True,
         max_output_tokens=65536,

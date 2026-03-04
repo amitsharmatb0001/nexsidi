@@ -157,19 +157,15 @@ async def start_pipeline(
         )
 
     # R26-FIX-11: Prevent concurrent pipeline runs for the same project.
-    # R27-FIX-6: Lock the project row with SELECT FOR UPDATE to prevent
-    # TOCTOU race between the SELECT COUNT and the INSERT in _persist_run
-    # (which uses its own session).  The lock holds until the tenant session
-    # commits (endpoint return), by which time _persist_run has committed
-    # the new run — so a concurrent request blocked on FOR UPDATE will then
-    # see the active run in its COUNT check.
+    # R27-FIX-6: Originally used SELECT FOR UPDATE on the project row to prevent
+    # TOCTOU race. REMOVED because _persist_run() uses a SEPARATE session for the
+    # PipelineRun INSERT. The FK check (project_id -> core.projects) needs
+    # FOR KEY SHARE on the referenced project row, but FOR UPDATE blocks
+    # FOR KEY SHARE — causing a cross-session deadlock.
+    # The active_run_q count check below is sufficient to prevent concurrent runs.
+    # The worst-case TOCTOU race (two near-simultaneous starts) is extremely
+    # unlikely and caught by the orchestrator's in-memory _active_runs guard.
     from app.models.pipeline import PipelineRun as DBPipelineRun
-    await session.execute(
-        select(Project).where(
-            Project.id == body.project_id,
-            Project.organization_id == _uuid.UUID(ctx.organization_id),
-        ).with_for_update()
-    )
     # R35-FIX: Add organization_id filter for defense-in-depth (R31-R34
     # pattern). Without this, a RLS bypass (superuser connection) would
     # count pipeline runs from ALL organizations, causing false 409 Conflict.

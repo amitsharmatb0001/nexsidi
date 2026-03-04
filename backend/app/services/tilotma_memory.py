@@ -295,8 +295,15 @@ class TilotmaMemory:
         missing = ", ".join(pu.missing_information) if pu.missing_information else "None"
         concerns = ", ".join(pu.quality_concerns) if pu.quality_concerns else "None"
 
+        # FORMAT-FIX: confidence_level may be a string from JSON parsing.
+        # Coerce to float before using :.0% format spec.
+        try:
+            confidence_pct = f"{float(pu.confidence_level):.0%}"
+        except (ValueError, TypeError):
+            confidence_pct = str(pu.confidence_level)
+
         return (
-            f"Project Understanding (Confidence: {pu.confidence_level:.0%}):\n"
+            f"Project Understanding (Confidence: {confidence_pct}):\n"
             f"{pu.current_understanding}\n\n"
             f"Project Type: {pu.project_type or 'Unknown'}\n"
             f"Key Features: {', '.join(pu.key_features) if pu.key_features else 'None'}\n"

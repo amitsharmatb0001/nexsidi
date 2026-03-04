@@ -1956,6 +1956,11 @@ class PipelineOrchestrator:
             run.context["tilotma_mode"] = "review"
         elif agent_name == "tilotma" and stage == PipelineStage.REQUIREMENTS:
             run.context.pop("tilotma_mode", None)  # Ensure requirements mode
+            # CONTEXT-FIX: Tilotma reads "user_input" from context, but the
+            # pipeline router stores requirements as "__requirements__". Bridge
+            # the gap so Tilotma gets the user's project description.
+            if "__requirements__" in run.context and "user_input" not in run.context:
+                run.context["user_input"] = run.context["__requirements__"]
 
         # R11-FIX: Wrap agent.run() so crashed steps still get a StepResult
         # record in the database (for post-mortem diagnostics). Previously,

@@ -404,12 +404,25 @@ class Vikram:
                 )
 
         if _written_contract is None:
-            return AgentResult(
-                agent_name=self.name,
-                status=AgentStatus.FAILED,
-                error="Failed to generate architecture contract",
-                output={"raw_response": response.content},
-            )
+            # VIKRAM-FIX: Before failing, try to use the previous successful
+            # contract from context (stored by store_output on earlier retries).
+            # This prevents pipeline abort when the 3rd challenge-retry returns
+            # an empty/unparseable response but a valid contract already exists.
+            previous_contract = context.get("vikram", {}).get("contract")
+            if previous_contract and isinstance(previous_contract, dict):
+                logger.warning(
+                    "vikram_using_previous_contract",
+                    reason="AI returned empty/unparseable — falling back to last successful contract",
+                )
+                _written_contract = previous_contract
+                _validation_errors = validate_contract(_written_contract)
+            else:
+                return AgentResult(
+                    agent_name=self.name,
+                    status=AgentStatus.FAILED,
+                    error="Failed to generate architecture contract",
+                    output={"raw_response": response.content},
+                )
 
         if _validation_errors:
             logger.warning(
@@ -449,8 +462,14 @@ class Vikram:
         )
 
     def _parse_contract(self, content: str) -> dict[str, Any] | None:
-        """Parse JSON from AI response, handling markdown code blocks."""
-        # Strip markdown code fences if present
+        """Parse JSON from AI response, handling markdown code blocks.
+
+        Tries multiple strategies:
+        1. Strip markdown fences and parse directly
+        2. Find the first/largest JSON object in the text
+        3. Find JSON inside code blocks anywhere in the text
+        """
+        # Strategy 1: Strip markdown code fences if present
         cleaned = content.strip()
         if cleaned.startswith("```"):
             lines = cleaned.split("\n")
@@ -467,8 +486,44 @@ class Vikram:
         try:
             return orjson.loads(cleaned.encode("utf-8"))
         except orjson.JSONDecodeError:
-            logger.error("contract_json_parse_failed", content_preview=cleaned[:200])
-            return None
+            pass
+
+        # Strategy 2: Find the largest JSON object in the text
+        # AI sometimes embeds JSON in explanatory text
+        import re as _re
+        json_blocks = _re.findall(r'```(?:json)?\s*\n([\s\S]*?)\n```', content)
+        for block in json_blocks:
+            try:
+                parsed = orjson.loads(block.strip().encode("utf-8"))
+                if isinstance(parsed, dict) and ("api" in parsed or "database" in parsed or "tech_stack" in parsed):
+                    logger.info("contract_extracted_from_code_block")
+                    return parsed
+            except orjson.JSONDecodeError:
+                continue
+
+        # Strategy 3: Find the first { ... } that looks like a contract
+        brace_start = content.find("{")
+        if brace_start >= 0:
+            # Find the matching closing brace by tracking nesting
+            depth = 0
+            for i in range(brace_start, len(content)):
+                if content[i] == "{":
+                    depth += 1
+                elif content[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = content[brace_start : i + 1]
+                        try:
+                            parsed = orjson.loads(candidate.encode("utf-8"))
+                            if isinstance(parsed, dict) and len(parsed) >= 2:
+                                logger.info("contract_extracted_from_brace_match")
+                                return parsed
+                        except orjson.JSONDecodeError:
+                            pass
+                        break
+
+        logger.error("contract_json_parse_failed", content_preview=cleaned[:200])
+        return None
 
 
 # Register the agent

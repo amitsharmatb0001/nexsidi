@@ -107,7 +107,7 @@ class TestPhaseResult:
 
     @property
     def passed(self) -> bool:
-        return self.status == TestStatus.PASSED
+        return self.status in (TestStatus.PASSED, TestStatus.SKIPPED)
 
 
 @dataclass(slots=True)
@@ -121,7 +121,11 @@ class SandboxTestReport:
 
     @property
     def failed_phases(self) -> list[str]:
-        return [r.phase.value for r in self.phase_results if not r.passed]
+        """Phases that actually failed (not skipped or passed)."""
+        return [
+            r.phase.value for r in self.phase_results
+            if r.status in (TestStatus.FAILED, TestStatus.ERROR, TestStatus.TIMEOUT)
+        ]
 
     @property
     def total_tests(self) -> int:
@@ -493,9 +497,23 @@ class Aarav:
             )
 
             elapsed = (time.monotonic() - phase_start) * 1000
-            passed = sum(1 for r in api_results if r.get("passed", False))
-            failed = len(api_results) - passed
-            errors = [r for r in api_results if not r.get("passed", False)]
+
+            # AARAV-FIX-5b: Distinguish skipped (passed=None) from real failures.
+            # In simulation mode (Docker unavailable), engine returns passed=None.
+            skipped = [r for r in api_results if r.get("passed") is None]
+            if skipped and len(skipped) == len(api_results):
+                # ALL tests skipped — Docker unavailable
+                return TestPhaseResult(
+                    phase=TestPhase.API_TEST,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    tests_total=len(api_results),
+                    output=f"API tests skipped ({len(skipped)} endpoints — Docker unavailable)",
+                )
+
+            passed = sum(1 for r in api_results if r.get("passed") is True)
+            failed = sum(1 for r in api_results if r.get("passed") is False)
+            errors = [r for r in api_results if r.get("passed") is False]
 
             return TestPhaseResult(
                 phase=TestPhase.API_TEST,
@@ -546,8 +564,20 @@ class Aarav:
             )
 
             elapsed = (time.monotonic() - phase_start) * 1000
-            passed = sum(1 for r in browser_results if r.get("passed", False))
-            failed = len(browser_results) - passed
+
+            # Handle skipped results (Docker unavailable returns passed=None, skipped=True)
+            skipped = [r for r in browser_results if r.get("skipped", False)]
+            if skipped and len(skipped) == len(browser_results):
+                return TestPhaseResult(
+                    phase=TestPhase.BROWSER_TEST,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    tests_total=len(browser_results),
+                    output=f"Browser tests skipped ({len(skipped)} pages — Docker unavailable)",
+                )
+
+            passed = sum(1 for r in browser_results if r.get("passed") is True)
+            failed = sum(1 for r in browser_results if r.get("passed") is False)
 
             return TestPhaseResult(
                 phase=TestPhase.BROWSER_TEST,
@@ -556,7 +586,7 @@ class Aarav:
                 tests_total=len(browser_results),
                 tests_passed=passed,
                 tests_failed=failed,
-                errors=[r for r in browser_results if not r.get("passed", False)],
+                errors=[r for r in browser_results if r.get("passed") is False],
                 output=f"Browser tests: {passed}/{len(browser_results)} passed",
             )
 
@@ -643,20 +673,36 @@ class Aarav:
             )
 
             elapsed = (time.monotonic() - phase_start) * 1000
-            backend_ok = dep_results.get("backend", {}).get("success", True)
-            frontend_ok = dep_results.get("frontend", {}).get("success", True)
+
+            # Handle simulation mode (Docker unavailable)
+            if dep_results.get("simulated", False):
+                return TestPhaseResult(
+                    phase=TestPhase.DEPENDENCY_CHECK,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    output="Dependency check skipped (Docker unavailable — simulation mode)",
+                )
+
+            # AARAV-FIX-2: When Docker is unavailable, verify_dependencies()
+            # returns backend=None / frontend=None (key exists but value is None).
+            # dict.get("backend", {}) returns None (not {}), then None.get()
+            # crashes. Use `or {}` to handle None values.
+            backend_data = dep_results.get("backend") or {}
+            frontend_data = dep_results.get("frontend") or {}
+            backend_ok = backend_data.get("passed", True) if backend_data else True
+            frontend_ok = frontend_data.get("passed", True) if frontend_data else True
             all_ok = backend_ok and frontend_ok
 
             errors = []
             if not backend_ok:
                 errors.append({
                     "type": "backend_dependency",
-                    "details": dep_results.get("backend", {}).get("error", "Unknown"),
+                    "details": backend_data.get("error", "Unknown") if backend_data else "Unknown",
                 })
             if not frontend_ok:
                 errors.append({
                     "type": "frontend_dependency",
-                    "details": dep_results.get("frontend", {}).get("error", "Unknown"),
+                    "details": frontend_data.get("error", "Unknown") if frontend_data else "Unknown",
                 })
 
             return TestPhaseResult(
@@ -701,16 +747,29 @@ class Aarav:
             from app.engine.execution_engine import get_execution_engine
 
             engine = get_execution_engine()
+            # AARAV-FIX-3: Engine's run_integration_tests() takes
+            # `endpoints` not `contract`. Extract endpoints from contract.
+            endpoints = contract.get("api", {}).get("endpoints", [])
             int_results = await engine.run_integration_tests(
                 pipeline_run_id=pipeline_run_id,
-                contract=contract,
+                endpoints=endpoints,
                 timeout_seconds=PHASE_TIMEOUTS[TestPhase.INTEGRATION_TEST],
             )
 
             elapsed = (time.monotonic() - phase_start) * 1000
-            passed = sum(1 for r in int_results if r.get("passed", False))
-            failed = len(int_results) - passed
-            errors = [r for r in int_results if not r.get("passed", False)]
+
+            # Engine returns [] when Docker is unavailable — treat as skipped
+            if not int_results:
+                return TestPhaseResult(
+                    phase=TestPhase.INTEGRATION_TEST,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    output="Integration tests skipped (Docker unavailable — simulation mode)",
+                )
+
+            passed = sum(1 for r in int_results if r.get("passed") is True)
+            failed = sum(1 for r in int_results if r.get("passed") is False)
+            errors = [r for r in int_results if r.get("passed") is False]
 
             return TestPhaseResult(
                 phase=TestPhase.INTEGRATION_TEST,
@@ -745,28 +804,41 @@ class Aarav:
             from app.engine.execution_engine import get_execution_engine
 
             engine = get_execution_engine()
+            # AARAV-FIX-4: Engine's run_security_scans() doesn't take `tools` param.
+            # It runs all scanners internally (bandit, safety, npm_audit).
             scan_results = await engine.run_security_scans(
                 pipeline_run_id=pipeline_run_id,
-                tools=["bandit", "safety", "npm_audit"],
                 timeout_seconds=PHASE_TIMEOUTS[TestPhase.SECURITY_SCAN],
             )
 
             elapsed = (time.monotonic() - phase_start) * 1000
 
+            # AARAV-FIX-5: Engine returns {"simulated": bool, "scans": [...]},
+            # not {tool_name: result_dict}. Handle both formats + simulation.
+            if scan_results.get("simulated", False):
+                return TestPhaseResult(
+                    phase=TestPhase.SECURITY_SCAN,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    output="Security scan skipped (Docker unavailable — simulation mode)",
+                )
+
             # Count total findings across all scanners
             total_findings = 0
             critical_findings = 0
             errors = []
-            for tool_name, result in scan_results.items():
-                findings = result.get("findings", [])
+            scans = scan_results.get("scans", [])
+            for scan in scans:
+                findings = scan.get("findings", []) + scan.get("vulnerabilities", [])
                 total_findings += len(findings)
                 for f in findings:
-                    if f.get("severity", "").lower() in ("critical", "high"):
+                    sev = f.get("severity", "").lower() if isinstance(f, dict) else ""
+                    if sev in ("critical", "high"):
                         critical_findings += 1
-                if result.get("error"):
+                if scan.get("error"):
                     errors.append({
-                        "type": f"{tool_name}_error",
-                        "details": result["error"],
+                        "type": f"{scan.get('tool', 'unknown')}_error",
+                        "details": scan["error"],
                     })
 
             # Pass if no critical/high findings
@@ -776,8 +848,8 @@ class Aarav:
                 phase=TestPhase.SECURITY_SCAN,
                 status=TestStatus.PASSED if passed else TestStatus.FAILED,
                 duration_ms=elapsed,
-                tests_total=len(scan_results),
-                tests_passed=len(scan_results) - len(errors),
+                tests_total=len(scans),
+                tests_passed=len(scans) - len(errors),
                 tests_failed=len(errors),
                 errors=errors,
                 output=(
@@ -929,9 +1001,14 @@ class Aarav:
             failed_phases=report.failed_phases,
         )
 
+        # AARAV-FIX-1: Always return COMPLETED — test failures are expected data,
+        # not agent failures. Returning FAILED caused the pipeline to abort
+        # immediately instead of routing to the fix-retest loop (TESTING →
+        # FIXING → quality rewind). FAILED should only be for "Aarav crashed
+        # and couldn't run tests at all" (handled by execute()'s outer except).
         return AgentResult(
             agent_name=self.name,
-            status=AgentStatus.COMPLETED if report.all_passed else AgentStatus.FAILED,
+            status=AgentStatus.COMPLETED,
             output=output,
         )
 

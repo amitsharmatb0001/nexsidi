@@ -116,6 +116,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _ = get_ai_router()
     logger.info("ai_router_ready")
 
+    # Register all agents (import agent modules to trigger register_agent() calls)
+    try:
+        from app.agents import register_all_agents
+        agent_count = register_all_agents()
+        logger.info("agents_ready", count=agent_count)
+    except Exception as exc:
+        logger.warning("agent_registration_failed", error=_sanitize_error(exc))
+
     # Crash recovery: find and mark interrupted pipelines
     try:
         from app.services.pipeline import get_orchestrator
