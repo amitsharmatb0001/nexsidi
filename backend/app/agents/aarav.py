@@ -3,19 +3,25 @@
 Aarav is a PURE AUTOMATION agent — NO AI calls. It orchestrates the
 execution engine to test generated code in an isolated Docker sandbox.
 
-Test phases (sequential):
+Test phases (sequential, 9 total):
 1. Docker Build: build backend + frontend containers
 2. Server Start: docker-compose up, wait for health checks
 3. Database Migration: run alembic + seed data
-4. API Testing: hit EVERY endpoint, verify status codes + schemas
-5. Browser Testing: Playwright page loads + user flows + responsive
-6. Database Verification: check tables, constraints, seed data
+4. Dependency Check: verify pip/npm install cleanly
+5. API Testing: hit EVERY endpoint, verify status codes + schemas
+6. Integration Testing: auth flow, validation, SQL injection, rate limiting
+7. Browser Testing: Playwright page loads + user flows + responsive
+8. Security Scanning: bandit (Python), safety (deps), npm audit (JS)
+9. Database Verification: check tables, constraints, seed data
 
 Hard timeouts per phase (AUDIT FIX #2):
 - Docker build: 5 min
 - Server start + health: 2 min
+- Dependency check: 3 min
 - API testing: 10 min
+- Integration testing: 10 min
 - Browser testing: 10 min
+- Security scanning: 3 min
 - DB verification: 3 min
 - Total sandbox: 30 min
 
@@ -34,7 +40,6 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    ToolDefinition,
     register_agent,
     run_agent,
     store_output,
@@ -53,8 +58,11 @@ class TestPhase(str, Enum):
     DOCKER_BUILD = "docker_build"
     SERVER_START = "server_start"
     DB_MIGRATION = "db_migration"
+    DEPENDENCY_CHECK = "dependency_check"      # NEW — verify all deps install
     API_TEST = "api_test"
+    INTEGRATION_TEST = "integration_test"      # NEW — auth flow, validation, security
     BROWSER_TEST = "browser_test"
+    SECURITY_SCAN = "security_scan"            # NEW — bandit, safety, npm audit
     DB_VERIFY = "db_verify"
 
 
@@ -63,8 +71,11 @@ PHASE_TIMEOUTS: dict[TestPhase, int] = {
     TestPhase.DOCKER_BUILD: 300,   # 5 min
     TestPhase.SERVER_START: 120,   # 2 min
     TestPhase.DB_MIGRATION: 120,   # 2 min
+    TestPhase.DEPENDENCY_CHECK: 180,  # 3 min
     TestPhase.API_TEST: 600,       # 10 min
+    TestPhase.INTEGRATION_TEST: 600,  # 10 min
     TestPhase.BROWSER_TEST: 600,   # 10 min
+    TestPhase.SECURITY_SCAN: 180,  # 3 min
     TestPhase.DB_VERIFY: 180,      # 3 min
 }
 
@@ -144,100 +155,10 @@ class Aarav:
     default_complexity = TaskComplexity.HIGH
     default_model: str | None = None
 
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        self.register_tool(ToolDefinition(
-            name="run_docker",
-            description="Build and start Docker containers for the generated project.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["build", "start", "stop", "cleanup"],
-                        "description": "Docker action to perform.",
-                    },
-                    "services": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Service names to target (default: all).",
-                    },
-                },
-                "required": ["action"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="run_api_test",
-            description="Run API endpoint tests against the running server.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "base_url": {"type": "string", "description": "Server base URL."},
-                    "endpoints": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "method": {"type": "string"},
-                                "path": {"type": "string"},
-                                "expected_status": {"type": "integer"},
-                            },
-                        },
-                        "description": "Endpoints to test.",
-                    },
-                },
-                "required": ["base_url"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="run_playwright",
-            description="Run browser tests using Playwright.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "base_url": {"type": "string"},
-                    "pages": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Page paths to test.",
-                    },
-                    "responsive": {
-                        "type": "boolean",
-                        "description": "Test responsive breakpoints.",
-                    },
-                },
-                "required": ["base_url"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="verify_db",
-            description="Verify database schema, constraints, and seed data.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "connection_string": {"type": "string"},
-                    "expected_tables": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": ["connection_string"],
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
-
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list:
+        """No tools — Aarav is pure automation, no AI tool loop."""
+        return []
 
     async def run(
         self,
@@ -258,9 +179,12 @@ class Aarav:
         1. Docker build (backend + frontend + database)
         2. Server start + health check
         3. Database migration + seed
-        4. API endpoint testing
-        5. Browser testing (Playwright)
-        6. Database verification
+        4. Dependency check (pip/npm install verification)
+        5. API endpoint testing (contract endpoints)
+        6. Integration testing (auth flow, validation, security, rate limiting)
+        7. Browser testing (Playwright)
+        8. Security scanning (bandit, safety, npm audit)
+        9. Database verification (tables, constraints, seed data)
         """
         sandbox_start = time.monotonic()
         report = SandboxTestReport(sandbox_id=pipeline_run_id)
@@ -268,12 +192,38 @@ class Aarav:
         contract = context.get("vikram", {}).get("contract", {})
         quality_findings = self._collect_quality_findings(context)
 
+        def _check_timeout(phase_name: str) -> bool:
+            """Check if total execution time exceeds sandbox timeout."""
+            elapsed = time.monotonic() - sandbox_start
+            if elapsed > TOTAL_SANDBOX_TIMEOUT:
+                logger.warning(
+                    "sandbox_total_timeout_exceeded",
+                    elapsed_s=round(elapsed, 1),
+                    max_s=TOTAL_SANDBOX_TIMEOUT,
+                    after_phase=phase_name,
+                )
+                report.add(TestPhaseResult(
+                    phase=TestPhase.DB_VERIFY,   # Sentinel
+                    status=TestStatus.TIMEOUT,
+                    duration_ms=elapsed * 1000,
+                    output=(
+                        f"Sandbox timeout ({TOTAL_SANDBOX_TIMEOUT}s) exceeded "
+                        f"after {elapsed:.1f}s (after {phase_name})"
+                    ),
+                ))
+                return True
+            return False
+
         # Phase 1: Docker Build
         build_result = await self._phase_docker_build(
             pipeline_run_id, context, contract
         )
         report.add(build_result)
         if not build_result.passed:
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+        if _check_timeout("docker_build"):
             result = self._build_result(report, sandbox_start)
             await store_output(self, pipeline_run_id, result.output)
             return result
@@ -285,6 +235,10 @@ class Aarav:
             result = self._build_result(report, sandbox_start)
             await store_output(self, pipeline_run_id, result.output)
             return result
+        if _check_timeout("server_start"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
 
         # Phase 3: Database Migration + Seed
         migration_result = await self._phase_db_migration(pipeline_run_id, contract)
@@ -293,41 +247,57 @@ class Aarav:
             result = self._build_result(report, sandbox_start)
             await store_output(self, pipeline_run_id, result.output)
             return result
-
-        # Phase 4: API Testing
-        api_result = await self._phase_api_test(pipeline_run_id, contract)
-        report.add(api_result)
-
-        # Phase 5: Browser Testing (continue even if API tests partially fail)
-        browser_result = await self._phase_browser_test(pipeline_run_id, contract)
-        report.add(browser_result)
-
-        # Phase 6: Database Verification
-        db_result = await self._phase_db_verify(pipeline_run_id, contract)
-        report.add(db_result)
-
-        # SANDBOX-FIX E: Enforce total sandbox timeout — don't just warn, stop.
-        # If we've already exceeded the budget, record a TIMEOUT phase result
-        # and return early rather than silently continuing to completion.
-        elapsed = (time.monotonic() - sandbox_start) * 1000
-        if elapsed > TOTAL_SANDBOX_TIMEOUT * 1000:
-            logger.warning(
-                "sandbox_total_timeout_exceeded",
-                elapsed_ms=elapsed,
-                max_ms=TOTAL_SANDBOX_TIMEOUT * 1000,
-            )
-            report.add(TestPhaseResult(
-                phase=TestPhase.DB_VERIFY,   # Sentinel: whichever phase we're past
-                status=TestStatus.TIMEOUT,
-                duration_ms=elapsed,
-                output=(
-                    f"Sandbox total timeout exceeded: {elapsed:.0f} ms "
-                    f"> {TOTAL_SANDBOX_TIMEOUT * 1000} ms limit"
-                ),
-            ))
+        if _check_timeout("db_migration"):
             result = self._build_result(report, sandbox_start)
             await store_output(self, pipeline_run_id, result.output)
             return result
+
+        # Phase 4: Dependency Check (NEW — verify all deps install cleanly)
+        dep_result = await self._phase_dependency_check(pipeline_run_id, contract)
+        report.add(dep_result)
+        # Non-blocking: dependency warnings don't stop the pipeline
+        if _check_timeout("dependency_check"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
+        # Phase 5: API Testing
+        api_result = await self._phase_api_test(pipeline_run_id, contract)
+        report.add(api_result)
+        if _check_timeout("api_test"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
+        # Phase 6: Integration Testing (NEW — auth flow, validation, security)
+        integration_result = await self._phase_integration_test(
+            pipeline_run_id, contract
+        )
+        report.add(integration_result)
+        if _check_timeout("integration_test"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
+        # Phase 7: Browser Testing (continue even if API tests partially fail)
+        browser_result = await self._phase_browser_test(pipeline_run_id, contract)
+        report.add(browser_result)
+        if _check_timeout("browser_test"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
+        # Phase 8: Security Scanning (NEW — bandit, safety, npm audit)
+        security_result = await self._phase_security_scan(pipeline_run_id, contract)
+        report.add(security_result)
+        if _check_timeout("security_scan"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
+        # Phase 9: Database Verification
+        db_result = await self._phase_db_verify(pipeline_run_id, contract)
+        report.add(db_result)
 
         # STORE-FIX: Persist output to context engine for downstream agents
         result = self._build_result(report, sandbox_start)
@@ -385,14 +355,16 @@ class Aarav:
                     output="Docker build succeeded",
                 )
             else:
+                # Parse structured build errors for Fixer consumption
+                build_errors = self._parse_build_errors(engine, pipeline_run_id)
                 return TestPhaseResult(
                     phase=TestPhase.DOCKER_BUILD,
                     status=TestStatus.FAILED,
                     duration_ms=elapsed,
                     tests_total=1,
                     tests_failed=1,
-                    errors=[{"type": "build_failure", "details": "Docker build failed"}],
-                    output="Docker build failed",
+                    errors=build_errors or [{"type": "build_failure", "details": "Docker build failed"}],
+                    output=f"Docker build failed: {len(build_errors)} error(s) parsed",
                 )
 
         except Exception as exc:
@@ -651,7 +623,243 @@ class Aarav:
                 errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
+    # ── New Test Phases ──────────────────────────────────────────
+
+    async def _phase_dependency_check(
+        self,
+        pipeline_run_id: str,
+        contract: dict[str, Any],
+    ) -> TestPhaseResult:
+        """Phase 4: Verify all dependencies install cleanly."""
+        phase_start = time.monotonic()
+
+        try:
+            from app.engine.execution_engine import get_execution_engine
+
+            engine = get_execution_engine()
+            dep_results = await engine.verify_dependencies(
+                pipeline_run_id=pipeline_run_id,
+                timeout_seconds=PHASE_TIMEOUTS[TestPhase.DEPENDENCY_CHECK],
+            )
+
+            elapsed = (time.monotonic() - phase_start) * 1000
+            backend_ok = dep_results.get("backend", {}).get("success", True)
+            frontend_ok = dep_results.get("frontend", {}).get("success", True)
+            all_ok = backend_ok and frontend_ok
+
+            errors = []
+            if not backend_ok:
+                errors.append({
+                    "type": "backend_dependency",
+                    "details": dep_results.get("backend", {}).get("error", "Unknown"),
+                })
+            if not frontend_ok:
+                errors.append({
+                    "type": "frontend_dependency",
+                    "details": dep_results.get("frontend", {}).get("error", "Unknown"),
+                })
+
+            return TestPhaseResult(
+                phase=TestPhase.DEPENDENCY_CHECK,
+                status=TestStatus.PASSED if all_ok else TestStatus.FAILED,
+                duration_ms=elapsed,
+                tests_total=2,
+                tests_passed=(1 if backend_ok else 0) + (1 if frontend_ok else 0),
+                tests_failed=(0 if backend_ok else 1) + (0 if frontend_ok else 1),
+                errors=errors,
+                output=(
+                    "All dependencies install cleanly"
+                    if all_ok
+                    else f"Dependency issues: backend={'ok' if backend_ok else 'FAIL'}, "
+                    f"frontend={'ok' if frontend_ok else 'FAIL'}"
+                ),
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            elapsed = (time.monotonic() - phase_start) * 1000
+            return TestPhaseResult(
+                phase=TestPhase.DEPENDENCY_CHECK,
+                status=TestStatus.ERROR,
+                duration_ms=elapsed,
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
+            )
+
+    async def _phase_integration_test(
+        self,
+        pipeline_run_id: str,
+        contract: dict[str, Any],
+    ) -> TestPhaseResult:
+        """Phase 6: Run real QA-level integration tests.
+
+        Tests auth flow (register, login, protected routes, invalid tokens),
+        data validation, SQL injection, rate limiting, and 404 handling.
+        """
+        phase_start = time.monotonic()
+
+        try:
+            from app.engine.execution_engine import get_execution_engine
+
+            engine = get_execution_engine()
+            int_results = await engine.run_integration_tests(
+                pipeline_run_id=pipeline_run_id,
+                contract=contract,
+                timeout_seconds=PHASE_TIMEOUTS[TestPhase.INTEGRATION_TEST],
+            )
+
+            elapsed = (time.monotonic() - phase_start) * 1000
+            passed = sum(1 for r in int_results if r.get("passed", False))
+            failed = len(int_results) - passed
+            errors = [r for r in int_results if not r.get("passed", False)]
+
+            return TestPhaseResult(
+                phase=TestPhase.INTEGRATION_TEST,
+                status=TestStatus.PASSED if failed == 0 else TestStatus.FAILED,
+                duration_ms=elapsed,
+                tests_total=len(int_results),
+                tests_passed=passed,
+                tests_failed=failed,
+                errors=errors[:10],  # Cap error output
+                output=f"Integration tests: {passed}/{len(int_results)} passed",
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            elapsed = (time.monotonic() - phase_start) * 1000
+            return TestPhaseResult(
+                phase=TestPhase.INTEGRATION_TEST,
+                status=TestStatus.ERROR,
+                duration_ms=elapsed,
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
+            )
+
+    async def _phase_security_scan(
+        self,
+        pipeline_run_id: str,
+        contract: dict[str, Any],
+    ) -> TestPhaseResult:
+        """Phase 8: Run real security scanning tools (bandit, safety, npm audit)."""
+        phase_start = time.monotonic()
+
+        try:
+            from app.engine.execution_engine import get_execution_engine
+
+            engine = get_execution_engine()
+            scan_results = await engine.run_security_scans(
+                pipeline_run_id=pipeline_run_id,
+                tools=["bandit", "safety", "npm_audit"],
+                timeout_seconds=PHASE_TIMEOUTS[TestPhase.SECURITY_SCAN],
+            )
+
+            elapsed = (time.monotonic() - phase_start) * 1000
+
+            # Count total findings across all scanners
+            total_findings = 0
+            critical_findings = 0
+            errors = []
+            for tool_name, result in scan_results.items():
+                findings = result.get("findings", [])
+                total_findings += len(findings)
+                for f in findings:
+                    if f.get("severity", "").lower() in ("critical", "high"):
+                        critical_findings += 1
+                if result.get("error"):
+                    errors.append({
+                        "type": f"{tool_name}_error",
+                        "details": result["error"],
+                    })
+
+            # Pass if no critical/high findings
+            passed = critical_findings == 0
+
+            return TestPhaseResult(
+                phase=TestPhase.SECURITY_SCAN,
+                status=TestStatus.PASSED if passed else TestStatus.FAILED,
+                duration_ms=elapsed,
+                tests_total=len(scan_results),
+                tests_passed=len(scan_results) - len(errors),
+                tests_failed=len(errors),
+                errors=errors,
+                output=(
+                    f"Security scan: {total_findings} total findings, "
+                    f"{critical_findings} critical/high"
+                ),
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            elapsed = (time.monotonic() - phase_start) * 1000
+            return TestPhaseResult(
+                phase=TestPhase.SECURITY_SCAN,
+                status=TestStatus.ERROR,
+                duration_ms=elapsed,
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
+            )
+
     # ── Helpers ────────────────────────────────────────────────────
+
+    def _parse_build_errors(
+        self,
+        engine: Any,
+        pipeline_run_id: str,
+    ) -> list[dict[str, Any]]:
+        """Parse Docker build stderr into structured errors for Fixer.
+
+        Extracts: ModuleNotFoundError, ImportError, SyntaxError (Python),
+        npm ERR! (Node.js), pip ERROR (Python deps).
+        """
+        import re
+
+        errors: list[dict[str, Any]] = []
+
+        # Try to get build logs from engine state
+        build_log = ""
+        try:
+            sandbox_state = getattr(engine, "_sandbox_states", {}).get(pipeline_run_id, {})
+            build_log = sandbox_state.get("build_stderr", "") or sandbox_state.get("build_log", "")
+        except Exception:
+            pass
+
+        if not build_log:
+            return errors
+
+        # Python errors
+        for match in re.finditer(
+            r"(ModuleNotFoundError|ImportError|SyntaxError|NameError|TypeError):\s*(.+)",
+            build_log,
+        ):
+            error_type, message = match.groups()
+            # Try to extract file path
+            file_match = re.search(r'File "([^"]+)", line (\d+)', build_log[:match.start()])
+            errors.append({
+                "type": error_type,
+                "details": message.strip()[:200],
+                "file": file_match.group(1) if file_match else "(unknown)",
+                "line": int(file_match.group(2)) if file_match else None,
+            })
+
+        # pip errors
+        for match in re.finditer(r"pip\s+(?:ERROR|error):\s*(.+)", build_log):
+            errors.append({
+                "type": "pip_error",
+                "details": match.group(1).strip()[:200],
+            })
+
+        # npm errors
+        for match in re.finditer(r"npm\s+ERR!\s*(.+)", build_log):
+            errors.append({
+                "type": "npm_error",
+                "details": match.group(1).strip()[:200],
+            })
+
+        # Generic build failures (Dockerfile)
+        for match in re.finditer(r"ERROR\s*\[[\w/]+\s+(\d+/\d+)\]\s+(.+)", build_log):
+            errors.append({
+                "type": "docker_step_failure",
+                "details": f"Step {match.group(1)}: {match.group(2).strip()[:200]}",
+            })
+
+        return errors[:20]  # Cap at 20 errors
 
     def _collect_quality_findings(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         """Collect findings from quality review agents."""
@@ -670,8 +878,26 @@ class Aarav:
         """Build AgentResult from test report."""
         report.total_duration_ms = (time.monotonic() - sandbox_start) * 1000
 
+        # Detect whether a real Docker sandbox ran or was silently skipped.
+        # The execution engine returns True from build_sandbox() even when Docker
+        # is unavailable (graceful degradation for dev/CI).  We expose this as
+        # is_simulation_sandbox so the UI can warn users that no real tests ran.
+        try:
+            from app.engine.execution_engine import _check_docker_available
+
+            is_simulation_sandbox = not _check_docker_available()
+        except Exception:
+            is_simulation_sandbox = True  # Assume simulated when engine is absent
+
+        if is_simulation_sandbox:
+            logger.warning(
+                "sandbox_ran_in_simulation_mode",
+                reason="Docker not available — no real containers were built or tested",
+            )
+
         output = {
             "all_passed": report.all_passed,
+            "is_simulation_sandbox": is_simulation_sandbox,
             "total_duration_ms": round(report.total_duration_ms, 1),
             "total_tests": report.total_tests,
             "total_passed": report.total_passed,
@@ -695,6 +921,7 @@ class Aarav:
         logger.info(
             "sandbox_test_complete",
             all_passed=report.all_passed,
+            is_simulation_sandbox=is_simulation_sandbox,
             total_tests=report.total_tests,
             total_passed=report.total_passed,
             total_failed=report.total_failed,

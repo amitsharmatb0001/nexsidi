@@ -1,0 +1,192 @@
+"""Mistake Memory — Agents learn from past failures.
+
+Records error patterns and their fixes so agents don't repeat the same
+mistakes across projects. Uses ChromaDB for vector similarity search
+to find relevant past failures for the current task.
+
+Integration:
+- Fixer: records failures after fixing errors
+- Aarav: records test failures
+- call_ai(): injects relevant lessons into system prompts
+
+Storage:
+- ChromaDB collection per agent (persistent vector store)
+- Fallback to in-memory dict if ChromaDB unavailable
+"""
+
+from __future__ import annotations
+
+import hashlib
+import time
+from typing import Any
+
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+# Lazy-initialized ChromaDB client
+_chroma_client = None
+_FALLBACK_STORE: dict[str, list[dict[str, Any]]] = {}  # agent -> [mistakes]
+
+
+def _get_chroma():
+    """Lazy-initialize ChromaDB client."""
+    global _chroma_client
+    if _chroma_client is not None:
+        return _chroma_client
+    try:
+        import chromadb
+        _chroma_client = chromadb.Client()
+        logger.info("chromadb_initialized", backend="ephemeral")
+        return _chroma_client
+    except ImportError:
+        logger.warning("chromadb_not_installed", fallback="in-memory dict")
+        return None
+    except Exception as exc:
+        logger.warning("chromadb_init_failed", error=str(exc)[:200], fallback="in-memory dict")
+        return None
+
+
+def _collection_name(agent_name: str) -> str:
+    """Sanitized collection name for ChromaDB."""
+    # ChromaDB collection names: 3-63 chars, alphanumeric + underscores
+    name = f"mistakes_{agent_name}"
+    return name[:63]
+
+
+class MistakeMemory:
+    """Persistent failure learning across projects.
+
+    Usage:
+        from app.services.mistake_memory import mistake_memory
+
+        # Record a failure
+        mistake_memory.record_failure(
+            agent_name="shubham",
+            task_type="backend_generation",
+            error="ModuleNotFoundError: No module named 'app.models.user'",
+            fix="Added missing __init__.py and corrected import path",
+            context={"framework": "fastapi", "file": "routers/auth.py"},
+        )
+
+        # Query similar mistakes before a task
+        lessons = mistake_memory.build_lessons_prompt("shubham", "backend_generation", context_str)
+        # Returns prompt section or empty string
+    """
+
+    def record_failure(
+        self,
+        agent_name: str,
+        task_type: str,
+        error: str,
+        fix: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Store a mistake for future reference."""
+        doc_id = hashlib.md5(
+            f"{agent_name}:{task_type}:{error[:200]}".encode()
+        ).hexdigest()
+
+        doc_text = f"Error: {error}\nFix: {fix}"
+        metadata = {
+            "agent_name": agent_name,
+            "task_type": task_type,
+            "error": error[:500],
+            "fix": fix[:500],
+            "timestamp": time.time(),
+        }
+        if context:
+            # Store serializable context fields
+            for k, v in context.items():
+                if isinstance(v, (str, int, float, bool)):
+                    metadata[f"ctx_{k}"] = v
+
+        chroma = _get_chroma()
+        if chroma:
+            try:
+                collection = chroma.get_or_create_collection(_collection_name(agent_name))
+                collection.upsert(
+                    ids=[doc_id],
+                    documents=[doc_text],
+                    metadatas=[metadata],
+                )
+                logger.debug("mistake_recorded", agent=agent_name, task_type=task_type)
+                return
+            except Exception as exc:
+                logger.warning("mistake_record_chromadb_failed", error=str(exc)[:200])
+
+        # Fallback: in-memory store
+        if agent_name not in _FALLBACK_STORE:
+            _FALLBACK_STORE[agent_name] = []
+        _FALLBACK_STORE[agent_name].append(metadata)
+        # Cap at 200 entries per agent
+        if len(_FALLBACK_STORE[agent_name]) > 200:
+            _FALLBACK_STORE[agent_name] = _FALLBACK_STORE[agent_name][-200:]
+
+    def query_similar_mistakes(
+        self,
+        agent_name: str,
+        task_type: str,
+        input_context: str,
+        n_results: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Find similar past errors via vector similarity."""
+        chroma = _get_chroma()
+        if chroma:
+            try:
+                collection = chroma.get_or_create_collection(_collection_name(agent_name))
+                results = collection.query(
+                    query_texts=[f"{task_type}: {input_context[:500]}"],
+                    n_results=n_results,
+                    where={"agent_name": agent_name},
+                )
+                if results and results.get("metadatas"):
+                    # Flatten: results["metadatas"] is list of lists
+                    mistakes = []
+                    for meta_list in results["metadatas"]:
+                        if isinstance(meta_list, list):
+                            mistakes.extend(meta_list)
+                        else:
+                            mistakes.append(meta_list)
+                    return mistakes[:n_results]
+            except Exception as exc:
+                logger.warning("mistake_query_chromadb_failed", error=str(exc)[:200])
+
+        # Fallback: simple keyword matching
+        entries = _FALLBACK_STORE.get(agent_name, [])
+        matched = [
+            e for e in entries
+            if e.get("task_type") == task_type
+        ]
+        return matched[-n_results:]
+
+    def build_lessons_prompt(
+        self,
+        agent_name: str,
+        task_type: str,
+        context: str,
+    ) -> str:
+        """Build a prompt section with past lessons, or empty string.
+
+        Returns a section like:
+            LEARN FROM PAST MISTAKES:
+            1. Error: ... → Fix: ...
+            2. Error: ... → Fix: ...
+        """
+        mistakes = self.query_similar_mistakes(agent_name, task_type, context)
+        if not mistakes:
+            return ""
+
+        lines = ["\n\n**LEARN FROM PAST MISTAKES (DO NOT REPEAT):**"]
+        for i, mistake in enumerate(mistakes[:5], 1):
+            error = mistake.get("error", "Unknown")[:200]
+            fix = mistake.get("fix", "No fix recorded")[:200]
+            lines.append(f"{i}. **Error**: {error}")
+            lines.append(f"   **Fix**: {fix}")
+        lines.append("")
+
+        return "\n".join(lines)
+
+
+# Module-level singleton
+mistake_memory = MistakeMemory()

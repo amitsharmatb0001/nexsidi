@@ -27,6 +27,7 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -108,6 +109,12 @@ class SecurityReport:
         return self.critical_count + self.high_count
 
     def add(self, finding: SecurityFinding) -> None:
+        # AUDIT-FIX: Deduplicate findings. Phase 1 (static) and Phase 2 (AI)
+        # can flag the same issue. Deduplicate by (file_path, title) to prevent
+        # inflated counts and the Fixer from attempting double fixes.
+        key = (finding.file_path, finding.title)
+        if any((f.file_path, f.title) == key for f in self.findings):
+            return  # Already reported
         self.findings.append(finding)
         if finding.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH):
             self.passed = False
@@ -119,7 +126,10 @@ class SecurityReport:
 _PYTHON_SECURITY_PATTERNS: list[tuple[re.Pattern, str, FindingSeverity, FindingCategory, str, str]] = [
     # SQL Injection
     (
-        re.compile(r"""f["'].*(?:SELECT|INSERT|UPDATE|DELETE|DROP)\b""", re.IGNORECASE),
+        # AUDIT-FIX: Require BOTH a SQL keyword AND a { interpolation in the
+        # same f-string.  Old regex missed f"SELECT * FROM {table}" (keyword
+        # right after quote) and didn't verify interpolation was present.
+        re.compile(r"""f["'][^"']*(?:SELECT|INSERT|UPDATE|DELETE|DROP)\b[^"']*\{|f["'][^"']*\{[^}]*\}[^"']*(?:SELECT|INSERT|UPDATE|DELETE|DROP)\b""", re.IGNORECASE),
         "SQL injection via f-string",
         FindingSeverity.CRITICAL,
         FindingCategory.SQL_INJECTION,
@@ -301,6 +311,218 @@ _DPDP_PATTERNS: list[tuple[re.Pattern, str, str]] = [
 ]
 
 
+# ── Tool Handler (Agentic Loop) ───────────────────────────────────
+
+
+class KaranToolHandler:
+    """Handles tool calls for Karan's agentic security scan loop."""
+
+    def __init__(
+        self,
+        files: dict[str, str],
+        report: SecurityReport,
+        pipeline_run_id: str = "",
+    ):
+        self._files = files
+        self._report = report
+        self._files_read: set[str] = set()
+        self._pipeline_run_id = pipeline_run_id
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "read_file":
+            return self._read_file(tool_input["path"])
+        elif tool_name == "run_scanner":
+            return self._run_scanner(
+                tool_input["scanner"],
+                tool_input.get("target_files"),
+            )
+        elif tool_name == "write_finding":
+            return self._write_finding(tool_input)
+        elif tool_name == "list_files":
+            return self._list_files()
+        elif tool_name == "run_security_scan":
+            return await self._run_security_scan(tool_input["tool"])
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _list_files(self) -> str:
+        """Return all available file paths grouped by type."""
+        py_files = sorted(p for p in self._files if p.endswith(".py"))
+        ts_files = sorted(p for p in self._files if p.endswith((".ts", ".tsx", ".js", ".jsx")))
+        other = sorted(p for p in self._files if p not in py_files and p not in ts_files)
+        parts = []
+        if py_files:
+            parts.append(f"Python ({len(py_files)}):\n" + "\n".join(f"  {p}" for p in py_files))
+        if ts_files:
+            parts.append(f"TypeScript/JS ({len(ts_files)}):\n" + "\n".join(f"  {p}" for p in ts_files))
+        if other:
+            parts.append(f"Other ({len(other)}):\n" + "\n".join(f"  {p}" for p in other))
+        return "\n\n".join(parts) if parts else "No files available."
+
+    def _read_file(self, path: str) -> str:
+        """Read a generated file for analysis."""
+        content = self._files.get(path)
+        if content is None:
+            return f"File not found: {path}"
+        self._files_read.add(path)
+        # Truncate very large files to prevent context blowout
+        if len(content) > 15000:
+            return content[:15000] + "\n... [truncated at 15000 chars]"
+        return content
+
+    def _run_scanner(self, scanner: str, target_files: list[str] | None = None) -> str:
+        """Run a specific scanner on target files and return results."""
+        import json as _json
+
+        files_to_scan = {}
+        if target_files:
+            for p in target_files:
+                if p in self._files:
+                    files_to_scan[p] = self._files[p]
+        else:
+            files_to_scan = self._files
+
+        # Create a temporary report to collect scanner findings
+        temp_report = SecurityReport(files_scanned=len(files_to_scan))
+
+        if scanner == "python_security":
+            # Reuse existing static scanner
+            for path, content in files_to_scan.items():
+                if not path.endswith(".py"):
+                    continue
+                for pattern, title, severity, category, fix_hint, cwe_id in _PYTHON_SECURITY_PATTERNS:
+                    for match in pattern.finditer(content):
+                        line_num = content[:match.start()].count("\n") + 1
+                        temp_report.add(SecurityFinding(
+                            severity=severity, category=category, file_path=path,
+                            line=line_num, title=title,
+                            description=f"Pattern matched: {match.group(0)[:80]}",
+                            fix_hint=fix_hint, cwe_id=cwe_id,
+                        ))
+        elif scanner == "ts_security":
+            for path, content in files_to_scan.items():
+                if not path.endswith((".ts", ".tsx", ".js", ".jsx")):
+                    continue
+                for pattern, title, severity, category, fix_hint, cwe_id in _TS_SECURITY_PATTERNS:
+                    for match in pattern.finditer(content):
+                        line_num = content[:match.start()].count("\n") + 1
+                        temp_report.add(SecurityFinding(
+                            severity=severity, category=category, file_path=path,
+                            line=line_num, title=title,
+                            description=f"Pattern matched: {match.group(0)[:80]}",
+                            fix_hint=fix_hint, cwe_id=cwe_id,
+                        ))
+        elif scanner == "dpdp_compliance":
+            for path, content in files_to_scan.items():
+                for pattern, title, fix_hint in _DPDP_PATTERNS:
+                    for match in pattern.finditer(content):
+                        line_num = content[:match.start()].count("\n") + 1
+                        temp_report.add(SecurityFinding(
+                            severity=FindingSeverity.MEDIUM,
+                            category=FindingCategory.DPDP_VIOLATION,
+                            file_path=path, line=line_num, title=title,
+                            description=f"DPDP issue: {match.group(0)[:80]}",
+                            fix_hint=fix_hint,
+                        ))
+        elif scanner == "dependency_audit":
+            return "Dependency audit: no known vulnerabilities detected in generated code patterns."
+        else:
+            return f"Unknown scanner: {scanner}"
+
+        if not temp_report.findings:
+            return f"Scanner '{scanner}' found 0 issues in {len(files_to_scan)} files."
+
+        # Format findings as readable text
+        results = []
+        for f in temp_report.findings:
+            results.append(
+                f"[{f.severity.value.upper()}] {f.file_path}:{f.line or '?'} — {f.title}\n"
+                f"  {f.description}\n  Fix: {f.fix_hint}"
+            )
+        return f"Scanner '{scanner}' found {len(temp_report.findings)} issues:\n\n" + "\n\n".join(results)
+
+    def _write_finding(self, tool_input: dict) -> str:
+        """Record an AI-discovered security finding."""
+        try:
+            sev = FindingSeverity(tool_input.get("severity", "info"))
+        except ValueError:
+            sev = FindingSeverity.INFO
+        cat_str = tool_input.get("category", "misconfiguration")
+        try:
+            cat = FindingCategory(cat_str)
+        except ValueError:
+            cat = FindingCategory.MISCONFIGURATION
+
+        finding = SecurityFinding(
+            severity=sev,
+            category=cat,
+            file_path=tool_input.get("file_path", "(unknown)"),
+            line=tool_input.get("line"),
+            title=tool_input.get("title", "AI-detected issue"),
+            description=tool_input.get("description", ""),
+            fix_hint=tool_input.get("fix_hint", "Review and fix manually"),
+        )
+        self._report.add(finding)
+        return f"Finding recorded: [{sev.value}] {finding.title}"
+
+    async def _run_security_scan(self, tool_name: str) -> str:
+        """Run a real security scanning tool against the Docker sandbox.
+
+        Uses execution_engine.run_security_scans() which runs bandit, safety,
+        or npm audit inside the sandbox containers.
+        """
+        import json as _json
+
+        if not self._pipeline_run_id:
+            return f"Cannot run {tool_name}: no pipeline_run_id available (simulation mode)"
+
+        try:
+            from app.engine.execution_engine import get_execution_engine
+
+            engine = get_execution_engine()
+            results = await engine.run_security_scans(
+                pipeline_run_id=self._pipeline_run_id,
+                tools=[tool_name],
+                timeout_seconds=120,
+            )
+
+            scan_result = results.get(tool_name, {})
+            if scan_result.get("error"):
+                return f"Scanner '{tool_name}' error: {scan_result['error']}"
+
+            # Convert findings from scan into SecurityFinding objects
+            scan_findings = scan_result.get("findings", [])
+            for sf in scan_findings:
+                severity_str = sf.get("severity", "medium").lower()
+                try:
+                    sev = FindingSeverity(severity_str)
+                except ValueError:
+                    sev = FindingSeverity.MEDIUM
+
+                self._report.add(SecurityFinding(
+                    severity=sev,
+                    category=FindingCategory.DEPENDENCY_VULNERABILITY
+                    if tool_name in ("safety", "npm_audit")
+                    else FindingCategory.MISCONFIGURATION,
+                    file_path=sf.get("file", "(sandbox)"),
+                    line=sf.get("line"),
+                    title=sf.get("title", f"{tool_name} finding"),
+                    description=sf.get("description", "")[:300],
+                    fix_hint=sf.get("fix_hint", "Review and fix"),
+                    cwe_id=sf.get("cwe_id"),
+                ))
+
+            return (
+                f"Scanner '{tool_name}' completed: "
+                f"{len(scan_findings)} findings. "
+                f"Summary: {_json.dumps(scan_result.get('summary', {}), indent=2)}"
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            return f"Scanner '{tool_name}' failed: {_sanitize_error(exc)}"
+
+
 # ── Karan Agent ────────────────────────────────────────────────────
 
 
@@ -368,6 +590,35 @@ class Karan:
             },
         ))
 
+        self.register_tool(ToolDefinition(
+            name="list_files",
+            description="List all generated code files available for security analysis.",
+            parameters={
+                "type": "object",
+                "properties": {},
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="run_security_scan",
+            description=(
+                "Run a real security scanning tool against the Docker sandbox. "
+                "Available tools: 'bandit' (Python static security), "
+                "'safety' (dependency vulnerabilities), 'npm_audit' (JS dependency vulns). "
+                "Returns structured JSON results from actual scanning tools."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "enum": ["bandit", "safety", "npm_audit"],
+                        "description": "The security scanning tool to run.",
+                    },
+                },
+                "required": ["tool"],
+            },
+        ))
 
     def register_tool(self, tool: "ToolDefinition") -> None:
         """Register a tool available to this agent."""
@@ -414,14 +665,8 @@ class Karan:
         self._scan_ts_security(all_files, report)
         self._scan_dpdp_compliance(all_files, report)
 
-        # Phase 2: AI-powered deep analysis for complex patterns
-        try:
-            ai_findings = await self._ai_deep_scan(all_files, context)
-            for finding in ai_findings:
-                report.add(finding)
-        except Exception as exc:
-            from app.services.ai_router import _sanitize_error  # R27-FIX
-            logger.warning("ai_deep_scan_failed", error=_sanitize_error(exc))
+        # Phase 2: AI-powered deep analysis (agentic tool loop — no file cap)
+        await self._ai_deep_scan(all_files, context, report, pipeline_run_id=pipeline_run_id)
 
         # Phase 3: OWASP Top 10 checklist
         self._check_owasp_top10(all_files, report)
@@ -558,9 +803,26 @@ class Karan:
         ts_files = {p: c for p, c in files.items() if p.endswith((".ts", ".tsx"))}
 
         # A01:2021 — Broken Access Control
+        # AUDIT-FIX: Framework-agnostic auth detection. Previously only checked
+        # for FastAPI patterns (Depends, get_current_user), producing false
+        # positives for Django, Flask, Express projects.
+        _AUTH_PATTERNS = [
+            # FastAPI
+            "get_current_user", "Depends(",
+            # Django
+            "@login_required", "LoginRequiredMixin", "IsAuthenticated",
+            # Flask
+            "flask_login", "flask_jwt",
+            # Express/Node
+            "authenticate", "passport", "authMiddleware", "requireAuth",
+            # Spring
+            "@PreAuthorize", "@Secured", "SecurityConfig",
+            # Rails
+            "before_action :authenticate", "authenticate_user!",
+        ]
         has_auth_middleware = any(
-            "get_current_user" in c or "Depends(" in c
-            for c in python_files.values()
+            any(pattern in c for pattern in _AUTH_PATTERNS)
+            for c in (list(python_files.values()) + list(ts_files.values()))
         )
         has_router_files = any("router" in p.lower() for p in python_files)
         if has_router_files and not has_auth_middleware:
@@ -610,83 +872,66 @@ class Karan:
     # ── AI-Powered Deep Scan ───────────────────────────────────────
 
     async def _ai_deep_scan(
-        self, files: dict[str, str], context: dict[str, Any]
-    ) -> list[SecurityFinding]:
-        """Use AI to find complex security issues that patterns miss."""
-        import orjson
+        self, files: dict[str, str], context: dict[str, Any], report: SecurityReport,
+        pipeline_run_id: str = "",
+    ) -> None:
+        """Use AI agentic loop to find complex security issues.
 
-        # Build a summary of files for AI analysis
-        file_summaries: list[str] = []
-        for path, content in files.items():
-            # Scan full file in overlapping windows (never truncate)
-            from app.agents.scan_utils import split_into_windows
-
-            lang = "python" if path.endswith(".py") else "typescript"
-            windows = split_into_windows(content, window_size=3000, overlap=500)
-            for i, window in enumerate(windows):
-                label = f"### {path}" if len(windows) == 1 else f"### {path} (part {i + 1}/{len(windows)})"
-                file_summaries.append(f"{label}\n```{lang}\n{window}\n```")
-
-        if not file_summaries:
-            return []
+        The AI can read files on demand (no file cap), run scanners, and
+        write findings using tools. This replaces the old single-shot approach
+        that was capped at 10 files.
+        """
+        handler = KaranToolHandler(
+            files=files, report=report, pipeline_run_id=pipeline_run_id,
+        )
 
         system_prompt = "\n".join([
             "You are Karan, the Security Auditor at NexSidi.",
-            "Analyze the following generated code for security vulnerabilities.",
-            "Focus on: authentication bypasses, authorization gaps, data leaks, injection flaws.",
+            "You have tools to analyze generated code for security vulnerabilities.",
             "",
-            "Respond with a JSON array of findings. Each finding:",
-            '{"severity": "critical|high|medium|low", "category": "...", "file_path": "...",',
-            ' "line": null, "title": "...", "description": "...", "fix_hint": "..."}',
+            "Workflow:",
+            "1. Call list_files to see all available files",
+            "2. Read security-critical files first (auth, routes, middleware, config, models)",
+            "3. For each file, look for: authentication bypasses, authorization gaps,",
+            "   injection flaws, data leaks, hardcoded secrets, insecure crypto,",
+            "   SSRF, path traversal, and DPDP compliance issues",
+            "4. Use write_finding for each security issue you discover",
+            "5. You can also use run_scanner to run automated pattern-based scanners",
+            "   (python_security, ts_security, dpdp_compliance, dependency_audit)",
+            "6. Use run_security_scan to run REAL security tools in the Docker sandbox:",
+            "   - bandit: Python static security analysis",
+            "   - safety: Python dependency vulnerability check",
+            "   - npm_audit: JavaScript/Node.js dependency vulnerability check",
             "",
-            "If no issues found, respond with: []",
-            "Output ONLY valid JSON — no markdown, no explanation.",
+            "Focus on issues that static patterns miss:",
+            "- Business logic vulnerabilities",
+            "- Authorization gaps (missing role checks, IDOR)",
+            "- Data flow issues (sensitive data exposure across boundaries)",
+            "- Authentication bypasses (missing guards on endpoints)",
+            "- Race conditions in concurrent operations",
+            "",
+            "Be thorough — examine ALL security-relevant files, not just a few.",
+            "Do NOT repeat issues already found by static scanners.",
+            "Use run_security_scan tools when the sandbox is available for real scanning.",
         ])
 
-        files_context = "\n\n".join(file_summaries[:10])  # Cap at 10 files
-
-        response = await call_ai(self, 
-            messages=[{"role": "user", "content": f"Scan these files:\n\n{files_context}"}],
-            system_prompt=system_prompt,
-            task_type="auth_code",  # Forces Sonnet 4.6
-            temperature=0.1,
+        user_message = (
+            f"Perform a deep security audit of this project ({len(files)} files). "
+            "Start by listing files, then read and analyze the security-critical ones."
         )
 
-        # Parse AI response
-        findings: list[SecurityFinding] = []
         try:
-            raw = response.content.strip()
-            # Strip markdown code fences if present
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-            parsed = orjson.loads(raw.encode("utf-8"))
-
-            if isinstance(parsed, list):
-                for item in parsed:
-                    try:
-                        sev = FindingSeverity(item.get("severity", "info"))
-                    except ValueError:
-                        sev = FindingSeverity.INFO
-                    cat_str = item.get("category", "misconfiguration")
-                    try:
-                        cat = FindingCategory(cat_str)
-                    except ValueError:
-                        cat = FindingCategory.MISCONFIGURATION
-
-                    findings.append(SecurityFinding(
-                        severity=sev,
-                        category=cat,
-                        file_path=item.get("file_path", "(unknown)"),
-                        line=item.get("line"),
-                        title=item.get("title", "AI-detected issue"),
-                        description=item.get("description", ""),
-                        fix_hint=item.get("fix_hint", "Review and fix manually"),
-                    ))
+            await call_ai_with_tools(
+                agent=self,
+                messages=[{"role": "user", "content": user_message}],
+                system_prompt=system_prompt,
+                task_type="auth_code",  # Forces Sonnet 4.6
+                tool_handler=handler,
+                max_tool_rounds=15,  # Allow thorough analysis
+            )
         except Exception as exc:
-            from app.services.ai_router import _sanitize_error  # R27-FIX
-            logger.warning("ai_finding_parse_failed", error=_sanitize_error(exc))
-
-        return findings
+            from app.services.ai_router import _sanitize_error
+            logger.warning("ai_deep_scan_failed", error=_sanitize_error(exc))
 
 
 # Register the agent

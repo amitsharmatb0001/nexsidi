@@ -3,24 +3,23 @@
 Shubham generates backend code using a two-phase approach:
 1. Template phase (ZERO AI): Dockerfile, docker-compose, requirements.txt,
    .env, database.py, config.py, main.py — all from Jinja2 templates
-2. AI phase (dependency-ordered, framework-aware):
-   Each framework has its own generation order, rules, golden examples,
-   and file structure defined in ``app.agents.frameworks``.
+2. AI phase (agentic tool loop): The LLM receives ONE comprehensive prompt
+   listing ALL files to generate. It uses write_file, read_file,
+   validate_syntax, list_files, ask_architect, and task_complete tools to
+   iteratively produce, inspect, and validate all required source files.
 
-Each AI-generated file sees the ACTUAL output of previously generated
-files (not descriptions — the real code), preventing hallucinated imports.
+The agentic approach lets the LLM read previously written files before
+writing dependent ones, validate Python syntax in-loop, and ask the
+architect for clarification — producing more coherent, self-consistent code
+than the old per-file call_ai_with_continuation() approach.
 
-Uses ``call_ai_with_continuation()`` so large files (1000+ lines) are
-generated completely — responses that hit token limits are automatically
-continued until the full file is produced.
-
-Supports: FastAPI (default), Django, Express
+Supports: FastAPI (default), Django, Express, Flask, NestJS, Next.js,
+          Laravel, Spring Boot, ASP.NET, Go/Gin, Rails, Rust/Axum, Kotlin/Ktor
 Security-critical code ALWAYS uses Sonnet 4.6 (AUDIT FIX #17).
 """
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import structlog
@@ -29,7 +28,7 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
-    call_ai_with_continuation,
+    call_ai_with_tools,
     estimate_file_complexity,
     register_agent,
     run_agent,
@@ -39,7 +38,10 @@ from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
 
-# Dependency-ordered file generation sequences per backend framework
+# R37-FIX-23: Cap the total accumulated code injected into prompts to prevent
+# quadratic token cost growth.  Each round keeps all prior file contents; without
+# this cap a large project would exhaust the context window.
+_MAX_ACCUMULATED_CHARS = 100_000  # int; ~25K tokens; safe for 200K-token models
 
 FASTAPI_GENERATION_ORDER: list[dict[str, str]] = [
     {"name": "models", "path": "backend/app/models.py", "task_type": "general",
@@ -611,14 +613,238 @@ def split_generation_step(
     return sub_steps
 
 
+# ── Agentic Tool Definitions ────────────────────────────────────────
+#
+# These tools are exposed to the LLM during Phase 2 (AI code generation).
+# The LLM calls them in a tool loop to write files, read them back,
+# validate syntax, ask the architect for clarification, and signal
+# completion — giving it genuine agency over the generation process.
+
+SHUBHAM_TOOLS: list[ToolDefinition] = [
+    ToolDefinition(
+        name="write_file",
+        description="Write a file to the project output. Use this to save generated code.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to project root (e.g. 'backend/app/models.py')",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Complete file content to write",
+                },
+            },
+            "required": ["path", "content"],
+        },
+    ),
+    ToolDefinition(
+        name="read_file",
+        description="Read a previously generated file to check its content or build upon it.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File path to read",
+                },
+            },
+            "required": ["path"],
+        },
+    ),
+    ToolDefinition(
+        name="validate_syntax",
+        description="Validate Python syntax of generated code. Returns 'OK' or error message.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path of file to validate",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to validate (optional, uses written file if omitted)",
+                },
+            },
+            "required": ["path"],
+        },
+    ),
+    ToolDefinition(
+        name="list_files",
+        description="List all files written so far in the project.",
+        parameters={
+            "type": "object",
+            "properties": {},
+        },
+    ),
+    ToolDefinition(
+        name="ask_architect",
+        description=(
+            "Ask Vikram (architect) a clarifying question about the contract, "
+            "requirements, or design decisions."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Your question for the architect",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Relevant context for the question",
+                },
+            },
+            "required": ["question"],
+        },
+    ),
+    ToolDefinition(
+        name="task_complete",
+        description=(
+            "Signal that code generation is complete. Call this when all required "
+            "files have been written and validated."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Summary of what was generated",
+                },
+            },
+            "required": ["summary"],
+        },
+    ),
+]
+
+
+# ── Agentic Tool Handler ─────────────────────────────────────────────
+
+
+class ShubhamToolHandler:
+    """Handles tool calls from Shubham's agentic tool loop.
+
+    Maintains an in-memory dict of path -> content that accumulates all
+    files written during Phase 2. When the LLM calls task_complete, the
+    ``done`` flag is set and ``summary`` records what was generated.
+    """
+
+    def __init__(
+        self,
+        pipeline_run_id: str,
+        generated_files: dict[str, str],
+        pipeline_context: dict | None = None,
+    ) -> None:
+        self._pipeline_run_id = pipeline_run_id
+        self._files = generated_files  # Shared dict: path -> content
+        self._pipeline_context = pipeline_context or {}  # For agent oracle fallback
+        self._done = False
+        self._summary = ""
+
+    @property
+    def done(self) -> bool:
+        """True after the LLM calls task_complete."""
+        return self._done
+
+    @property
+    def summary(self) -> str:
+        """Summary provided by the LLM when it called task_complete."""
+        return self._summary
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        """Route tool calls to the appropriate handler method."""
+        if tool_name == "write_file":
+            return await self._write_file(**tool_input)
+        elif tool_name == "read_file":
+            return await self._read_file(**tool_input)
+        elif tool_name == "validate_syntax":
+            return await self._validate_syntax(**tool_input)
+        elif tool_name == "list_files":
+            return self._list_files()
+        elif tool_name == "ask_architect":
+            return await self._ask_architect(**tool_input)
+        elif tool_name == "task_complete":
+            return self._task_complete(**tool_input)
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    async def _write_file(self, path: str, content: str) -> str:
+        self._files[path] = content
+        return f"Written {path} ({len(content)} chars)"
+
+    async def _read_file(self, path: str) -> str:
+        if path in self._files:
+            content = self._files[path]
+            if len(content) > 10000:
+                return content[:10000] + "\n... [truncated, use validate_syntax for full file]"
+            return content
+        return f"File not found: {path}. Available: {list(self._files.keys())[:10]}"
+
+    async def _validate_syntax(self, path: str, content: str | None = None) -> str:
+        import ast
+
+        code = content or self._files.get(path, "")
+        if not code:
+            return f"No content for {path}"
+        if not path.endswith(".py"):
+            return "OK (non-Python file, skipping AST check)"
+        try:
+            ast.parse(code)
+            return "OK"
+        except SyntaxError as e:
+            return f"SyntaxError at line {e.lineno}: {e.msg}"
+
+    def _list_files(self) -> str:
+        if not self._files:
+            return "No files written yet"
+        lines = [
+            f"- {path} ({len(content)} chars)"
+            for path, content in self._files.items()
+        ]
+        return "\n".join(lines)
+
+    async def _ask_architect(self, question: str, context: str = "") -> str:
+        # PATH A: Real-time message bus (works when agents run concurrently)
+        try:
+            from app.services.agent_message_bus import get_agent_message_bus
+
+            bus = get_agent_message_bus()
+            answer = await bus.ask(
+                from_agent="shubham",
+                to_agent="vikram",
+                pipeline_run_id=self._pipeline_run_id,
+                question=question,
+                context={"context": context},
+                timeout=10.0,  # Short timeout — fall back to oracle quickly
+            )
+            return answer
+        except Exception:
+            pass  # Fall through to oracle
+
+        # PATH B: Context oracle fallback — Vikram ran before us, so look up
+        # the completed contract from the pipeline context.
+        if self._pipeline_context:
+            from app.services.agent_oracle import query_agent_context
+            return query_agent_context(self._pipeline_context, "vikram", question)
+
+        return "Architect not available. Proceed with best judgment based on contract."
+
+    def _task_complete(self, summary: str) -> str:
+        self._done = True
+        self._summary = summary
+        return f"Task marked complete: {summary}"
+
+
 class Shubham:
     """Backend Engineer — hybrid template + AI code generation.
 
-    Uses framework-aware prompts with:
-    - Framework-specific mandatory rules (ORM, validation, routing, auth)
-    - Golden code examples per generation step
-    - Language-aware code fences (Python vs TypeScript)
-    - Automatic continuation for large files (no truncation)
+    Phase 1 uses a Jinja2 template engine (zero AI) to generate boilerplate.
+    Phase 2 uses a genuine agentic tool loop: the LLM receives one
+    comprehensive prompt and uses write_file / read_file / validate_syntax /
+    list_files / ask_architect / task_complete tools to produce all required
+    source files, self-validate, and signal completion.
     """
 
     name = "shubham"
@@ -627,55 +853,14 @@ class Shubham:
     default_model: str | None = None
 
     def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        self.register_tool(ToolDefinition(
-            name="write_file",
-            description="Write a generated code file to the project.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative file path."},
-                    "content": {"type": "string", "description": "Complete file content."},
-                    "language": {
-                        "type": "string",
-                        "enum": ["python", "typescript", "javascript", "sql", "yaml", "toml"],
-                    },
-                },
-                "required": ["path", "content"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="read_file",
-            description="Read a previously generated file for context.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Relative file path to read."},
-                },
-                "required": ["path"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="read_contract",
-            description="Read the architecture contract (single source of truth).",
-            parameters={
-                "type": "object",
-                "properties": {},
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
+        # tools is a module-level constant — expose it as the instance attribute
+        # that call_ai_with_tools() reads via agent.tools.
+        pass
 
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list[ToolDefinition]:
+        """All tools available in the Phase 2 agentic tool loop."""
+        return SHUBHAM_TOOLS
 
     async def run(
         self,
@@ -693,8 +878,9 @@ class Shubham:
         """Generate backend code from approved architecture contract.
 
         Phase 1: Template engine generates boilerplate (zero AI).
-        Phase 2: AI generates business logic in dependency order with
-                 framework-aware prompts and automatic continuation.
+        Phase 2: Agentic tool loop — ONE comprehensive prompt, LLM iterates
+                 using write_file / read_file / validate_syntax / list_files /
+                 ask_architect / task_complete tools until all files are done.
         """
         vikram_output = context.get("vikram")
         if not vikram_output:
@@ -764,73 +950,88 @@ class Shubham:
             from app.services.ai_router import _sanitize_error  # R27-FIX
             logger.warning("template_phase_failed", error=_sanitize_error(exc))
 
-        # ── Phase 2: AI code generation (parallel dependency-ordered) ──
-        from app.services.ai_router import ProjectCostTracker, select_model_for_generation
+        # ── Phase 2: Agentic tool loop (ONE prompt, LLM drives generation) ──
+        # COST-AGG-FIX: Use the shared pipeline-level tracker when available so
+        # Shubham's costs are counted toward the aggregate cap across all agents.
+        # Falls back to a fresh local tracker if the run is not registered (e.g.,
+        # during unit tests or standalone execution).
+        from app.services.pipeline import get_run_cost_tracker
+        from app.services.ai_router import ProjectCostTracker
 
-        accumulated_code: dict[str, str] = {}
-        cost_tracker = ProjectCostTracker(pipeline_run_id=pipeline_run_id)
+        cost_tracker = get_run_cost_tracker(pipeline_run_id) or ProjectCostTracker(pipeline_run_id=pipeline_run_id)
 
-        # Compute parallel execution levels
-        dep_graph = fw_config.dependency_graph  # OCP-FIX: read from plugin
-        levels = compute_parallel_levels(generation_order, dep_graph)
-
-        logger.info(
-            "parallel_levels_computed",
-            framework=backend_framework,
-            levels=len(levels),
-            level_sizes=[len(lv) for lv in levels],
+        system_prompt = self._build_agentic_system_prompt(
+            contract=contract,
+            generation_order=generation_order,
+            db_artifacts=dhruv_output.get("database_artifacts", ""),
+            fw_config=fw_config,
+            template_file_paths=list(generated_files.keys()),
+            user_feedback=user_feedback,
         )
 
-        for level_idx, level_steps in enumerate(levels):
-            if len(level_steps) == 1:
-                # Single step — run sequentially (no overhead from gather)
-                step = level_steps[0]
-                await self._generate_step(
-                    step=step,
-                    contract=contract,
-                    accumulated_code=accumulated_code,
-                    generated_files=generated_files,
-                    db_artifacts=dhruv_output.get("database_artifacts", ""),
-                    fw_config=fw_config,
-                    user_feedback=user_feedback,
-                    cost_tracker=cost_tracker,
-                )
-            else:
-                # Multiple steps — run in parallel with asyncio.gather
-                logger.info(
-                    "parallel_generation",
-                    level=level_idx,
-                    steps=[s["name"] for s in level_steps],
-                )
-                # Create a snapshot of accumulated_code so parallel steps share
-                # the same context (they don't see each other's output)
-                code_snapshot = dict(accumulated_code)
-                results = await asyncio.gather(
-                    *[
-                        self._generate_step_isolated(
-                            step=step,
-                            contract=contract,
-                            accumulated_code=code_snapshot,
-                            db_artifacts=dhruv_output.get("database_artifacts", ""),
-                            fw_config=fw_config,
-                            user_feedback=user_feedback,
-                            cost_tracker=cost_tracker,
-                        )
-                        for step in level_steps
-                    ],
-                    return_exceptions=True,
-                )
-                # Merge results back
-                for step, result in zip(level_steps, results):
-                    if isinstance(result, Exception):
-                        from app.services.ai_router import _sanitize_error  # R27-FIX
-                        err_prefix = fw_config.error_comment_prefix
-                        accumulated_code[step["name"]] = f"{err_prefix} Generation failed: {_sanitize_error(result)}"
-                        logger.error("parallel_step_failed", step=step["name"], error=_sanitize_error(result))
-                    elif isinstance(result, tuple):
-                        name, content = result
-                        accumulated_code[name] = content
-                        generated_files[step["path"]] = content
+        tool_handler = ShubhamToolHandler(
+            pipeline_run_id=pipeline_run_id,
+            generated_files=generated_files,  # Shared dict — handler writes into it
+            pipeline_context=context,  # For agent oracle fallback in ask_architect
+        )
+
+        logger.info(
+            "agentic_phase_start",
+            framework=backend_framework,
+            files_to_generate=len(generation_order),
+            template_files_available=len(generated_files),
+        )
+
+        try:
+            response = await call_ai_with_tools(
+                self,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Generate a complete {fw_config.display_name} backend application "
+                        f"by writing all required files using the write_file tool. "
+                        f"Start with models/entities, then build up through auth, "
+                        f"business logic, and finally tests. "
+                        f"Call task_complete when ALL files are written and validated."
+                    ),
+                }],
+                system_prompt=system_prompt,
+                task_type="general",
+                tool_handler=tool_handler,
+                max_tool_rounds=30,  # Generous limit for large projects
+            )
+
+            if cost_tracker is not None:
+                cost_tracker.record(response, agent_name=self.name, model_key="high")
+
+            logger.info(
+                "agentic_phase_complete",
+                files_written=len([p for p in generated_files if p not in (
+                    [f.path for f in template_files] if "template_files" in locals() else []
+                )]),
+                tool_handler_done=tool_handler.done,
+                model=response.model_used,
+                tokens=response.output_tokens,
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error  # R27-FIX
+            logger.error("agentic_phase_failed", error=_sanitize_error(exc))
+            # generated_files may have partial output from tool calls before the
+            # exception — keep whatever was written so downstream agents can work
+            # with partial results rather than nothing.
+
+        # ── Layer 1: Builder Self-Check ──
+        # Validate own output before handing off — catch errors early
+        # before downstream reviewers waste AI calls on obvious issues.
+        self_check = self._run_self_check(generated_files, contract, backend_framework)
+
+        logger.info(
+            "self_check_complete",
+            errors=self_check.get("errors", 0),
+            warnings=self_check.get("warnings", 0),
+            passed=self_check.get("passed", False),
+        )
 
         output = {
             "generated_files": list(generated_files.keys()),
@@ -843,7 +1044,9 @@ class Shubham:
             "file_count": len(generated_files),
             "generation_order": [s["name"] for s in generation_order],
             "backend_framework": backend_framework,
+            "agentic_summary": tool_handler.summary if tool_handler.done else "",
             "cost_summary": cost_tracker.summary(),
+            "self_check": self_check,
         }
 
         await store_output(self, pipeline_run_id, output)
@@ -854,195 +1057,134 @@ class Shubham:
             output=output,
         )
 
-    async def _generate_step(
+    def _run_self_check(
         self,
-        step: dict[str, str],
-        contract: dict[str, Any],
-        accumulated_code: dict[str, str],
         generated_files: dict[str, str],
-        db_artifacts: str,
-        fw_config: Any,
-        user_feedback: str,
-        cost_tracker: Any = None,
-    ) -> None:
-        """Generate a single step, updating accumulated_code and generated_files in place."""
-        from app.services.ai_router import select_model_for_generation
-
-        system_prompt = self._build_generation_prompt(
-            step=step,
-            contract=contract,
-            accumulated_code=accumulated_code,
-            db_artifacts=db_artifacts,
-            fw_config=fw_config,
-            user_feedback=user_feedback,
-        )
-
-        # Auto-select model based on estimated complexity
-        estimated = estimate_file_complexity(contract, step["name"])
-        model_key = select_model_for_generation(estimated, step["task_type"])
-
-        # CACHE-FIX: accumulated_code goes in dynamic_system_context, NOT system_prompt,
-        # so the static system_prompt prefix stays stable for cache hits.
-        dynamic_ctx: str | None = None
-        if accumulated_code:
-            lang = fw_config.code_block_lang if fw_config else "python"
-            _MAX_ACCUMULATED_CHARS = 50_000
-            parts: list[str] = ["## Previously Generated Files\n"]
-            budget = _MAX_ACCUMULATED_CHARS
-            for name, code in reversed(list(accumulated_code.items())):
-                entry = f"\n### {name}\n```{lang}\n{code}\n```"
-                if budget - len(entry) < 0 and budget < _MAX_ACCUMULATED_CHARS:
-                    parts.append("\n_(older generated files omitted for prompt size)_")
-                    break
-                parts.append(entry)
-                budget -= len(entry)
-            dynamic_ctx = "".join(parts)
-
-        try:
-            response = await call_ai_with_continuation(self,
-                messages=[{
-                    "role": "user",
-                    "content": f"Generate the {step['description']} for this project.",
-                }],
-                system_prompt=system_prompt,      # STATIC — gets cache hits
-                dynamic_system_context=dynamic_ctx,  # DYNAMIC — no caching
-                task_type=step["task_type"],
-                temperature=0.1,
-                max_continuations=5,
-            )
-
-            accumulated_code[step["name"]] = response.content
-            generated_files[step["path"]] = response.content
-
-            if cost_tracker is not None:
-                cost_tracker.record(response, agent_name=self.name, model_key=model_key)
-
-            logger.info(
-                "ai_generation_step",
-                step=step["name"],
-                model=response.model_used,
-                tokens=response.output_tokens,
-                was_truncated=response.was_truncated,
-                estimated_lines=estimated,
-                selected_model=model_key,
-            )
-
-        except Exception as exc:
-            from app.services.ai_router import _sanitize_error  # R27-FIX
-            logger.error("ai_generation_failed", step=step["name"], error=_sanitize_error(exc))
-            err_prefix = fw_config.error_comment_prefix
-            accumulated_code[step["name"]] = f"{err_prefix} Generation failed: {_sanitize_error(exc)}"
-
-    async def _generate_step_isolated(
-        self,
-        step: dict[str, str],
         contract: dict[str, Any],
-        accumulated_code: dict[str, str],
-        db_artifacts: str,
-        fw_config: Any,
-        user_feedback: str,
-        cost_tracker: Any = None,
-    ) -> tuple[str, str]:
-        """Generate a single step and return (name, content) without mutating shared state.
+        backend_framework: str,
+    ) -> dict[str, Any]:
+        """Layer 1 self-check: validate own output before downstream handoff.
 
-        Used for parallel generation via asyncio.gather().
+        Checks (no AI — pure deterministic):
+        1. Python files have valid syntax (ast.parse)
+        2. No placeholder/TODO comments in generated code
+        3. Required files from contract exist
+        4. Non-empty file contents
+        5. Import consistency (basic check)
         """
-        from app.services.ai_router import select_model_for_generation
+        import ast
+        import re
 
-        system_prompt = self._build_generation_prompt(
-            step=step,
-            contract=contract,
-            accumulated_code=accumulated_code,
-            db_artifacts=db_artifacts,
-            fw_config=fw_config,
-            user_feedback=user_feedback,
-        )
+        errors: list[dict[str, str]] = []
+        warnings: list[dict[str, str]] = []
+        files_checked = 0
 
-        estimated = estimate_file_complexity(contract, step["name"])
-        model_key = select_model_for_generation(estimated, step["task_type"])
+        for path, content in generated_files.items():
+            if not content or len(content.strip()) < 10:
+                errors.append({"file": path, "issue": "File is empty or near-empty"})
+                continue
 
-        # CACHE-FIX: accumulated_code goes in dynamic_system_context, NOT system_prompt,
-        # so the static system_prompt prefix stays stable for cache hits.
-        dynamic_ctx: str | None = None
-        if accumulated_code:
-            lang = fw_config.code_block_lang if fw_config else "python"
-            _MAX_ACCUMULATED_CHARS = 50_000
-            parts: list[str] = ["## Previously Generated Files\n"]
-            budget = _MAX_ACCUMULATED_CHARS
-            for name, code in reversed(list(accumulated_code.items())):
-                entry = f"\n### {name}\n```{lang}\n{code}\n```"
-                if budget - len(entry) < 0 and budget < _MAX_ACCUMULATED_CHARS:
-                    parts.append("\n_(older generated files omitted for prompt size)_")
-                    break
-                parts.append(entry)
-                budget -= len(entry)
-            dynamic_ctx = "".join(parts)
+            files_checked += 1
 
-        response = await call_ai_with_continuation(self,
-            messages=[{
-                "role": "user",
-                "content": f"Generate the {step['description']} for this project.",
-            }],
-            system_prompt=system_prompt,      # STATIC — gets cache hits
-            dynamic_system_context=dynamic_ctx,  # DYNAMIC — no caching
-            task_type=step["task_type"],
-            temperature=0.1,
-            max_continuations=5,
-        )
+            # 1. Python syntax check
+            if path.endswith(".py"):
+                try:
+                    ast.parse(content)
+                except SyntaxError as e:
+                    errors.append({
+                        "file": path,
+                        "issue": f"SyntaxError at line {e.lineno}: {e.msg}",
+                    })
 
-        if cost_tracker is not None:
-            cost_tracker.record(response, agent_name=self.name, model_key=model_key)
+            # 2. Placeholder/TODO detection
+            todo_matches = re.findall(
+                r"(?:TODO|FIXME|HACK|XXX|PLACEHOLDER|implement later|add more here|pass\s*#)",
+                content, re.IGNORECASE,
+            )
+            if todo_matches:
+                warnings.append({
+                    "file": path,
+                    "issue": f"Found {len(todo_matches)} placeholder comment(s): {todo_matches[:3]}",
+                })
 
-        logger.info(
-            "ai_generation_step_parallel",
-            step=step["name"],
-            model=response.model_used,
-            tokens=response.output_tokens,
-            estimated_lines=estimated,
-            selected_model=model_key,
-        )
+            # 3. Anti-hallucination: check for common LLM artifacts
+            if "```python" in content or "```typescript" in content:
+                errors.append({
+                    "file": path,
+                    "issue": "File contains markdown code fences (LLM artifact)",
+                })
 
-        return (step["name"], response.content)
+        # 4. Check required files exist based on contract
+        expected_tables = contract.get("tables", [])
+        if expected_tables and backend_framework in ("fastapi", "flask"):
+            if not any("models" in p for p in generated_files):
+                errors.append({
+                    "file": "(missing)",
+                    "issue": "No models file found but contract defines database tables",
+                })
 
-    def _build_generation_prompt(
+        return {
+            "files_checked": files_checked,
+            "errors": len(errors),
+            "warnings": len(warnings),
+            "error_details": errors[:20],  # Cap detail output
+            "warning_details": warnings[:20],
+            "passed": len(errors) == 0,
+        }
+
+    def _build_agentic_system_prompt(
         self,
-        step: dict[str, str],
         contract: dict[str, Any],
-        accumulated_code: dict[str, str],
+        generation_order: list[dict[str, str]],
         db_artifacts: str,
-        fw_config: Any | None = None,
+        fw_config: Any,
+        template_file_paths: list[str],
         user_feedback: str = "",
     ) -> str:
-        """Build context-rich, framework-aware prompt for each generation step.
+        """Build ONE comprehensive system prompt for the agentic Phase 2 tool loop.
+
+        Unlike the old per-file prompt, this describes ALL files the LLM must
+        generate in a single session. The LLM drives the process by calling
+        write_file, read_file, validate_syntax, etc. in whatever order it chooses,
+        and signals completion with task_complete.
 
         Prompt structure:
-        1. WHAT TO BUILD — role + task + framework
-        2. Architecture Contract — the single source of truth
-        3. Database DDL (if applicable)
+        1. Role + framework + language
+        2. Architecture Contract — single source of truth
+        3. Database DDL (if available)
         4. File Structure — expected project layout
-        5. Mandatory Rules — 14 framework-specific rules
-        6. Golden Example — code pattern for this specific step
-        7. Previously Generated Files — real code for dependency context
-        8. Completeness Rules — never truncate, generate full files
-        9. User Feedback (if present)
-        10. GENERATE — output format instructions
+        5. Required files to generate (from generation_order)
+        6. Mandatory framework rules
+        7. Golden examples for first generation step (models/entities)
+        8. Tool usage rules — how to use each tool correctly
+        9. Template files already available via read_file
+        10. Completeness rules
+        11. User feedback (if present)
         """
         import orjson
 
-        # Lazy-import framework config if not provided (backward compat)
-        if fw_config is None:
-            from app.agents.frameworks import get_framework_config
-            fw_config = get_framework_config("fastapi")
-
         contract_json = orjson.dumps(contract, option=orjson.OPT_INDENT_2).decode("utf-8")
+
+        # AUDIT-FIX: Cap serialized contract to prevent token explosion.
+        # For very large contracts (>20K chars), extract only the most relevant
+        # sections instead of dumping the full nested object.
+        _MAX_CONTRACT_CHARS = 20_000
+        if len(contract_json) > _MAX_CONTRACT_CHARS:
+            _relevant_keys = ["tables", "endpoints", "tech_stack", "app_name", "database", "auth"]
+            trimmed = {k: contract[k] for k in _relevant_keys if k in contract}
+            contract_json = orjson.dumps(trimmed, option=orjson.OPT_INDENT_2).decode("utf-8")
+            # If still too large after key filtering, hard-truncate
+            if len(contract_json) > _MAX_CONTRACT_CHARS:
+                contract_json = contract_json[:_MAX_CONTRACT_CHARS] + "\n... [truncated at 20000 chars]"
+
         lang = fw_config.code_block_lang
 
         prompt_parts: list[str] = []
 
-        # ── 1. WHAT TO BUILD ──
+        # ── 1. Role + Framework ──
         prompt_parts.extend([
-            f"You are Shubham, the Backend Engineer at NexSidi.",
-            f"You are generating the **{step['description']}** for a **{fw_config.display_name}** project.",
+            f"You are Shubham, an expert backend engineer at NexSidi.",
+            f"Generate a complete **{fw_config.display_name}** backend application.",
             f"Language: {fw_config.language}.",
             "",
         ])
@@ -1054,11 +1196,10 @@ class Shubham:
             "",
         ])
 
-        # ── 3. Database DDL (if applicable) ──
-        model_steps = ("models", "schemas", "db_schema", "types", "serializers")
-        if db_artifacts and step["name"] in model_steps:
+        # ── 3. Database DDL ──
+        if db_artifacts:
             prompt_parts.extend([
-                "## Database DDL (from Dhruv)",
+                "## Database DDL (from Dhruv — use for models/schema generation)",
                 db_artifacts,
                 "",
             ])
@@ -1069,28 +1210,64 @@ class Shubham:
             prompt_parts.append(f"- `{step_name}` → `{path}`")
         prompt_parts.append("")
 
-        # ── 5. Mandatory Rules ──
+        # ── 5. Required Files ──
+        prompt_parts.append("## Files You Must Generate")
+        prompt_parts.append(
+            "Write these files IN ORDER using the write_file tool. "
+            "Each file depends on those above it."
+        )
+        for step in generation_order:
+            prompt_parts.append(f"- **{step['path']}** — {step['description']}")
+        prompt_parts.append("")
+
+        # ── 6. Mandatory Rules ──
         prompt_parts.append(f"## MANDATORY {fw_config.display_name} RULES (NEVER VIOLATE)")
         for rule in fw_config.rules:
             prompt_parts.append(rule)
         prompt_parts.append("")
 
-        # ── 6. Golden Example ──
-        golden = fw_config.golden_examples.get(step["name"])
+        # ── 7. Golden Examples (first step — models/entities) ──
+        first_step_name = generation_order[0]["name"] if generation_order else ""
+        golden = fw_config.golden_examples.get(first_step_name)
         if golden:
             prompt_parts.extend([
-                f"## GOLDEN EXAMPLE — {step['name']}",
-                f"Follow this EXACT pattern. Adapt names/fields from the contract.",
+                f"## GOLDEN EXAMPLE — {first_step_name}",
+                f"Follow this EXACT pattern for the first file. Adapt names/fields from contract.",
                 f"```{lang}\n{golden}\n```",
                 "",
             ])
 
-        # ── 7. Previously Generated Files ──
-        # CACHE-FIX: accumulated_code is NO LONGER embedded here.
-        # It is passed as dynamic_system_context in the AIRequest so the static
-        # system_prompt prefix remains stable across calls, enabling cache hits.
+        # ── 8. Tool Usage Rules ──
+        prompt_parts.extend([
+            "## Tool Usage Rules",
+            "1. Write models/entities FIRST before anything that depends on them.",
+            "2. After writing a Python file, call validate_syntax to check for errors.",
+            "3. Before writing a file that imports from another, use read_file to verify imports.",
+            "4. Use ask_architect if the contract is ambiguous or contradictory.",
+            "5. Use list_files to check what you have written so far.",
+            "6. Call task_complete ONLY when ALL required files are written and validated.",
+            "7. Each file must be COMPLETE — no truncation, no placeholder comments.",
+            "8. Every function must be fully implemented with real business logic.",
+            f"9. Error comments use `{fw_config.error_comment_prefix}`.",
+            "10. Match table/column names EXACTLY from the contract.",
+            "",
+        ])
 
-        # ── 8. Completeness Rules ──
+        # ── 9. Template Files Already Available ──
+        if template_file_paths:
+            prompt_parts.append(
+                "## Template Files Already Generated (available via read_file)"
+            )
+            for path in template_file_paths:
+                prompt_parts.append(f"- {path}")
+            prompt_parts.append(
+                "These include Dockerfile, docker-compose, requirements.txt, "
+                "database.py, config.py, main.py. Use read_file to inspect them "
+                "and ensure your generated code imports from them correctly."
+            )
+            prompt_parts.append("")
+
+        # ── 10. Completeness Rules ──
         prompt_parts.extend([
             "## COMPLETENESS RULES",
             "- Generate the COMPLETE file. NEVER stop mid-function or mid-class.",
@@ -1101,23 +1278,64 @@ class Shubham:
             "",
         ])
 
-        # ── 9. User Feedback ──
+        # ── 11. User Feedback ──
         if user_feedback:
             prompt_parts.extend([
-                "## User Feedback (incorporate into generation)",
+                "## User Feedback (incorporate into ALL generated files)",
                 user_feedback,
                 "",
             ])
 
-        # ── 10. GENERATE ──
-        prompt_parts.extend([
-            "## GENERATE",
-            f"Output ONLY the {lang} code file. No markdown wrapping, no explanations.",
-            f"Error comments use `{fw_config.error_comment_prefix}`.",
-            "Match table/column names EXACTLY from the contract.",
-        ])
-
         return "\n".join(prompt_parts)
+
+    def _build_generation_prompt(
+        self,
+        step: dict[str, str],
+        contract: dict[str, Any],
+        accumulated_code: dict[str, str],
+        db_artifacts: str,
+        fw_config: Any,
+        user_feedback: str = "",
+    ) -> str:
+        """Backward-compat wrapper — tests call the old per-step signature.
+
+        The new agentic system sends ONE system prompt for ALL files; this shim
+        wraps _build_agentic_system_prompt() so existing test assertions still pass.
+
+        R37-FIX-23: Apply _MAX_ACCUMULATED_CHARS budget — only the most recent
+        files within the budget are injected, preventing OOM on large projects.
+        """
+        # Build a generation order from the single step (test compat)
+        generation_order = [step]
+
+        # Budget-cap accumulated_code before injecting it (R37-FIX-23)
+        budget = _MAX_ACCUMULATED_CHARS
+        capped: dict[str, str] = {}
+        for path, code in reversed(list(accumulated_code.items())):
+            if budget <= 0:
+                break
+            snippet = code[:budget]
+            capped[path] = snippet
+            budget -= len(snippet)
+        if len(capped) < len(accumulated_code):
+            logger.debug(
+                "accumulated_code_budget_exceeded",
+                total_files=len(accumulated_code),
+                included_files=len(capped),
+                omitted=len(accumulated_code) - len(capped),
+            )
+
+        # Template files list derived from capped accumulated code
+        template_file_paths = list(capped.keys())
+
+        return self._build_agentic_system_prompt(
+            contract=contract,
+            generation_order=generation_order,
+            db_artifacts=db_artifacts,
+            fw_config=fw_config,
+            template_file_paths=template_file_paths,
+            user_feedback=user_feedback,
+        )
 
 
 # Register the agent

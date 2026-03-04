@@ -16,7 +16,7 @@ Pipeline stages:
     DATABASE_DESIGN -> UI_DESIGN -> CHECKPOINT_DESIGN ->
     BACKEND_BUILD -> FRONTEND_BUILD ->
     QUALITY_REVIEW (parallel) -> TESTING -> SECURITY_AUDIT ->
-    COMPLIANCE_CHECK -> FIXING (loop) -> CHECKPOINT_TESTING ->
+    COMPLIANCE_CHECK -> TILOTMA_REVIEW (GO/NO-GO) -> FIXING (loop) -> CHECKPOINT_TESTING ->
     DEPLOYMENT -> DELIVERY -> COMPLETED
 """
 
@@ -34,9 +34,26 @@ from typing import Any
 import structlog
 
 from app.agents.base import AgentResult, AgentStatus, get_agent
-from app.services.ai_router import PipelineCostLimitError  # COST-CAP-FIX
+from app.services.ai_router import PipelineCostLimitError, ProjectCostTracker  # COST-CAP-FIX
 
 logger = structlog.get_logger(__name__)
+
+# COST-AGG-FIX: Module-level registry mapping run_id → shared ProjectCostTracker.
+# Agents that want to contribute to the pipeline-level cost cap call
+# get_run_cost_tracker(pipeline_run_id) and record() on the result.
+# Keyed by run_id (str UUID); entries are removed when the run reaches a
+# terminal state so the dict doesn't grow unboundedly.
+_RUN_COST_TRACKERS: dict[str, ProjectCostTracker] = {}
+
+
+def get_run_cost_tracker(run_id: str) -> ProjectCostTracker | None:
+    """Return the shared cost tracker for a running pipeline, or None.
+
+    Agents call this to contribute their AI costs to the pipeline-level cap.
+    Returns None for runs that haven't started yet (safe to ignore — agents
+    fall back to their own local tracking).
+    """
+    return _RUN_COST_TRACKERS.get(run_id)
 
 
 # -- Pipeline Stages ----------------------------------------------------------
@@ -58,6 +75,7 @@ class PipelineStage(str, Enum):
     TESTING = "testing"
     SECURITY_AUDIT = "security_audit"
     COMPLIANCE_CHECK = "compliance_check"
+    TILOTMA_REVIEW = "tilotma_review"  # Tilotma GO/NO-GO before fixing
     FIXING = "fixing"
     CHECKPOINT_TESTING = "checkpoint_testing"
     DEPLOYMENT = "deployment"
@@ -80,6 +98,7 @@ STAGE_AGENTS: dict[PipelineStage, str | list[str]] = {
     PipelineStage.TESTING: "aarav",
     PipelineStage.SECURITY_AUDIT: "karan",
     PipelineStage.COMPLIANCE_CHECK: "karan",
+    PipelineStage.TILOTMA_REVIEW: "tilotma",  # Tilotma reviews all reports, GO/NO-GO
     PipelineStage.FIXING: "fixer",
     PipelineStage.CHECKPOINT_TESTING: "__checkpoint_2__",
     PipelineStage.DEPLOYMENT: "pranav",
@@ -140,6 +159,7 @@ FIX_RETEST_STAGES: list[PipelineStage] = [
     PipelineStage.TESTING,
     PipelineStage.SECURITY_AUDIT,
     PipelineStage.COMPLIANCE_CHECK,
+    PipelineStage.TILOTMA_REVIEW,
     PipelineStage.FIXING,
 ]
 
@@ -841,6 +861,46 @@ class PipelineOrchestrator:
         if isinstance(agent_name, list):
             return await self._execute_parallel(run, stage, agent_name)
 
+        # Contract coherence check: fail-fast before Shubham consumes the contract.
+        # If FK references or endpoint paths are broken, stop now instead of
+        # generating thousands of lines of incorrect code.
+        if stage == PipelineStage.BACKEND_BUILD:
+            contract = run.context.get("vikram", {}).get("contract", {})
+            if contract:
+                from app.services.contract_validator import validate_contract_coherence
+
+                coherence_errors = validate_contract_coherence(contract)
+                if coherence_errors:
+                    error_summary = "; ".join(coherence_errors[:5])
+                    if len(coherence_errors) > 5:
+                        error_summary += f" … and {len(coherence_errors) - 5} more"
+                    logger.error(
+                        "contract_coherence_fail_fast",
+                        run_id=run.run_id,
+                        error_count=len(coherence_errors),
+                        errors=coherence_errors,
+                    )
+                    from app.agents.base import AgentResult, AgentStatus
+
+                    failed_result = AgentResult(
+                        agent_name="contract_coherence_validator",
+                        status=AgentStatus.FAILED,
+                        error=(
+                            f"Architecture contract has {len(coherence_errors)} coherence "
+                            f"error(s): {error_summary}"
+                        ),
+                    )
+                    step = StepResult(
+                        stage=stage,
+                        agent_name="contract_coherence_validator",
+                        result=failed_result,
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                    await self._persist_step(run, step)
+                    run.status = PipelineRunStatus.FAILED
+                    run.error = failed_result.error
+                    return step
+
         # Execute single agent
         return await self._execute_agent(run, stage, agent_name)
 
@@ -1094,6 +1154,12 @@ class PipelineOrchestrator:
         """Inner pipeline execution (runs inside semaphore + timeout)."""
         run.status = PipelineRunStatus.RUNNING
 
+        # COST-AGG-FIX: Create a shared cost tracker for this run so ALL agents
+        # (Shubham, Fixer, Aanya, etc.) contribute to the same cap.
+        # Registered in the module-level dict so agents can look it up by run_id
+        # without receiving it as a parameter (no signature changes required).
+        _RUN_COST_TRACKERS[run.run_id] = ProjectCostTracker(pipeline_run_id=run.run_id)
+
         # Persist initial state
         await self._persist_run(run)
 
@@ -1111,6 +1177,19 @@ class PipelineOrchestrator:
             )
         except Exception:
             pass  # WebSocket notification failures must NEVER crash the pipeline
+
+        # PUBSUB-FIX: Cross-process broadcast — publish pipeline_started so other
+        # workers' WebSocket clients receive the event.
+        try:
+            from app.services.pipeline_events import get_pipeline_event_publisher
+            await get_pipeline_event_publisher().publish_stage_update(
+                run.run_id,
+                stage="pipeline",
+                status="pipeline_started",
+                agent_name="",
+            )
+        except Exception:
+            pass
 
         # WEBHOOK-FIX: Also deliver pipeline.started to registered webhooks
         try:
@@ -1143,6 +1222,18 @@ class PipelineOrchestrator:
             except Exception:
                 pass
 
+            # PUBSUB-FIX: Cross-process broadcast — publish stage_started.
+            try:
+                from app.services.pipeline_events import get_pipeline_event_publisher
+                await get_pipeline_event_publisher().publish_stage_update(
+                    run.run_id,
+                    stage=run.current_stage.value,
+                    status="stage_started",
+                    agent_name=agent_name_ws,
+                )
+            except Exception:
+                pass
+
             step_result = await self.execute_stage(run)
             run.step_results.append(step_result)
             step_count += 1
@@ -1156,6 +1247,18 @@ class PipelineOrchestrator:
                     agent=step_result.agent_name,
                 )
                 await self._emit_file_events(run, step_result)
+            except Exception:
+                pass
+
+            # PUBSUB-FIX: Cross-process broadcast — publish stage_completed.
+            try:
+                from app.services.pipeline_events import get_pipeline_event_publisher
+                await get_pipeline_event_publisher().publish_stage_update(
+                    run.run_id,
+                    stage=step_result.stage.value,
+                    status="stage_completed",
+                    agent_name=step_result.agent_name,
+                )
             except Exception:
                 pass
 
@@ -1312,11 +1415,36 @@ class PipelineOrchestrator:
 
         # WS-FIX: Emit terminal pipeline-level events
         if run.status == PipelineRunStatus.COMPLETED:
+            # Compute simulation summary for the completion event payload so
+            # WebSocket subscribers don't need an extra HTTP round-trip.
+            _sandbox_sim = bool(run.context.get("aarav", {}).get("is_simulation_sandbox", False))
+            _git_sim = bool(run.context.get("git_agent", {}).get("is_simulation_git", False))
+            _deploy_sim = bool(run.context.get("pranav", {}).get("is_simulation_deploy", False))
+            _partially_simulated = _sandbox_sim or _git_sim or _deploy_sim
+            _sim_summary = (
+                {"sandbox_simulated": _sandbox_sim, "git_simulated": _git_sim, "deploy_simulated": _deploy_sim}
+                if _partially_simulated else {}
+            )
             try:
                 await notify_pipeline_event(
                     run.run_id,
                     "pipeline_completed",
-                    data={"run_id": run.run_id},
+                    data={
+                        "run_id": run.run_id,
+                        "is_partially_simulated": _partially_simulated,
+                        "simulation_summary": _sim_summary,
+                    },
+                )
+            except Exception:
+                pass
+            # PUBSUB-FIX: Cross-process broadcast — publish pipeline_completed.
+            try:
+                from app.services.pipeline_events import get_pipeline_event_publisher
+                await get_pipeline_event_publisher().publish_stage_update(
+                    run.run_id,
+                    stage="pipeline",
+                    status="pipeline_completed",
+                    agent_name="",
                 )
             except Exception:
                 pass
@@ -1330,12 +1458,70 @@ class PipelineOrchestrator:
                 )
             except Exception:
                 pass
+            # TOKEN-USAGE-FIX: Persist per-model token usage to billing.token_usage
+            # so cost analytics and quota enforcement have a durable record.
+            # Uses the shared cost tracker created at pipeline start.
+            # NOTE: billing.token_usage requires user_id (NOT NULL). Skip if the run
+            # has no user_id (system-triggered runs). No pipeline_run_id column exists.
+            try:
+                tracker = _RUN_COST_TRACKERS.get(run.run_id)
+                if tracker is not None and run.user_id is not None:
+                    summary = tracker.summary()
+                    if summary.get("total_cost_usd", 0) > 0:
+                        from app.database import get_session_factory
+                        from sqlalchemy import text as _text
+                        from datetime import datetime, timezone as _tz
+                        _factory = get_session_factory()
+                        async with _factory() as _session:
+                            per_model = summary.get("per_model_breakdown", {})
+                            for model_id, stats in per_model.items():
+                                await _session.execute(_text("""
+                                    INSERT INTO billing.token_usage
+                                        (id, organization_id, user_id, project_id,
+                                         model, input_tokens, output_tokens, cost_usd, recorded_at)
+                                    VALUES
+                                        (gen_random_uuid(), :org_id::uuid, :user_id::uuid,
+                                         :project_id::uuid, :model,
+                                         :input_tokens, :output_tokens, :cost_usd, :now)
+                                    ON CONFLICT DO NOTHING
+                                """), {
+                                    "org_id": str(run.organization_id),
+                                    "user_id": str(run.user_id),
+                                    "project_id": str(run.project_id),
+                                    "model": model_id,
+                                    "input_tokens": stats.get("input_tokens", 0),
+                                    "output_tokens": stats.get("output_tokens", 0),
+                                    "cost_usd": round(stats.get("cost_usd", 0.0), 6),
+                                    "now": datetime.now(_tz.utc),
+                                })
+                            await _session.commit()
+                            logger.info(
+                                "token_usage_persisted",
+                                run_id=run.run_id,
+                                total_cost_usd=round(summary.get("total_cost_usd", 0), 4),
+                                models=list(per_model.keys()),
+                            )
+            except Exception as _exc:
+                # Non-fatal — billing data is important but must not crash the pipeline
+                logger.warning("token_usage_persist_failed", run_id=run.run_id, error=str(_exc)[:200])
         elif run.status == PipelineRunStatus.FAILED:
             try:
                 await notify_pipeline_event(
                     run.run_id,
                     "pipeline_failed",
                     data={"error": str(run.error or "")[:200]},
+                )
+            except Exception:
+                pass
+            # PUBSUB-FIX: Cross-process broadcast — publish pipeline_failed.
+            try:
+                from app.services.pipeline_events import get_pipeline_event_publisher
+                await get_pipeline_event_publisher().publish_stage_update(
+                    run.run_id,
+                    stage="pipeline",
+                    status="pipeline_failed",
+                    agent_name="",
+                    error=str(run.error or "")[:200],
                 )
             except Exception:
                 pass
@@ -1356,6 +1542,10 @@ class PipelineOrchestrator:
         if run.status in (PipelineRunStatus.COMPLETED, PipelineRunStatus.FAILED):
             self._active_runs.pop(run.run_id, None)
             self._paused_at.pop(run.run_id, None)  # R17-FIX: Clean up tracking
+            # COST-AGG-FIX: Evict the shared cost tracker alongside the run.
+            # Keeping it after the run completes would be a memory leak on long-lived
+            # processes with many pipeline runs.
+            _RUN_COST_TRACKERS.pop(run.run_id, None)
             logger.debug("run_evicted_from_cache", run_id=run.run_id, status=run.status.value)
         elif run.status == PipelineRunStatus.PAUSED:
             # R17-FIX: Track when this run entered PAUSED state for TTL eviction
@@ -1759,6 +1949,13 @@ class PipelineOrchestrator:
             step.skipped = True
             step.completed_at = datetime.now(timezone.utc)
             return step
+
+        # Inject tilotma_mode for TILOTMA_REVIEW stage so Tilotma knows
+        # to run in review mode (GO/NO-GO) instead of requirements mode.
+        if stage == PipelineStage.TILOTMA_REVIEW and agent_name == "tilotma":
+            run.context["tilotma_mode"] = "review"
+        elif agent_name == "tilotma" and stage == PipelineStage.REQUIREMENTS:
+            run.context.pop("tilotma_mode", None)  # Ensure requirements mode
 
         # R11-FIX: Wrap agent.run() so crashed steps still get a StepResult
         # record in the database (for post-mortem diagnostics). Previously,

@@ -28,8 +28,9 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
-    call_ai,
+    call_ai_with_tools,
     register_agent,
+    resolve_model_override,
     run_agent,
     store_output,
 )
@@ -169,6 +170,236 @@ def _sanitize_message(message: str) -> str:
     return sanitized
 
 
+# ── Fixer Tool Handler ─────────────────────────────────────────────
+
+
+class FixerToolHandler:
+    """Handles tool calls from Fixer's agentic tool loop."""
+
+    def __init__(
+        self,
+        context: dict,
+        error: SanitizedError,
+        error_report: dict,
+        pipeline_run_id: str = "",
+    ):
+        self._context = context
+        self._error = error
+        self._error_report = error_report
+        self._pipeline_run_id = pipeline_run_id
+        self._written_files: dict[str, str] = {}  # path -> new content
+        self._fix_description = ""
+        self._validation_passed = False
+        self._complete = False
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "read_file":
+            return self._read_file(tool_input["path"])
+        elif tool_name == "write_file":
+            return self._write_file(tool_input["path"], tool_input["content"])
+        elif tool_name == "validate_syntax":
+            return self._validate_syntax(tool_input["path"], tool_input.get("content"))
+        elif tool_name == "read_error_report":
+            import json
+            return json.dumps(self._error_report, indent=2)
+        elif tool_name == "report_complete":
+            return self._report_complete(
+                tool_input["fix_description"],
+                tool_input.get("validation_passed", False),
+            )
+        elif tool_name == "check_imports":
+            return self._check_imports(tool_input["path"])
+        elif tool_name == "search_solution":
+            return await self._search_solution(
+                tool_input["error_message"],
+                tool_input.get("context", ""),
+            )
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _read_file(self, path: str) -> str:
+        # Check written_files first (latest version)
+        if path in self._written_files:
+            content = self._written_files[path]
+            if len(content) > 10000:
+                return content[:10000] + "\n...[truncated]"
+            return content
+        # Fall back to context (original generated content)
+        for agent in ("shubham", "aanya"):
+            agent_out = self._context.get(agent, {})
+            if isinstance(agent_out, dict):
+                fc = agent_out.get("file_contents", {})
+                if path in fc:
+                    content = fc[path]
+                    if len(content) > 10000:
+                        return content[:10000] + "\n...[truncated]"
+                    return content
+        return f"File not found: {path}"
+
+    def _write_file(self, path: str, content: str) -> str:
+        if len(content) < 10:
+            return "Error: content too short — must be a complete file"
+        self._written_files[path] = content
+        return f"Written {path} ({len(content)} chars)"
+
+    def _validate_syntax(self, path: str, content: str | None = None) -> str:
+        code = content or self._written_files.get(path, "")
+        if not code:
+            return f"No content for {path}"
+        if path.endswith(".py"):
+            import ast
+            try:
+                ast.parse(code)
+                return "OK — Python syntax is valid"
+            except SyntaxError as e:
+                return f"SyntaxError at line {e.lineno}: {e.msg}"
+        # Non-Python: basic bracket balance
+        opens = code.count("{") + code.count("(") + code.count("[")
+        closes = code.count("}") + code.count(")") + code.count("]")
+        if abs(opens - closes) > 5:
+            return f"Possible issue: unbalanced brackets (opens={opens}, closes={closes})"
+        return "OK"
+
+    def _report_complete(self, fix_description: str, validation_passed: bool) -> str:
+        self._fix_description = fix_description
+        self._validation_passed = validation_passed
+        self._complete = True
+        return f"Fix reported as complete: {fix_description}"
+
+    def _check_imports(self, path: str) -> str:
+        """Verify all imports in a Python file resolve to known modules.
+
+        Uses ast.parse() to extract Import/ImportFrom nodes, then checks
+        against stdlib, known third-party packages, and project files.
+        """
+        import ast
+        import sys
+
+        code = self._written_files.get(path, "")
+        if not code:
+            code = self._read_file(path)
+            if code.startswith("File not found"):
+                return code
+
+        if not path.endswith(".py"):
+            return "check_imports only works on Python files"
+
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return f"Cannot parse {path}: SyntaxError at line {e.lineno}: {e.msg}"
+
+        # Collect all import targets
+        imports: list[dict[str, str]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.append({
+                        "module": alias.name,
+                        "line": node.lineno,
+                        "type": "import",
+                    })
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imports.append({
+                        "module": node.module,
+                        "line": node.lineno,
+                        "type": "from_import",
+                    })
+
+        if not imports:
+            return "No imports found in file."
+
+        # Known third-party packages (common ones)
+        _KNOWN_THIRD_PARTY = {
+            "fastapi", "uvicorn", "pydantic", "sqlalchemy", "alembic",
+            "passlib", "jose", "jwt", "bcrypt", "dotenv", "orjson",
+            "httpx", "requests", "celery", "redis", "structlog",
+            "django", "flask", "express", "prisma", "boto3",
+            "pytest", "starlette", "databases", "aiohttp", "asyncpg",
+            "psycopg2", "pymongo", "motor", "stripe", "sendgrid",
+            "pillow", "PIL", "numpy", "pandas",
+        }
+
+        # Project files available in context
+        project_files = set()
+        for agent in ("shubham", "aanya"):
+            agent_out = self._context.get(agent, {})
+            if isinstance(agent_out, dict):
+                for fp in agent_out.get("generated_files", []):
+                    # Convert file path to module path
+                    mod = fp.replace("/", ".").replace("\\", ".").rstrip(".py")
+                    project_files.add(mod)
+                    # Also add parent package
+                    parts = mod.rsplit(".", 1)
+                    if len(parts) > 1:
+                        project_files.add(parts[0])
+
+        unresolved: list[dict[str, Any]] = []
+
+        for imp in imports:
+            module = imp["module"]
+            top_level = module.split(".")[0]
+
+            # Check: stdlib?
+            if top_level in sys.stdlib_module_names:
+                continue
+
+            # Check: known third-party?
+            if top_level in _KNOWN_THIRD_PARTY:
+                continue
+
+            # Check: project module?
+            if any(module.startswith(pf) or pf.startswith(module) for pf in project_files):
+                continue
+
+            # Check: relative import from app/backend?
+            if top_level in ("app", "backend", "core", "config", "src"):
+                continue
+
+            unresolved.append(imp)
+
+        if not unresolved:
+            return f"All {len(imports)} imports in {path} resolved successfully."
+
+        lines = [f"Found {len(unresolved)} unresolved import(s) in {path}:"]
+        for u in unresolved:
+            lines.append(f"  Line {u['line']}: {u['type']} {u['module']}")
+        lines.append("\nPossible fixes:")
+        lines.append("  - Add missing package to requirements.txt")
+        lines.append("  - Fix typo in import path")
+        lines.append("  - Create the missing module file")
+        return "\n".join(lines)
+
+    async def _search_solution(self, error_message: str, context: str = "") -> str:
+        """Search web for a solution using the Research Agent.
+
+        Uses Gemini with Google Search Grounding — zero extra cost.
+        """
+        try:
+            from app.agents.research_agent import ResearchAgent
+
+            researcher = ResearchAgent(project_id=self._pipeline_run_id)
+            result = await researcher.search_for_solution(
+                error_msg=error_message,
+                context=context,
+            )
+            solution = result.get("solution", "")
+            sources = result.get("sources", [])
+
+            if not solution:
+                return "No solution found via web search."
+
+            response = f"Web search result:\n{solution[:1000]}"
+            if sources:
+                response += f"\n\nSources: {', '.join(sources[:3])}"
+            return response
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            return f"Web search failed: {_sanitize_error(exc)}"
+
+
 # ── Fixer Agent ────────────────────────────────────────────────────
 
 
@@ -220,6 +451,73 @@ class Fixer:
             },
         ))
 
+        self.register_tool(ToolDefinition(
+            name="validate_syntax",
+            description="Validate Python syntax of a file after fixing. Returns 'OK' or the syntax error.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to validate"},
+                    "content": {"type": "string", "description": "Content to validate (uses written content if omitted)"},
+                },
+                "required": ["path"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="report_complete",
+            description="Signal that the fix is complete and validated.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "fix_description": {"type": "string", "description": "Brief description of what was fixed"},
+                    "validation_passed": {"type": "boolean", "description": "Whether syntax validation passed"},
+                },
+                "required": ["fix_description", "validation_passed"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="check_imports",
+            description=(
+                "Verify all imports in a Python file resolve to existing modules "
+                "or project files. Returns a list of unresolved imports so you "
+                "can fix them (add missing deps or correct import paths)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Python file path to check imports for.",
+                    },
+                },
+                "required": ["path"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="search_solution",
+            description=(
+                "Search the web for a solution to an error you can't figure out. "
+                "Uses Gemini with Google Search Grounding to find real answers. "
+                "Call this BEFORE attempting a fix for unfamiliar errors."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "error_message": {
+                        "type": "string",
+                        "description": "The error message to search for.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Additional context (framework, language, etc.)",
+                    },
+                },
+                "required": ["error_message"],
+            },
+        ))
 
     def register_tool(self, tool: "ToolDefinition") -> None:
         """Register a tool available to this agent."""
@@ -295,6 +593,7 @@ class Fixer:
                 context=context,
                 model_override=model_override,
                 enable_thinking=enable_thinking,
+                pipeline_run_id=pipeline_run_id,
             )
 
             report.attempts.append(attempt)
@@ -310,10 +609,33 @@ class Fixer:
                     )
                     if attempt.file_path not in report.files_modified:
                         report.files_modified.append(attempt.file_path)
+
+                # Record successful fix in mistake memory for future learning
+                try:
+                    from app.services.mistake_memory import mistake_memory
+                    mistake_memory.record_failure(
+                        agent_name=current_error.source_agent or "unknown",
+                        task_type=current_error.error_type,
+                        error=current_error.error_message,
+                        fix=attempt.fix_applied,
+                        context={
+                            "file_path": current_error.file_path,
+                            "severity": current_error.severity,
+                        },
+                    )
+                except Exception:
+                    pass  # Mistake memory is non-fatal
             else:
                 # If fix failed, try next error (don't re-attempt same one immediately)
                 failed = remaining_errors.pop(0)
                 remaining_errors.append(failed)
+                # AUDIT-FIX: Re-sort by severity after rotation so CRITICAL
+                # errors aren't stuck behind LOW ones. Without this, a failed
+                # CRITICAL gets appended after MEDIUMs, wasting stronger
+                # model tiers on lower-priority errors.
+                remaining_errors.sort(
+                    key=lambda e: priority_order.get(e.severity, 99)
+                )
 
         report.errors_remaining = len(remaining_errors)
 
@@ -380,117 +702,92 @@ class Fixer:
         context: dict[str, Any],
         model_override: str,
         enable_thinking: bool,
+        pipeline_run_id: str = "",
     ) -> FixAttempt:
-        """Attempt to fix a single error."""
-        import orjson
-
-        # Get the current file content
-        file_content = self._get_file_content(context, error.file_path)
-
-        # Build the fix prompt
-        error_json = orjson.dumps({
+        """Attempt to fix a single error using the agentic tool loop."""
+        # Build error report for read_error_report tool
+        error_report = {
             "file_path": error.file_path,
             "line_number": error.line_number,
             "error_type": error.error_type,
             "error_message": error.error_message,
+            "code_snippet": error.code_snippet,
             "severity": error.severity,
-        }, option=orjson.OPT_INDENT_2).decode("utf-8")
+            "source_agent": error.source_agent,
+        }
+
+        handler = FixerToolHandler(
+            context=context,
+            error=error,
+            error_report=error_report,
+            pipeline_run_id=pipeline_run_id,
+        )
+
+        # Original file content (for before/after comparison)
+        file_before = handler._read_file(error.file_path)
 
         system_prompt = "\n".join([
-            "You are the Fixer agent at NexSidi.",
-            "You receive a structured error report and the file that needs fixing.",
-            "Your job: apply ONE targeted fix to resolve the error.",
+            "You are the Fixer agent at NexSidi. Fix code errors using your tools.",
             "",
-            "## Rules",
-            "1. Output ONLY the complete fixed file content — no markdown, no explanation",
-            "2. Make the MINIMUM change needed to fix the error",
-            "3. Do NOT refactor surrounding code",
-            "4. Do NOT add new features",
-            "5. Do NOT use TODO, pass, ..., or NotImplementedError",
-            "6. Preserve ALL existing functionality",
-            "7. Match the existing code style exactly",
+            "Workflow:",
+            "1. Call read_error_report to get error details",
+            "2. Call read_file to get the current file content",
+            "3. For unfamiliar errors: call search_solution FIRST to find the right fix",
+            "4. For ImportError/ModuleNotFoundError: call check_imports to find unresolved imports",
+            "5. Call write_file with the COMPLETE fixed file content",
+            "6. For Python files: call validate_syntax to confirm fix is valid",
+            "7. Call report_complete with a brief description and validation result",
+            "",
+            "Tools available:",
+            "- read_error_report: get structured error details",
+            "- read_file: read current file content",
+            "- write_file: write the fixed file (COMPLETE content, not a diff)",
+            "- validate_syntax: check Python syntax after fixing",
+            "- check_imports: verify all Python imports resolve correctly",
+            "- search_solution: search web for error solutions (use for unfamiliar errors)",
+            "- report_complete: signal the fix is done",
+            "",
+            "Rules:",
+            "- Make MINIMUM change needed to fix the error",
+            "- Do NOT refactor surrounding code",
+            "- Do NOT add new features",
+            "- Preserve ALL existing functionality",
+            "- Match the existing code style exactly",
+            "- For ImportError: use check_imports to diagnose, then fix the import path or add the dependency",
+            "- For unknown errors: use search_solution before guessing",
         ])
 
-        user_message = "\n".join([
-            f"## Error Report",
-            f"```json\n{error_json}\n```",
-            "",
-            f"## Current File ({error.file_path})",
-            f"```\n{file_content}\n```" if file_content else "File not found in context",
-            "",
-            "Fix this error. Output ONLY the complete corrected file.",
-        ])
+        user_message = (
+            f"Fix this error in {error.file_path}: {error.error_type}\n"
+            f"Call read_error_report first, then read_file, then write_file with the fix."
+        )
+
+        # AUDIT-FIX: Use a lightweight proxy instead of mutating self.default_model.
+        # The Fixer singleton is shared across concurrent pipeline runs. Mutating
+        # self.default_model causes a race: Pipeline A sets "gemini-pro", Pipeline B
+        # sets "sonnet", Pipeline A reads "sonnet". The proxy is stack-local, so
+        # concurrent pipelines get their own model override without interference.
+        class _ModelProxy:
+            """Stack-local proxy to avoid mutating the shared Fixer singleton."""
+            def __init__(self, agent, model_key):
+                self.name = agent.name
+                self.display_name = agent.display_name
+                self.default_complexity = agent.default_complexity
+                self.default_model = resolve_model_override(model_key)
+                self.tools = agent.tools
+
+        proxy = _ModelProxy(self, model_override)
 
         try:
-            # M1-FIX: Pass model_override directly instead of mutating
-            # self.default_model (which is a race condition with concurrent pipelines)
-            from app.agents.base import resolve_model_override
-            from app.services.ai_router import AIMessage, AIRequest, get_ai_router
-
-            router = get_ai_router()
-            ai_messages = [AIMessage(role="user", content=user_message)]
-            request = AIRequest(
-                messages=ai_messages,
+            response = await call_ai_with_tools(
+                agent=proxy,
+                messages=[{"role": "user", "content": user_message}],
                 system_prompt=system_prompt,
                 task_type="general",
-                complexity=self.default_complexity,
-                model_override=resolve_model_override(model_override),
-                temperature=0.1,
-                enable_thinking=enable_thinking,
+                tool_handler=handler,
+                max_tool_rounds=8,  # Allow up to 8 rounds for fix + validate + retry
             )
-            response = await router.call(request)
-
-            fixed_content = response.content.strip()
-            # Strip markdown code fences if present
-            # R12-FIX: Guard split to prevent IndexError if response is
-            # exactly "```" with no newline (split returns 1-element list).
-            if fixed_content.startswith("```"):
-                parts = fixed_content.split("\n", 1)
-                if len(parts) > 1:
-                    fixed_content = parts[1].rsplit("```", 1)[0]
-                else:
-                    fixed_content = ""
-
-            # Validate the fix produced actual content
-            if len(fixed_content) < 10:
-                return FixAttempt(
-                    iteration=iteration,
-                    error=error,
-                    model_used=response.model_used,
-                    fix_applied="Fix produced empty/minimal content",
-                    file_path=error.file_path,
-                    file_content_before=file_content,
-                    file_content_after="",
-                    success=False,
-                )
-
-            # Check that the fix actually changed something
-            if fixed_content == file_content:
-                return FixAttempt(
-                    iteration=iteration,
-                    error=error,
-                    model_used=response.model_used,
-                    fix_applied="No changes made — fix identical to original",
-                    file_path=error.file_path,
-                    file_content_before=file_content,
-                    file_content_after=file_content,
-                    success=False,
-                )
-
-            return FixAttempt(
-                iteration=iteration,
-                error=error,
-                model_used=response.model_used,
-                fix_applied=f"Applied fix for {error.error_type} at {error.file_path}",
-                file_path=error.file_path,
-                file_content_before=file_content,
-                file_content_after=fixed_content,
-                success=True,
-            )
-
         except Exception as exc:
-            # R11-FIX: Sanitize exception — may contain API keys/Bearer tokens
-            # from httpx error messages, which flow into pipeline output dicts.
             from app.services.ai_router import _sanitize_error
             safe_err = _sanitize_error(exc)
             logger.error("fix_attempt_failed", iteration=iteration, error=safe_err)
@@ -500,10 +797,74 @@ class Fixer:
                 model_used=model_override,
                 fix_applied=f"Fix attempt failed: {safe_err}",
                 file_path=error.file_path,
-                file_content_before=file_content,
+                file_content_before=file_before,
                 file_content_after="",
                 success=False,
             )
+
+        # COST-AGG-FIX: Record this fix-attempt's cost to the shared pipeline tracker.
+        if pipeline_run_id:
+            try:
+                from app.services.pipeline import get_run_cost_tracker
+                tracker = get_run_cost_tracker(pipeline_run_id)
+                if tracker is not None:
+                    tracker.record(response, agent_name=self.name, model_key="high")
+            except Exception:
+                pass  # Cost tracking is non-fatal
+
+        # Check results
+        fixed_path = error.file_path
+        raw_content = handler._written_files.get(fixed_path, "")
+
+        # ROUND12-FIX: Strip markdown fences the LLM may wrap content in.
+        # Guard with len(parts) > 1 to avoid IndexError on bare ``` lines.
+        if raw_content.startswith("```"):
+            parts = raw_content.split("\n", 1)
+            if len(parts) > 1:
+                fixed_content = parts[1].rsplit("```", 1)[0]
+            else:
+                fixed_content = ""
+        else:
+            fixed_content = raw_content
+
+        if not fixed_content or len(fixed_content) < 10:
+            return FixAttempt(
+                iteration=iteration,
+                error=error,
+                model_used=model_override,
+                fix_applied="No fix written",
+                file_path=fixed_path,
+                file_content_before=file_before,
+                file_content_after="",
+                success=False,
+            )
+
+        if fixed_content == file_before:
+            return FixAttempt(
+                iteration=iteration,
+                error=error,
+                model_used=model_override,
+                fix_applied="No changes made",
+                file_path=fixed_path,
+                file_content_before=file_before,
+                file_content_after=fixed_content,
+                success=False,
+            )
+
+        success = handler._complete and (
+            not fixed_path.endswith(".py") or handler._validation_passed
+        )
+
+        return FixAttempt(
+            iteration=iteration,
+            error=error,
+            model_used=model_override,
+            fix_applied=handler._fix_description or f"Fixed {error.error_type}",
+            file_path=fixed_path,
+            file_content_before=file_before,
+            file_content_after=fixed_content,
+            success=success,
+        )
 
     # ── Error Collection ───────────────────────────────────────────
 

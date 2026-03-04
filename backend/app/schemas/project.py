@@ -75,6 +75,12 @@ class PipelineStatusResponse(BaseModel):
     created_at: str
     step_results: list[dict[str, Any]] = Field(default_factory=list)
     error: str | None = None
+    # Simulation transparency — True if ANY real-world integration ran in
+    # simulation mode (no Docker, no GitHub token, no cloud credentials).
+    # Clients MUST surface this to the user so they are never misled into
+    # thinking a "completed" pipeline actually deployed/tested anything.
+    is_partially_simulated: bool = False
+    simulation_summary: dict[str, Any] = Field(default_factory=dict)
 
 
 class CheckpointApprovalRequest(BaseModel):
