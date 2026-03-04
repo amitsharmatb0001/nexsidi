@@ -1,6 +1,14 @@
 """FastAPI dependencies: auth extraction, tenant-scoped sessions.
 
 These are injected into route handlers via Depends().
+
+Authentication hierarchy
+------------------------
+1. ``CurrentContext``  — requires a valid JWT Bearer token (existing behaviour).
+2. ``ApiKeyContext``   — accepts EITHER a JWT Bearer token OR an ``X-Api-Key``
+                          header.  Raises 401 if neither is provided / valid.
+3. Helper deps ``get_jwt_context_optional`` and
+   ``get_current_user_context_from_api_key`` underpin ``ApiKeyContext``.
 """
 
 from __future__ import annotations
@@ -9,7 +17,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy import select
@@ -21,6 +29,9 @@ from app.models.auth import User
 from app.services.auth import decode_token, verify_token
 
 security_scheme = HTTPBearer()
+# Optional variant: auto_error=False so missing/invalid token returns None
+# instead of raising 401. Used by the hybrid ApiKeyContext dependency.
+_optional_bearer = HTTPBearer(auto_error=False)
 
 
 async def get_current_user_context(
@@ -177,3 +188,107 @@ CurrentContext = Annotated[TenantContext, Depends(get_current_user_context)]
 TenantSession = Annotated[AsyncSession, Depends(get_tenant_session)]
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminContext = Annotated[TenantContext, Depends(require_admin)]
+
+
+# ── API-key / hybrid authentication ──────────────────────────────────────────
+
+
+async def get_jwt_context_optional(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None,
+        Depends(_optional_bearer),
+    ] = None,
+) -> TenantContext | None:
+    """Return TenantContext if a valid JWT Bearer token is present, else None.
+
+    Unlike ``get_current_user_context``, this dependency does NOT raise 401 on
+    missing or invalid tokens — it simply returns None so the hybrid
+    ``get_auth_context`` dependency can fall through to X-Api-Key.
+    """
+    if credentials is None:
+        return None
+    try:
+        payload = await verify_token(credentials.credentials, expected_type="access")
+    except (JWTError, Exception):
+        # Invalid / expired / infrastructure error — let API-key path try.
+        return None
+
+    user_id = payload.get("sub")
+    org_id = payload.get("org")
+    role = payload.get("role")
+
+    if user_id is None or org_id is None or role is None:
+        return None
+
+    try:
+        uuid.UUID(user_id)
+        uuid.UUID(org_id)
+    except (ValueError, AttributeError):
+        return None
+
+    return TenantContext(
+        organization_id=org_id,
+        user_id=user_id,
+        role=role,
+    )
+
+
+async def get_current_user_context_from_api_key(
+    request: Request,
+    x_api_key: Annotated[str | None, Header(alias="X-Api-Key")] = None,
+) -> TenantContext | None:
+    """Return TenantContext if a valid ``X-Api-Key`` header is present, else None.
+
+    Stores the authenticated ApiKey ORM object in ``request.state.api_key`` so
+    that scope-checking and rate-limiting dependencies can read it without an
+    extra DB round-trip.
+    """
+    if x_api_key is None:
+        return None
+
+    from app.database import get_session_factory as _get_sf
+    from app.services.api_key_auth import authenticate_api_key
+
+    result = await authenticate_api_key(x_api_key, _get_sf())
+    if result is None:
+        # Key provided but invalid — raise 401 immediately (don't fall through).
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    ctx, api_key = result
+    # Stash the ApiKey ORM object for scope / rate-limit dependencies.
+    request.state.api_key = api_key
+    return ctx
+
+
+async def get_auth_context(
+    jwt_ctx: Annotated[
+        TenantContext | None,
+        Depends(get_jwt_context_optional),
+    ],
+    api_key_ctx: Annotated[
+        TenantContext | None,
+        Depends(get_current_user_context_from_api_key),
+    ],
+) -> TenantContext:
+    """Accept either JWT Bearer or ``X-Api-Key`` header.
+
+    Priority: JWT (if valid) takes precedence over API key.
+    Raises HTTP 401 if neither credential is provided or valid.
+    """
+    ctx = jwt_ctx or api_key_ctx
+    if ctx is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required: provide a Bearer token or X-Api-Key header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return ctx
+
+
+# Exported alias — drop-in replacement for CurrentContext on routes that want
+# to accept both JWT and API key authentication.
+ApiKeyContext = Annotated[TenantContext, Depends(get_auth_context)]

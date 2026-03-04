@@ -7,19 +7,20 @@ Registration creates both an organization and user (first user = org_admin).
 from __future__ import annotations
 
 import asyncio
-import time
+import secrets
 import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from jose import JWTError
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.database import get_session_factory
-from app.dependencies import CurrentContext, CurrentUser
+from app.dependencies import CurrentContext, CurrentUser, TenantSession
+from app.middleware.tenant import TenantContext as _TC, set_tenant_context
 from app.models.auth import User
 from app.models.core import Organization
 from app.schemas.auth import (
@@ -31,6 +32,7 @@ from app.schemas.auth import (
     UserResponse,
 )
 from app.services.audit import log_action
+from app.services.rate_limiter import get_rate_limiter
 from app.services.auth import (
     create_access_token,
     create_refresh_token,
@@ -51,65 +53,12 @@ router = APIRouter()
 _DUMMY_HASH = hash_password("__timing_oracle_dummy_pw__")
 
 
-# ── H3/H4-FIX: Simple sliding-window rate limiter for auth endpoints ──
-
-
-class _AuthRateLimiter:
-    """In-memory sliding-window rate limiter for auth endpoints.
-
-    Limits per email (primary) + per IP (secondary):
-    - login: 10 attempts per email per 15 minutes, 30 per IP  # RATEFIX
-    - register: 5 attempts per 15 minutes
-
-    REFIX: Added key eviction to prevent memory leak when many distinct IPs
-    are seen (e.g. distributed attacks). Keys with no active attempts are
-    removed during periodic cleanup every 1000 checks.
-
-    In production, replace with Valkey/Redis-based rate limiter.
-    """
-
-    _MAX_KEYS = 10_000  # hard limit to prevent OOM
-    _CLEANUP_INTERVAL = 1000  # evict stale keys every N checks
-
-    def __init__(self) -> None:
-        self._attempts: dict[str, list[float]] = defaultdict(list)
-        self._check_count: int = 0
-
-    def check(self, key: str, max_attempts: int, window_seconds: int = 900) -> None:
-        """Raise 429 if rate limit exceeded."""
-        now = time.monotonic()
-
-        # Periodic cleanup: evict stale keys to prevent memory leak
-        self._check_count += 1
-        if self._check_count >= self._CLEANUP_INTERVAL:
-            self._evict_stale_keys(now, window_seconds)
-            self._check_count = 0
-
-        attempts = self._attempts[key]
-        # Prune expired entries for THIS key
-        self._attempts[key] = [t for t in attempts if now - t < window_seconds]
-        if len(self._attempts[key]) >= max_attempts:
-            logger.warning("rate_limit_exceeded", key=key, max=max_attempts)
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Too many attempts. Please try again later.",
-                headers={"Retry-After": str(window_seconds)},
-            )
-        self._attempts[key].append(now)
-
-    def _evict_stale_keys(self, now: float, default_window: int = 900) -> None:
-        """Remove keys with no active attempts within the window."""
-        stale = [k for k, v in self._attempts.items() if not v or (now - v[-1]) >= default_window]
-        for k in stale:
-            del self._attempts[k]
-        # Hard cap: if still too many keys, drop the oldest
-        if len(self._attempts) > self._MAX_KEYS:
-            sorted_keys = sorted(self._attempts, key=lambda k: self._attempts[k][-1] if self._attempts[k] else 0)
-            for k in sorted_keys[: len(self._attempts) - self._MAX_KEYS]:
-                del self._attempts[k]
-
-
-_rate_limiter = _AuthRateLimiter()
+# ── Distributed rate limiting for auth endpoints ──────────────────────────────
+# Previously used an in-memory _AuthRateLimiter that was bypassed in
+# multi-worker / multi-replica deployments (each process had its own counter).
+# Now uses ValKeyRateLimiter — a Valkey-backed sliding-window limiter with an
+# atomic Lua script, so limits are enforced across ALL workers and replicas.
+# See app/services/rate_limiter.py for implementation details.
 
 
 def _client_ip(request: Request) -> str:
@@ -148,7 +97,7 @@ async def register(body: UserRegister, request: Request) -> TokenResponse:
     The first user of an organization becomes org_admin.
     Creates: organization, user, and returns JWT tokens.
     """
-    _rate_limiter.check(f"register:{_client_ip(request)}", max_attempts=5)
+    await get_rate_limiter().check("register_ip", _client_ip(request), max_attempts=5)
     settings = get_settings()
     factory = get_session_factory()
 
@@ -286,8 +235,8 @@ async def register(body: UserRegister, request: Request) -> TokenResponse:
 @router.post("/login", response_model=TokenResponse)
 async def login(body: UserLogin, request: Request) -> TokenResponse:
     """Authenticate with email + password, return JWT tokens."""
-    _rate_limiter.check(f"login:{body.email.lower()}", max_attempts=10)          # per-email (primary)  # RATEFIX
-    _rate_limiter.check(f"login_ip:{_client_ip(request)}", max_attempts=30)     # per-IP (secondary)   # RATEFIX
+    await get_rate_limiter().check("login_email", body.email.lower(), max_attempts=10)       # per-email (primary)
+    await get_rate_limiter().check("login_ip", _client_ip(request), max_attempts=30)        # per-IP (secondary)
     settings = get_settings()
     factory = get_session_factory()
 
@@ -333,6 +282,33 @@ async def login(body: UserLogin, request: Request) -> TokenResponse:
                     detail="Invalid email or password",
                 )
 
+            # F-2-FIX: TOTP gate — enforce 2FA at login.
+            # Previously totp_enabled was NEVER checked here: any user who enrolled
+            # 2FA still received tokens on password-alone — a complete 2FA bypass.
+            if user.totp_enabled and user.totp_secret_enc:
+                if not body.totp_code:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="totp_required",
+                        headers={"X-TOTP-Required": "true"},
+                    )
+                try:
+                    import pyotp
+                    from app.services.encryption import decrypt_totp_secret
+                    _totp_secret = decrypt_totp_secret(user.totp_secret_enc)
+                    if not pyotp.TOTP(_totp_secret).verify(body.totp_code, valid_window=1):
+                        raise HTTPException(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid TOTP code",
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="TOTP verification unavailable",
+                    )
+
             user.last_login_at = datetime.now(timezone.utc)
 
             # DEFERRED-FIX-18: Set RLS context before writing audit log.
@@ -376,7 +352,7 @@ async def refresh_token(body: TokenRefresh, request: Request) -> TokenResponse:
     # R-05-FIX: Rate limit refresh endpoint to prevent token-cycling attacks.
     # An attacker with a leaked refresh token could mint unlimited access tokens
     # without this limit.
-    _rate_limiter.check(f"refresh:{_client_ip(request)}", max_attempts=30, window_seconds=900)
+    await get_rate_limiter().check("refresh_ip", _client_ip(request), max_attempts=30, window_seconds=900)
     settings = get_settings()
 
     try:
@@ -723,3 +699,457 @@ async def logout_all(ctx: CurrentContext) -> Response:
         logger.error("logout_all_audit_failed", user_id=ctx.user_id, error=str(audit_exc)[:200])
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── TOTP / 2FA Endpoints ──────────────────────────────────────────────────────
+
+
+class TOTPEnableResponse(BaseModel):
+    """Returned when TOTP setup is initiated — contains the QR code URI.
+
+    L-1-FIX: secret_preview removed. Returning ANY portion of the TOTP secret
+    reduces the brute-force search space. The otpauth:// URI contains all
+    information needed by authenticator apps; manual entry uses the full secret
+    from the URI. Never expose partial secrets in API responses.
+    """
+    otpauth_uri: str
+
+
+class TOTPVerifyRequest(BaseModel):
+    code: str = Field(..., pattern=r"^\d{6}$", description="6-digit TOTP code")
+
+
+class TOTPDisableRequest(BaseModel):
+    code: str = Field(..., pattern=r"^\d{6}$", description="Current TOTP code to confirm disable")
+
+
+@router.post("/totp/enable", response_model=TOTPEnableResponse)
+async def totp_enable(
+    ctx: CurrentContext,
+    session: TenantSession,
+) -> TOTPEnableResponse:
+    """Step 1 of TOTP setup: generate a secret and return the otpauth:// URI.
+
+    Does NOT activate TOTP yet — user must call /totp/verify with a valid
+    code to confirm they have the QR code scanned correctly.
+    TenantSession already sets RLS context; no need to call set_tenant_context again.
+    """
+    settings = get_settings()
+    if not settings.enable_totp:
+        raise HTTPException(status_code=404, detail="TOTP authentication is not enabled")
+
+    try:
+        import pyotp
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="pyotp package not installed") from exc
+
+    from app.services.encryption import encrypt_totp_secret
+
+    # Generate new TOTP secret and encrypt for storage
+    secret = pyotp.random_base32()
+    encrypted = encrypt_totp_secret(secret)
+
+    # Persist encrypted secret (totp_enabled stays False until /totp/verify confirms it)
+    result = await session.execute(
+        select(User).where(User.id == uuid.UUID(ctx.user_id))
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.totp_secret_enc = encrypted
+    await session.flush()
+
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=user.email, issuer_name="Nexsidi")
+    logger.info("totp_setup_initiated", user_id=ctx.user_id)
+    return TOTPEnableResponse(otpauth_uri=uri)
+
+
+@router.post("/totp/verify", status_code=status.HTTP_204_NO_CONTENT)
+async def totp_verify(
+    body: TOTPVerifyRequest,
+    ctx: CurrentContext,
+    session: TenantSession,
+) -> Response:
+    """Step 2 of TOTP setup: verify first code and activate 2FA."""
+    # Rate limit: 5 attempts per 5 minutes per user to prevent brute-force.
+    await get_rate_limiter().check(
+        "totp_verify_user", ctx.user_id, max_attempts=5, window_seconds=300
+    )
+    settings = get_settings()
+    if not settings.enable_totp:
+        raise HTTPException(status_code=404, detail="TOTP authentication is not enabled")
+
+    try:
+        import pyotp
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="pyotp package not installed") from exc
+
+    from app.services.encryption import decrypt_totp_secret
+
+    result = await session.execute(
+        select(User).where(User.id == uuid.UUID(ctx.user_id))
+    )
+    user = result.scalar_one_or_none()
+    if not user or not user.totp_secret_enc:
+        raise HTTPException(status_code=400, detail="Call /totp/enable first")
+
+    try:
+        secret = decrypt_totp_secret(user.totp_secret_enc)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to decrypt TOTP secret")
+
+    if not pyotp.TOTP(secret).verify(body.code, valid_window=1):
+        logger.warning("totp_verify_invalid_code", user_id=ctx.user_id)
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+
+    user.totp_enabled = True
+    await session.flush()
+
+    logger.info("totp_enabled", user_id=ctx.user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/totp/disable", status_code=status.HTTP_204_NO_CONTENT)
+async def totp_disable(
+    body: TOTPDisableRequest,
+    ctx: CurrentContext,
+    session: TenantSession,
+) -> Response:
+    """Disable TOTP 2FA — requires current valid TOTP code to prevent session hijack."""
+    # Rate limit: 5 attempts per 5 minutes per user to prevent brute-force.
+    await get_rate_limiter().check(
+        "totp_disable_user", ctx.user_id, max_attempts=5, window_seconds=300
+    )
+    settings = get_settings()
+    if not settings.enable_totp:
+        raise HTTPException(status_code=404, detail="TOTP authentication is not enabled")
+
+    try:
+        import pyotp
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="pyotp package not installed") from exc
+
+    from app.services.encryption import decrypt_totp_secret
+
+    result = await session.execute(
+        select(User).where(User.id == uuid.UUID(ctx.user_id))
+    )
+    user = result.scalar_one_or_none()
+    if not user or not user.totp_enabled or not user.totp_secret_enc:
+        raise HTTPException(status_code=400, detail="TOTP is not enabled on this account")
+
+    try:
+        secret = decrypt_totp_secret(user.totp_secret_enc)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to decrypt TOTP secret")
+
+    if not pyotp.TOTP(secret).verify(body.code, valid_window=1):
+        logger.warning("totp_disable_invalid_code", user_id=ctx.user_id)
+        raise HTTPException(status_code=400, detail="Invalid TOTP code")
+
+    user.totp_enabled = False
+    user.totp_secret_enc = None
+    await session.flush()
+
+    logger.info("totp_disabled", user_id=ctx.user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── Google OAuth 2.0 Endpoints ────────────────────────────────────────────────
+#
+# Flow:
+#   1. GET /google/authorize  → redirect URL to Google consent screen
+#   2. Google redirects to GET /google/callback?code=...&state=...
+#   3. Exchange code for tokens, fetch user info, upsert user, return JWTs.
+#
+# CSRF: state param is a cryptographically random nonce. In production, store
+# it in a short-lived server-side session or Valkey key; here it is embedded
+# in the redirect URL and the frontend must pass it back for validation.
+#
+# httpx is already a dependency (see pyproject.toml) — no extra installs needed.
+
+
+class GoogleAuthorizeResponse(BaseModel):
+    """Authorization URL to redirect the browser to."""
+    authorization_url: str
+    state: str
+
+
+_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+_GOOGLE_SCOPES = "openid email profile"
+
+
+@router.get("/google/authorize", response_model=GoogleAuthorizeResponse)
+async def google_authorize() -> GoogleAuthorizeResponse:
+    """Return the Google OAuth consent screen URL.
+
+    The frontend should redirect the browser to ``authorization_url``.
+    It must store ``state`` and verify it matches the value returned
+    in the callback to prevent CSRF attacks.
+
+    Requires GOOGLE_CLIENT_ID to be configured.
+    """
+    settings = get_settings()
+    if not settings.google_client_id:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Google OAuth is not configured — set GOOGLE_CLIENT_ID",
+        )
+
+    import urllib.parse
+
+    state = secrets.token_urlsafe(16)
+    # The redirect_uri must be registered in the Google Cloud Console.
+    # We derive it from the first CORS origin so it works in all environments.
+    redirect_uri = _google_redirect_uri(settings)
+
+    params = {
+        "client_id": settings.google_client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": _GOOGLE_SCOPES,
+        "access_type": "offline",
+        "prompt": "select_account",
+        "state": state,
+    }
+    auth_url = f"{_GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}"
+    logger.info("google_oauth_authorize_requested")
+    return GoogleAuthorizeResponse(authorization_url=auth_url, state=state)
+
+
+@router.get("/google/callback", response_model=TokenResponse)
+async def google_callback(
+    code: str,
+    state: str,
+    request: Request,
+) -> TokenResponse:
+    """Handle Google's OAuth callback.
+
+    Exchanges the authorization code for user info, then:
+    - If google_id matches an existing user → log in.
+    - If email matches an existing user → link Google account and log in.
+    - Otherwise → create a new user (single-user org named after the Google name).
+
+    Returns the same JWT pair as /login.
+    """
+    await get_rate_limiter().check("google_callback_ip", _client_ip(request), max_attempts=20)
+
+    settings = get_settings()
+    if not settings.google_client_id or not settings.google_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Google OAuth is not configured",
+        )
+
+    redirect_uri = _google_redirect_uri(settings)
+
+    # ── Step 1: exchange code for tokens ─────────────────────────────────────
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_resp = await client.post(
+                _GOOGLE_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+    except Exception as exc:
+        logger.error("google_token_exchange_failed", error=str(exc)[:200])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to contact Google OAuth server",
+        )
+
+    if token_resp.status_code != 200:
+        logger.warning("google_token_exchange_rejected", status=token_resp.status_code)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid authorization code or state",
+        )
+
+    token_data = token_resp.json()
+    access_token_google = token_data.get("access_token")
+    if not access_token_google:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No access token in Google response",
+        )
+
+    # ── Step 2: fetch user info ───────────────────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            userinfo_resp = await client.get(
+                _GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token_google}"},
+            )
+    except Exception as exc:
+        logger.error("google_userinfo_failed", error=str(exc)[:200])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to fetch user info from Google",
+        )
+
+    if userinfo_resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to retrieve user info from Google",
+        )
+
+    userinfo = userinfo_resp.json()
+    google_id: str = userinfo.get("sub", "")
+    email: str = userinfo.get("email", "").lower()
+    name: str = userinfo.get("name") or email.split("@")[0]
+    avatar_url: str | None = userinfo.get("picture")
+    email_verified_google: bool = userinfo.get("email_verified", False)
+
+    if not google_id or not email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google did not return required user information",
+        )
+
+    # ── Step 3: upsert user ───────────────────────────────────────────────────
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+    import re as _re
+
+    factory = get_session_factory()
+    try:
+        async with factory() as session:
+            async with session.begin():
+                await session.execute(_text("SET LOCAL app.auth_mode = 'true'"))
+
+                # Try google_id first (returning user with linked account)
+                result = await session.execute(
+                    select(User).where(User.google_id == google_id)
+                )
+                user = result.scalar_one_or_none()
+
+                if user is None:
+                    # Try email match (existing email/password account → link)
+                    result = await session.execute(
+                        select(User).where(User.email == email)
+                    )
+                    user = result.scalar_one_or_none()
+                    if user is not None:
+                        # Link Google account to existing user
+                        user.google_id = google_id
+                        if avatar_url and not user.avatar_url:
+                            user.avatar_url = avatar_url
+                        if email_verified_google:
+                            user.email_verified = True
+                        await session.flush()
+                        logger.info("google_oauth_account_linked", user_id=str(user.id))
+
+                if user is None:
+                    # Brand-new user: create org + user
+                    from app.models.core import Organization
+
+                    base_slug = _re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))[:60]
+                    if not base_slug:
+                        base_slug = "org"
+                    slug = base_slug
+                    for suffix in range(0, 100):
+                        candidate = slug if suffix == 0 else f"{base_slug}-{suffix}"
+                        slug_check = await session.execute(
+                            select(func.count()).select_from(Organization).where(Organization.slug == candidate)
+                        )
+                        if slug_check.scalar_one() == 0:
+                            slug = candidate
+                            break
+                    else:
+                        slug = f"{base_slug}-{uuid.uuid4().hex[:8]}"
+
+                    org = Organization(name=f"{name}'s Organization", slug=slug, plan="free")
+                    session.add(org)
+                    await session.flush()
+
+                    user = User(
+                        organization_id=org.id,
+                        email=email,
+                        name=name,
+                        role="org_admin",
+                        auth_provider="google",
+                        google_id=google_id,
+                        avatar_url=avatar_url,
+                        is_active=True,
+                        email_verified=email_verified_google,
+                        last_login_at=datetime.now(timezone.utc),
+                    )
+                    session.add(user)
+                    await session.flush()
+                    logger.info("google_oauth_new_user", user_id=str(user.id))
+                else:
+                    # Existing user — update last_login_at
+                    if not user.is_active:
+                        raise HTTPException(
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Account is deactivated",
+                        )
+                    user.last_login_at = datetime.now(timezone.utc)
+
+                await set_tenant_context(session, _TC(
+                    organization_id=str(user.organization_id),
+                    user_id=str(user.id),
+                    role=user.role,
+                ))
+
+                await log_action(
+                    session=session,
+                    action="user.google_login",
+                    entity_type="user",
+                    entity_id=user.id,
+                    user_id=user.id,
+                    organization_id=user.organization_id,
+                    ip_address=_client_ip(request),
+                    user_agent=request.headers.get("user-agent", "")[:256],
+                )
+
+                _user_id = user.id
+                _org_id = user.organization_id
+                _role = user.role
+
+    except HTTPException:
+        raise
+    except SAIntegrityError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Unable to create account — email may already be in use",
+        )
+    except Exception as exc:
+        logger.error("google_oauth_upsert_failed", error=str(exc)[:200])
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to complete Google sign-in",
+        )
+
+    logger.info("google_oauth_login_complete", user_id=str(_user_id))
+
+    return TokenResponse(
+        access_token=create_access_token(_user_id, _org_id, _role),
+        refresh_token=create_refresh_token(_user_id, _org_id),
+        expires_in=settings.access_token_expire_minutes * 60,
+    )
+
+
+def _google_redirect_uri(settings) -> str:
+    """Build the OAuth callback URI from the API's own URL.
+
+    In production, GOOGLE_REDIRECT_URI should be set explicitly.
+    Fallback: derive from first CORS origin (typically the frontend URL).
+    """
+    import os
+    explicit = os.getenv("GOOGLE_REDIRECT_URI", "")
+    if explicit:
+        return explicit
+    if settings.cors_origins:
+        # API lives on the same origin but at /api/v1/auth/google/callback
+        # Adjust if your API and frontend are on different origins.
+        return f"{settings.cors_origins[0].rstrip('/')}/api/v1/auth/google/callback"
+    return "http://localhost:8000/api/v1/auth/google/callback"

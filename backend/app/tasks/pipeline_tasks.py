@@ -129,6 +129,9 @@ async def _ensure_services() -> None:
         ("context_engine", "app.services.context_engine.init_context_engine"),
         ("prompt_engine", "app.services.prompt_engine.init_prompt_engine"),
         ("revocation_store", "app.services.token_revocation.init_revocation_store"),
+        # Agentic services — gracefully skipped if not yet available
+        ("agent_message_bus", "app.services.agent_message_bus.init_agent_message_bus"),
+        ("pipeline_events", "app.services.pipeline_events.init_pipeline_events"),
     ]:
         try:
             module_path, fn_name = init_fn_path.rsplit(".", 1)
@@ -159,6 +162,20 @@ async def _shutdown_services() -> None:
     await shutdown_context_engine()
     await shutdown_prompt_engine()
     await shutdown_revocation_store()
+
+    # Agentic services — gracefully skip if not initialized
+    try:
+        from app.services.agent_message_bus import shutdown_agent_message_bus
+        await shutdown_agent_message_bus()
+    except Exception:
+        pass
+
+    try:
+        from app.services.pipeline_events import shutdown_pipeline_events
+        await shutdown_pipeline_events()
+    except Exception:
+        pass
+
     # R26-FIX-35: Close shared Valkey pool AFTER services that use it,
     # but BEFORE DB close. Previously leaked 20 connections per worker shutdown.
     await shutdown_valkey_client()

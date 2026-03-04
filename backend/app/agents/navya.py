@@ -25,6 +25,7 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -133,18 +134,18 @@ _PYTHON_LOGIC_PATTERNS: list[tuple[re.Pattern, str, LogicSeverity, LogicCategory
         LogicCategory.TYPE_MISMATCH,
         "PEP 8: comparisons to None should use 'is' or 'is not'",
     ),
-    # Unused variable assignment (basic pattern: assignment followed by no usage)
+    # Unused variable assignment (candidate detection — flags _prefixed vars only)
     (
-        re.compile(r"""^\s+(\w+)\s*=\s*.+$""", re.MULTILINE),
-        "Variable assigned but check if it's used later",
+        re.compile(r"""^\s+(_\w+)\s*=\s*.+$""", re.MULTILINE),
+        "Potential unused variable assignment (verify usage manually)",
         LogicSeverity.INFO,
         LogicCategory.DEAD_CODE,
         "Remove unused variables to reduce confusion",
     ),
-    # Infinite loop risk: while True without break
+    # Infinite loop risk: while True (verify break condition exists)
     (
-        re.compile(r"""while\s+True\s*:(?:(?!break).)*$""", re.MULTILINE | re.DOTALL),
-        "while True without visible break — potential infinite loop",
+        re.compile(r"""while\s+True\s*:"""),
+        "while True loop (verify break condition exists)",
         LogicSeverity.WARNING,
         LogicCategory.INFINITE_LOOP_RISK,
         "Ensure loop has a break condition or timeout",
@@ -188,6 +189,74 @@ _TS_LOGIC_PATTERNS: list[tuple[re.Pattern, str, LogicSeverity, LogicCategory, st
 ]
 
 
+# ── Navya Tool Handler ─────────────────────────────────────────────
+
+
+class NavyaToolHandler:
+    """Handles tool calls for Navya's agentic logic analysis loop."""
+
+    def __init__(self, files: dict[str, str], report: LogicReport, contract: dict[str, Any]):
+        self._files = files
+        self._report = report
+        self._contract = contract
+        self._files_read: set[str] = set()
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "read_file":
+            return self._read_file(tool_input["path"])
+        elif tool_name == "write_finding":
+            return self._write_finding(tool_input)
+        elif tool_name == "list_files":
+            return self._list_files()
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _list_files(self) -> str:
+        py_files = sorted(p for p in self._files if p.endswith(".py"))
+        ts_files = sorted(p for p in self._files if p.endswith((".ts", ".tsx")))
+        other = sorted(p for p in self._files if p not in py_files and p not in ts_files)
+        parts = []
+        if py_files:
+            parts.append(f"Python ({len(py_files)}):\n" + "\n".join(f"  {p}" for p in py_files))
+        if ts_files:
+            parts.append(f"TypeScript ({len(ts_files)}):\n" + "\n".join(f"  {p}" for p in ts_files))
+        if other:
+            parts.append(f"Other ({len(other)}):\n" + "\n".join(f"  {p}" for p in other))
+        return "\n\n".join(parts) if parts else "No files available."
+
+    def _read_file(self, path: str) -> str:
+        content = self._files.get(path)
+        if content is None:
+            return f"File not found: {path}"
+        self._files_read.add(path)
+        if len(content) > 15000:
+            return content[:15000] + "\n... [truncated at 15000 chars]"
+        return content
+
+    def _write_finding(self, tool_input: dict) -> str:
+        try:
+            sev = LogicSeverity(tool_input.get("severity", "info"))
+        except ValueError:
+            sev = LogicSeverity.INFO
+        cat_str = tool_input.get("category", "dead_code")
+        try:
+            cat = LogicCategory(cat_str)
+        except ValueError:
+            cat = LogicCategory.DEAD_CODE
+
+        finding = LogicFinding(
+            severity=sev,
+            category=cat,
+            file_path=tool_input.get("file_path", "(unknown)"),
+            line=tool_input.get("line"),
+            title=tool_input.get("title", "AI-detected logic issue"),
+            description=tool_input.get("description", ""),
+            suggestion=tool_input.get("suggestion"),
+        )
+        self._report.add(finding)
+        return f"Finding recorded: [{sev.value}] {finding.title}"
+
+
 # ── Navya Agent ────────────────────────────────────────────────────
 
 
@@ -229,6 +298,15 @@ class Navya:
                     "suggestion": {"type": "string"},
                 },
                 "required": ["severity", "category", "file_path", "title", "description"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="list_files",
+            description="List all generated code files available for analysis.",
+            parameters={
+                "type": "object",
+                "properties": {},
             },
         ))
 
@@ -279,13 +357,7 @@ class Navya:
         # Phase 2: AI contract-vs-implementation check
         contract = context.get("vikram", {}).get("contract", {})
         if contract:
-            try:
-                ai_findings = await self._ai_contract_verification(all_files, contract)
-                for finding in ai_findings:
-                    report.add(finding)
-            except Exception as exc:
-                from app.services.ai_router import _sanitize_error  # R27-FIX
-                logger.warning("ai_contract_verification_failed", error=_sanitize_error(exc))
+            await self._ai_contract_verification(all_files, contract, report)
 
         findings_output = [
             {
@@ -411,7 +483,9 @@ class Navya:
             func_indent = len(lines[func_line]) - len(lines[func_line].lstrip())
             has_return = False
 
-            for i in range(func_line + 1, min(func_line + 50, len(lines))):
+            # AUDIT-FIX: Scan up to 200 lines (was 50). Generated code
+            # frequently exceeds 50 lines, causing false "missing return" findings.
+            for i in range(func_line + 1, min(func_line + 200, len(lines))):
                 line = lines[i]
                 stripped = line.lstrip()
                 if stripped and (len(line) - len(stripped)) <= func_indent and not stripped.startswith("#"):
@@ -427,7 +501,7 @@ class Navya:
                     file_path=path,
                     line=func_line + 1,
                     title=f"Function '{func_name}' declares -> {return_type} but may not return",
-                    description=f"Function annotated to return {return_type} but no return statement found in first 50 lines",
+                    description=f"Function annotated to return {return_type} but no return statement found in scanned body",
                     suggestion="Add explicit return statement or fix return type annotation",
                 ))
 
@@ -460,86 +534,66 @@ class Navya:
     # ── AI-Powered Contract Verification ───────────────────────────
 
     async def _ai_contract_verification(
-        self, files: dict[str, str], contract: dict[str, Any]
-    ) -> list[LogicFinding]:
-        """Use AI to verify generated code matches the architecture contract."""
+        self, files: dict[str, str], contract: dict[str, Any], report: LogicReport
+    ) -> None:
+        """AI agentic loop for contract-vs-implementation verification.
+
+        The AI reads files on demand (no file cap) and writes findings
+        using tools.
+        """
         import orjson
 
         endpoints = contract.get("api", {}).get("endpoints", [])
         tables = contract.get("database", {}).get("tables", [])
 
         if not endpoints and not tables:
-            return []
+            return
 
         contract_summary = orjson.dumps(
             {"endpoints": endpoints[:20], "tables": tables[:10]},
             option=orjson.OPT_INDENT_2,
         ).decode("utf-8")
 
-        # Summarize implementation files
-        impl_summary: list[str] = []
-        for path, content in files.items():
-            if path.endswith(".py") and ("router" in path.lower() or "model" in path.lower()):
-                from app.agents.scan_utils import split_into_windows
-
-                windows = split_into_windows(content, window_size=2000, overlap=400)
-                for i, window in enumerate(windows):
-                    label = f"### {path}" if len(windows) == 1 else f"### {path} (part {i + 1}/{len(windows)})"
-                    impl_summary.append(f"{label}\n```python\n{window}\n```")
-
-        if not impl_summary:
-            return []
+        handler = NavyaToolHandler(files=files, report=report, contract=contract)
 
         system_prompt = "\n".join([
             "You are Navya, the Logic Analyst at NexSidi.",
-            "Compare the architecture contract with the implementation.",
-            "Find mismatches: missing endpoints, wrong field names, missing validations.",
+            "You have tools to analyze generated code for logic errors and contract mismatches.",
             "",
-            "Respond with a JSON array of findings:",
-            '{"severity": "error|warning|info", "category": "contract_mismatch",',
-            ' "file_path": "...", "title": "...", "description": "...", "suggestion": "..."}',
+            "Workflow:",
+            "1. Call list_files to see all available files",
+            "2. Read router/model/service files that implement the contract",
+            "3. For each file, check:",
+            "   - Missing endpoints (defined in contract but not implemented)",
+            "   - Wrong field names or types vs contract",
+            "   - Missing input validation",
+            "   - Dead code / unreachable branches",
+            "   - Null safety issues",
+            "   - Missing error handling for database operations",
+            "   - Race conditions in concurrent operations",
+            "4. Use write_finding for each issue discovered",
             "",
-            "If everything matches, respond with: []",
-            "Output ONLY valid JSON.",
+            "Be thorough — examine ALL implementation files, not just a few.",
         ])
 
-        response = await call_ai(self, 
-            messages=[{
-                "role": "user",
-                "content": f"Contract:\n{contract_summary}\n\nImplementation:\n{'\n\n'.join(impl_summary[:5])}",
-            }],
-            system_prompt=system_prompt,
-            task_type="general",
-            temperature=0.1,
+        user_message = (
+            f"Verify this implementation against the architecture contract.\n\n"
+            f"Contract summary:\n{contract_summary}\n\n"
+            f"Start by listing files, then read and analyze each implementation file."
         )
 
-        findings: list[LogicFinding] = []
         try:
-            raw = response.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-            parsed = orjson.loads(raw.encode("utf-8"))
-
-            if isinstance(parsed, list):
-                for item in parsed:
-                    try:
-                        sev = LogicSeverity(item.get("severity", "info"))
-                    except ValueError:
-                        sev = LogicSeverity.INFO
-                    findings.append(LogicFinding(
-                        severity=sev,
-                        category=LogicCategory.CONTRACT_MISMATCH,
-                        file_path=item.get("file_path", "(unknown)"),
-                        line=item.get("line"),
-                        title=item.get("title", "Contract mismatch"),
-                        description=item.get("description", ""),
-                        suggestion=item.get("suggestion"),
-                    ))
+            await call_ai_with_tools(
+                agent=self,
+                messages=[{"role": "user", "content": user_message}],
+                system_prompt=system_prompt,
+                task_type="general",
+                tool_handler=handler,
+                max_tool_rounds=12,
+            )
         except Exception as exc:
-            from app.services.ai_router import _sanitize_error  # R27-FIX
-            logger.warning("ai_contract_parse_failed", error=_sanitize_error(exc))
-
-        return findings
+            from app.services.ai_router import _sanitize_error
+            logger.warning("ai_contract_verification_failed", error=_sanitize_error(exc))
 
 
 # Register the agent

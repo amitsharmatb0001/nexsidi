@@ -25,6 +25,7 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -114,17 +115,17 @@ _PYTHON_PERF_PATTERNS: list[tuple[re.Pattern, str, PerfSeverity, PerfCategory, s
     ),
     # Unbounded query (no limit/pagination)
     (
-        re.compile(r"""\.all\(\)(?!.*limit|.*offset|.*paginate)"""),
-        "Unbounded .all() query — no LIMIT clause",
+        re.compile(r"""\.all\(\)"""),
+        "Unbounded .all() query — verify pagination exists nearby",
         PerfSeverity.HIGH,
         PerfCategory.UNBOUNDED_QUERY,
         "Returns ALL rows — catastrophic for large tables",
         "Add .limit() and .offset() for pagination",
     ),
-    # Sync I/O in async context
+    # Sync I/O in async context (single-line pattern to avoid catastrophic backtracking)
     (
-        re.compile(r"""async\s+def\s+\w+.*:\s*\n(?:.*\n)*?.*(?:open\(|os\.path|requests\.(?:get|post)|time\.sleep)""", re.MULTILINE),
-        "Synchronous I/O call inside async function",
+        re.compile(r"""(?:open\(|os\.path\.|requests\.(?:get|post|put|delete|patch)\(|time\.sleep\()"""),
+        "Potential synchronous I/O call — verify not inside async function",
         PerfSeverity.HIGH,
         PerfCategory.SYNC_IN_ASYNC,
         "Blocks the async event loop, causing latency for all requests",
@@ -200,6 +201,75 @@ _TS_PERF_PATTERNS: list[tuple[re.Pattern, str, PerfSeverity, PerfCategory, str, 
 ]
 
 
+# ── Deepika Tool Handler ───────────────────────────────────────────
+
+
+class DeepikaToolHandler:
+    """Handles tool calls for Deepika's agentic performance analysis loop."""
+
+    def __init__(self, files: dict[str, str], report: PerfReport, context: dict[str, Any]):
+        self._files = files
+        self._report = report
+        self._context = context
+        self._files_read: set[str] = set()
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "read_file":
+            return self._read_file(tool_input["path"])
+        elif tool_name == "write_finding":
+            return self._write_finding(tool_input)
+        elif tool_name == "list_files":
+            return self._list_files()
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _list_files(self) -> str:
+        py_files = sorted(p for p in self._files if p.endswith(".py"))
+        ts_files = sorted(p for p in self._files if p.endswith((".ts", ".tsx")))
+        other = sorted(p for p in self._files if p not in py_files and p not in ts_files)
+        parts = []
+        if py_files:
+            parts.append(f"Python ({len(py_files)}):\n" + "\n".join(f"  {p}" for p in py_files))
+        if ts_files:
+            parts.append(f"TypeScript ({len(ts_files)}):\n" + "\n".join(f"  {p}" for p in ts_files))
+        if other:
+            parts.append(f"Other ({len(other)}):\n" + "\n".join(f"  {p}" for p in other))
+        return "\n\n".join(parts) if parts else "No files available."
+
+    def _read_file(self, path: str) -> str:
+        content = self._files.get(path)
+        if content is None:
+            return f"File not found: {path}"
+        self._files_read.add(path)
+        if len(content) > 15000:
+            return content[:15000] + "\n... [truncated at 15000 chars]"
+        return content
+
+    def _write_finding(self, tool_input: dict) -> str:
+        try:
+            sev = PerfSeverity(tool_input.get("severity", "low"))
+        except ValueError:
+            sev = PerfSeverity.MEDIUM
+        cat_str = tool_input.get("category", "inefficient_algorithm")
+        try:
+            cat = PerfCategory(cat_str)
+        except ValueError:
+            cat = PerfCategory.INEFFICIENT_ALGORITHM
+
+        finding = PerfFinding(
+            severity=sev,
+            category=cat,
+            file_path=tool_input.get("file_path", "(unknown)"),
+            line=tool_input.get("line"),
+            title=tool_input.get("title", "AI-detected perf issue"),
+            description=tool_input.get("description", ""),
+            impact=tool_input.get("impact", "Performance degradation"),
+            suggestion=tool_input.get("suggestion", "Review and optimize"),
+        )
+        self._report.add(finding)
+        return f"Finding recorded: [{sev.value}] {finding.title}"
+
+
 # ── Deepika Agent ──────────────────────────────────────────────────
 
 
@@ -242,6 +312,15 @@ class Deepika:
                     "suggestion": {"type": "string"},
                 },
                 "required": ["severity", "category", "file_path", "title", "description", "impact", "suggestion"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="list_files",
+            description="List all generated code files available for analysis.",
+            parameters={
+                "type": "object",
+                "properties": {},
             },
         ))
 
@@ -292,13 +371,7 @@ class Deepika:
         self._check_missing_indexes(all_files, context, report)
 
         # Phase 2: AI-powered query complexity analysis
-        try:
-            ai_findings = await self._ai_perf_analysis(all_files, context)
-            for finding in ai_findings:
-                report.add(finding)
-        except Exception as exc:
-            from app.services.ai_router import _sanitize_error  # R27-FIX
-            logger.warning("ai_perf_analysis_failed", error=_sanitize_error(exc))
+        await self._ai_perf_analysis(all_files, context, report)
 
         findings_output = [
             {
@@ -448,7 +521,18 @@ class Deepika:
         for table in tables:
             table_name = table.get("name", "")
             columns = table.get("columns", [])
-            indexes = {idx.get("column", "") for idx in table.get("indexes", [])}
+            # AUDIT-FIX: Handle both "column" (single) and "columns" (composite)
+            # index key formats from the contract. Previously only checked "column",
+            # missing composite indexes like {"columns": ["email", "created_at"]}.
+            raw_indexes = table.get("indexes", [])
+            indexes: set[str] = set()
+            for idx in raw_indexes:
+                if isinstance(idx, dict):
+                    if "column" in idx:
+                        indexes.add(idx["column"])
+                    for col_name_val in (idx.get("columns") or []):
+                        if isinstance(col_name_val, str):
+                            indexes.add(col_name_val)
 
             for col in columns:
                 col_name = col.get("name", "")
@@ -471,80 +555,53 @@ class Deepika:
     # ── AI-Powered Performance Analysis ────────────────────────────
 
     async def _ai_perf_analysis(
-        self, files: dict[str, str], context: dict[str, Any]
-    ) -> list[PerfFinding]:
-        """Use AI to find complex performance issues."""
-        import orjson
+        self, files: dict[str, str], context: dict[str, Any], report: PerfReport
+    ) -> None:
+        """AI agentic loop for deep performance analysis.
 
-        # Focus on backend service/router files where perf matters most
-        critical_files: list[str] = []
-        for path, content in files.items():
-            if path.endswith(".py") and ("router" in path or "service" in path):
-                from app.agents.scan_utils import split_into_windows
-
-                windows = split_into_windows(content, window_size=2500, overlap=500)
-                for i, window in enumerate(windows):
-                    label = f"### {path}" if len(windows) == 1 else f"### {path} (part {i + 1}/{len(windows)})"
-                    critical_files.append(f"{label}\n```python\n{window}\n```")
-
-        if not critical_files:
-            return []
+        The AI reads files on demand (no file cap) and writes findings
+        using tools.
+        """
+        handler = DeepikaToolHandler(files=files, report=report, context=context)
 
         system_prompt = "\n".join([
             "You are Deepika, the Performance Analyst at NexSidi.",
-            "Analyze the code for performance issues: N+1 queries, missing indexes,",
-            "unbounded queries, sync-in-async, memory leaks, algorithm complexity.",
+            "You have tools to analyze generated code for performance issues.",
             "",
-            "Respond with a JSON array of findings:",
-            '{"severity": "critical|high|medium|low", "category": "...",',
-            ' "file_path": "...", "title": "...", "description": "...",',
-            ' "impact": "...", "suggestion": "..."}',
+            "Workflow:",
+            "1. Call list_files to see all available files",
+            "2. Read backend service/router files first (where perf matters most)",
+            "3. For each file, check for:",
+            "   - N+1 queries (relationship access inside loops)",
+            "   - Unbounded queries (missing LIMIT/pagination)",
+            "   - Sync I/O in async context (blocking the event loop)",
+            "   - Missing await on coroutines",
+            "   - Memory leaks (unbounded caches, growing lists)",
+            "   - Inefficient algorithms (O(n^2), string concat in loops)",
+            "   - Missing database indexes for common query patterns",
+            "   - Frontend bundle size issues (large imports, missing lazy loading)",
+            "4. Use write_finding for each performance issue discovered",
             "",
-            "If no issues found, respond with: []",
-            "Output ONLY valid JSON.",
+            "Be thorough — examine ALL service and router files, not just a few.",
         ])
 
-        response = await call_ai(self, 
-            messages=[{"role": "user", "content": f"Analyze:\n\n{'\n\n'.join(critical_files[:5])}"}],
-            system_prompt=system_prompt,
-            task_type="general",
-            temperature=0.1,
+        user_message = (
+            f"Perform a deep performance audit of this project ({len(files)} files). "
+            "Start by listing files, then read and analyze the performance-critical ones."
         )
 
-        findings: list[PerfFinding] = []
         try:
-            raw = response.content.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-            parsed = orjson.loads(raw.encode("utf-8"))
-
-            if isinstance(parsed, list):
-                for item in parsed:
-                    try:
-                        sev = PerfSeverity(item.get("severity", "low"))
-                    except ValueError:
-                        sev = PerfSeverity.MEDIUM
-                    cat_str = item.get("category", "inefficient_algorithm")
-                    try:
-                        cat = PerfCategory(cat_str)
-                    except ValueError:
-                        cat = PerfCategory.INEFFICIENT_ALGORITHM
-
-                    findings.append(PerfFinding(
-                        severity=sev,
-                        category=cat,
-                        file_path=item.get("file_path", "(unknown)"),
-                        line=item.get("line"),
-                        title=item.get("title", "AI-detected perf issue"),
-                        description=item.get("description", ""),
-                        impact=item.get("impact", "Performance degradation"),
-                        suggestion=item.get("suggestion", "Review and optimize"),
-                    ))
+            await call_ai_with_tools(
+                agent=self,
+                messages=[{"role": "user", "content": user_message}],
+                system_prompt=system_prompt,
+                task_type="general",
+                tool_handler=handler,
+                max_tool_rounds=12,
+            )
         except Exception as exc:
-            from app.services.ai_router import _sanitize_error  # R27-FIX
-            logger.warning("ai_perf_parse_failed", error=_sanitize_error(exc))
-
-        return findings
+            from app.services.ai_router import _sanitize_error
+            logger.warning("ai_perf_analysis_failed", error=_sanitize_error(exc))
 
 
 # Register the agent

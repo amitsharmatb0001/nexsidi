@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     valkey_password: str = ""
 
     # --- JWT Auth ---
-    # JWTSEC-FIX: Minimum 32 chars for HS256 (NIST recommends key ≥ hash output).
+    # JWTSEC-FIX: Minimum 32 chars for HS256 (NIST recommends key â‰¥ hash output).
     # 16 chars (128 bits) is below the 256-bit security level of HS256.
     jwt_secret_key: str = Field(min_length=32)
     # R9-FIX: Constrain to known-safe algorithms. An unconstrained string
@@ -113,13 +113,13 @@ class Settings(BaseSettings):
 
     # R19-FIX: Validate CORS origins to prevent wildcard + credentials bypass.
     # Starlette's CORSMiddleware with allow_credentials=True and origins=["*"]
-    # reflects the Origin header — effectively allowing ANY origin with cookies.
+    # reflects the Origin header â€" effectively allowing ANY origin with cookies.
     # This completely defeats CORS protection. Also reject origins without
     # explicit http/https scheme (e.g., bare domains) to prevent misconfiguration.
     @field_validator("cors_origins", mode="after")
     @classmethod
     def validate_cors_origins(cls, v: list[str]) -> list[str]:
-        # R38-FIX: Reject empty list — silently breaks frontend CORS preflight
+        # R38-FIX: Reject empty list â€" silently breaks frontend CORS preflight
         if not v:
             raise ValueError("CORS_ORIGINS must contain at least one origin")
         for origin in v:
@@ -139,17 +139,35 @@ class Settings(BaseSettings):
     enable_totp: bool = False
     enable_passkeys: bool = False
 
+    # --- Razorpay Payment Gateway ---
+    razorpay_key_id: str = ""
+    razorpay_key_secret: str = ""
+    razorpay_webhook_secret: str = ""
+
+    # --- TOTP encryption ---
+    # Fernet key for encrypting TOTP secrets stored in auth.users.totp_secret_enc.
+    # Must be 32-byte URL-safe base64 (Fernet.generate_key()).
+    # If empty, a key is derived from jwt_secret_key via HKDF.
+    totp_encryption_key: str = ""
+
     # --- AI Provider Mode ---
-    # "mixed"  = both providers (default, current behavior)
-    # "gemini" = Gemini-only (testing/dev — saves Claude costs)
-    # "claude" = Claude-only (production — max quality)
-    ai_provider_mode: Literal["mixed", "gemini", "claude"] = "mixed"
+    # "gemini" = Gemini-only (beta default — saves Claude costs)
+    # "mixed"  = both providers (production — activate via enable_claude)
+    # "claude" = Claude-only (max quality, no Gemini)
+    ai_provider_mode: Literal["mixed", "gemini", "claude"] = "gemini"
+
+    # Feature flag: When True, upgrades ai_provider_mode from "gemini" to "mixed"
+    # so Claude models become available alongside Gemini. Set to True in production
+    # when ready to enable Claude. Has no effect if ai_provider_mode is explicitly
+    # set to "claude" or "mixed" via env var.
+    enable_claude: bool = False
+
     enable_batch_quality_gates: bool = False  # Anthropic Batch API for quality gates
 
     # --- Celery Task Queue ---
     # When use_celery=True, pipeline runs dispatch to Celery workers instead
     # of in-process asyncio.create_task(). Enables horizontal scaling.
-    use_celery: bool = False  # Feature flag — False = current behavior
+    use_celery: bool = False  # Feature flag â€" False = current behavior
     celery_broker_url: str = ""  # Falls back to valkey_url if empty
     celery_result_backend: str = ""  # Falls back to valkey_url if empty
 
@@ -202,7 +220,7 @@ class Settings(BaseSettings):
         return bool(self.zeptomail_smtp_server and self.zeptomail_username)
 
 
-# ── Load secrets from GCP BEFORE Settings is created ───────────
+# â"€â"€ Load secrets from GCP BEFORE Settings is created â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 _secrets_loaded = False
 
@@ -227,7 +245,7 @@ def _ensure_secrets_loaded() -> None:
       and all subsequent requests to use incomplete settings forever.
     """
     global _secrets_loaded
-    # R37-FIX: Double-checked locking — fast path without lock acquisition.
+    # R37-FIX: Double-checked locking â€" fast path without lock acquisition.
     if _secrets_loaded:
         return
     with _secrets_lock:

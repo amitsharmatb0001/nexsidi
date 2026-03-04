@@ -20,7 +20,6 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    ToolDefinition,
     call_ai,
     register_agent,
     run_agent,
@@ -53,51 +52,10 @@ class Saanvi:
     default_complexity = TaskComplexity.MEDIUM
     default_model: str | None = None
 
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        self.register_tool(ToolDefinition(
-            name="score_complexity",
-            description="Score project complexity on a 1-10 scale with dimensional breakdown.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "overall_score": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "dimensions": {
-                        "type": "object",
-                        "description": "Score per dimension (1-10).",
-                    },
-                    "reasoning": {"type": "string"},
-                },
-                "required": ["overall_score", "dimensions", "reasoning"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="select_model",
-            description="Recommend AI model tier based on complexity score.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "recommended_tier": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high", "critical"],
-                    },
-                    "reasoning": {"type": "string"},
-                },
-                "required": ["recommended_tier", "reasoning"],
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
-
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list:
+        """No tools — Saanvi is a single-shot requirements analyst."""
+        return []
 
     async def run(
         self,

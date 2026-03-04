@@ -523,6 +523,10 @@ async def call_ai_with_tools(
     # PHASE-5: Uses proper ContentBlock types instead of pseudo-XML encoding.
     # Old approach: f'[tool_use id="{id}" name="{name}"]' (fragile string parsing)
     # New approach: ToolUseBlock(id=id, name=name, input=input) (typed, Anthropic-native)
+    # AUDIT-FIX: Moved constant out of loop body (was redefined every iteration).
+    _MAX_HISTORY_MESSAGES = 13  # 1 initial + 6 rounds × 2
+    _KEEP_ROUNDS = 6  # 6 rounds = 12 messages
+
     rounds = 0
     while response.tool_calls and rounds < max_tool_rounds:
         rounds += 1
@@ -589,11 +593,20 @@ async def call_ai_with_tools(
             content=result_blocks,
         ))
 
+        # AUDIT-FIX: Early exit if tool handler signals completion.
+        # FixerToolHandler uses _complete, Shubham/AanyaToolHandler use _done.
+        # Check both attributes so early exit works for ALL agentic agents.
+        # Without this, the loop continues calling the AI after task_complete,
+        # wasting tokens and risking the model undoing successful work.
+        if tool_handler is not None and (
+            getattr(tool_handler, '_complete', False)
+            or getattr(tool_handler, '_done', False)
+        ):
+            break
+
         # DEFERRED-FIX-2: Sliding window to prevent unbounded message history.
         # Each round adds 2 messages (assistant tool_use + user tool_result).
         # By round 10, we'd send 22 messages with up to 50KB each = 1MB+.
-        # Keep only the initial user message + last 6 rounds (12 messages).
-        _MAX_HISTORY_MESSAGES = 13  # 1 initial + 6 rounds × 2
         if len(ai_messages) > _MAX_HISTORY_MESSAGES:
             # R25-FIX-5: Ensure message alternation after truncation.
             # Anthropic requires strict user/assistant alternation. Naive
@@ -607,7 +620,6 @@ async def call_ai_with_tools(
             # which causes Anthropic API errors. We now compute the tail as
             # an even number of messages (complete rounds) and ensure the
             # tail starts with an assistant message.
-            _KEEP_ROUNDS = 6  # 6 rounds = 12 messages
             tail = ai_messages[-(_KEEP_ROUNDS * 2):]
             # If tail starts with "user" (tool_result), drop it to maintain
             # alternation: first_msg (user) must be followed by assistant.
@@ -712,6 +724,8 @@ def register_agent(agent: Any) -> None:
 
     ``agent`` must have ``.name`` and ``.display_name`` attributes.
     """
+    if agent.name in _agents:
+        logger.warning("agent_overwrite", agent=agent.name, hint="Duplicate agent name — previous registration replaced")
     _agents[agent.name] = agent
     logger.info("agent_registered", agent=agent.name, display_name=agent.display_name)
 

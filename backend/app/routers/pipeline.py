@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import io as _io
+import posixpath
 import uuid as _uuid
 
 import structlog
@@ -15,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.dependencies import AdminContext, CurrentContext, TenantSession
+from app.dependencies import AdminContext, ApiKeyContext, CurrentContext, TenantSession
 from app.models.core import Project
 from app.schemas.project import (
     CheckpointApprovalRequest,
@@ -83,6 +84,33 @@ def _validate_run_id(run_id: str) -> str:
         )
 
 
+def _simulation_flags(run) -> tuple[bool, dict]:
+    """Compute is_partially_simulated and simulation_summary from run context.
+
+    Aggregates is_simulation_* flags set by individual agents:
+    - aarav (testing):    is_simulation_sandbox — Docker not available
+    - git_agent (git):    is_simulation_git — no real GitHub token/API calls
+    - pranav (deploy):    is_simulation_deploy — no real cloud deployment
+
+    Returns (is_partially_simulated, simulation_summary) where
+    is_partially_simulated is True if ANY of the three flags is True.
+    simulation_summary carries per-subsystem detail for UI banner rendering.
+    """
+    ctx = getattr(run, "context", None) or {}
+    sandbox = bool(ctx.get("aarav", {}).get("is_simulation_sandbox", False))
+    git = bool(ctx.get("git_agent", {}).get("is_simulation_git", False))
+    deploy = bool(ctx.get("pranav", {}).get("is_simulation_deploy", False))
+    partially = sandbox or git or deploy
+    summary: dict = {}
+    if partially:
+        summary = {
+            "sandbox_simulated": sandbox,
+            "git_simulated": git,
+            "deploy_simulated": deploy,
+        }
+    return partially, summary
+
+
 @router.post(
     "/start",
     response_model=PipelineStatusResponse,
@@ -90,7 +118,7 @@ def _validate_run_id(run_id: str) -> str:
 )
 async def start_pipeline(
     body: PipelineStartRequest,
-    ctx: CurrentContext,
+    ctx: ApiKeyContext,  # F-1-FIX: Accept both JWT and X-Api-Key authentication
     session: TenantSession,
 ) -> PipelineStatusResponse:
     """Start a new pipeline run for a project.
@@ -250,6 +278,7 @@ async def start_pipeline(
         mode=mode.value,
     )
 
+    _partially_simulated, _sim_summary = _simulation_flags(run)
     return PipelineStatusResponse(
         run_id=run.run_id,
         project_id=str(body.project_id),
@@ -257,13 +286,15 @@ async def start_pipeline(
         current_stage=run.current_stage.value,
         execution_mode=run.execution_mode.value,
         created_at=run.created_at.isoformat(),
+        is_partially_simulated=_partially_simulated,
+        simulation_summary=_sim_summary,
     )
 
 
 @router.get("/{run_id}", response_model=PipelineStatusResponse)
 async def get_pipeline_status(
     run_id: str,
-    ctx: CurrentContext,
+    ctx: ApiKeyContext,  # F-1-FIX: Accept both JWT and X-Api-Key
 ) -> PipelineStatusResponse:
     """Get the current status of a pipeline run."""
     run_id = _validate_run_id(run_id)
@@ -305,6 +336,7 @@ async def get_pipeline_status(
         for sr in run.step_results
     ]
 
+    _partially_simulated, _sim_summary = _simulation_flags(run)
     return PipelineStatusResponse(
         run_id=run.run_id,
         project_id=run.project_id,
@@ -314,6 +346,8 @@ async def get_pipeline_status(
         created_at=run.created_at.isoformat(),
         step_results=step_results,
         error=run.error,
+        is_partially_simulated=_partially_simulated,
+        simulation_summary=_sim_summary,
     )
 
 
@@ -388,6 +422,7 @@ async def approve_checkpoint(
         user_id=ctx.user_id,
     )
 
+    _partially_simulated, _sim_summary = _simulation_flags(run)
     return PipelineStatusResponse(
         run_id=run.run_id,
         project_id=run.project_id,
@@ -396,6 +431,8 @@ async def approve_checkpoint(
         execution_mode=run.execution_mode.value,
         created_at=run.created_at.isoformat(),
         error=run.error,
+        is_partially_simulated=_partially_simulated,
+        simulation_summary=_sim_summary,
     )
 
 
@@ -551,6 +588,7 @@ async def resume_pipeline(
         logger.info("pipeline_resume_dispatched", run_id=run_id)
 
     # Return current run state (execution continues in background)
+    _partially_simulated, _sim_summary = _simulation_flags(run)
     return PipelineStatusResponse(
         run_id=run.run_id,
         project_id=run.project_id,
@@ -559,6 +597,8 @@ async def resume_pipeline(
         execution_mode=run.execution_mode.value,
         created_at=run.created_at.isoformat(),
         error=run.error,
+        is_partially_simulated=_partially_simulated,
+        simulation_summary=_sim_summary,
     )
 
 
@@ -660,13 +700,37 @@ async def get_file_content(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="path query parameter required (max 500 chars)",
         )
-    # Sanitise path — no traversal
-    safe_path = path.replace("\\", "/").lstrip("/")
-    if ".." in safe_path:
+    # Sanitise path — defeat ALL traversal variants including URL-encoded ones.
+    #
+    # Why the old ".." string check was insufficient:
+    #   FastAPI percent-decodes query params before our handler runs, so
+    #   "..%2Fetc%2Fpasswd" arrives as "../etc/passwd" and would be caught —
+    #   but double-encoded "..%252Fetc" → first decode gives "..%2Fetc", which
+    #   contains ".." and IS caught.  However, variants like "....//",
+    #   "..//", or OS-specific separators could still sneak through a simple
+    #   string check.  Using posixpath.normpath with an anchored root is the
+    #   correct fix: it resolves ALL sequences to a canonical path.
+    #
+    # Method: prepend "/" to force absolute path, normpath resolves all "../"
+    # sequences relative to "/", then strip the leading "/" back off.
+    # Any traversal above root collapses to "/" which becomes "" after strip.
+    # Null bytes are rejected explicitly (defence against C-string truncation).
+    if "\x00" in path:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid path",
+        )
+    # normalise: forward-slash only, collapse traversal sequences
+    normalised = posixpath.normpath("/" + path.replace("\\", "/")).lstrip("/")
+    # After normalisation a traversal attempt either collapses to a path inside
+    # the virtual root (safe) or to "" / starts with ".." (should not happen
+    # after anchored normpath, but guard anyway).
+    if not normalised or normalised.startswith(".."):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Path traversal not allowed",
         )
+    safe_path = normalised
 
     orch = get_orchestrator()
     run = orch.get_run(run_id)

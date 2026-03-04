@@ -23,6 +23,7 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -49,6 +50,71 @@ _FRAMEWORK_LANGUAGE: dict[str, str] = {
     "aspnet": "csharp",
     "kotlin_ktor": "kotlin",
 }
+
+
+class DhruvToolHandler:
+    """Handles tool calls for Dhruv's agentic database schema generation loop."""
+
+    def __init__(self, db_config: "DatabaseConfig") -> None:
+        self._db_config = db_config
+        self._written_files: dict[str, str] = {}
+        self._migrations: list[dict[str, str]] = []
+        self._seed_data: list[dict[str, Any]] = []
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "write_file":
+            return self._write_file(tool_input["path"], tool_input["content"])
+        elif tool_name == "generate_migration":
+            return self._generate_migration(tool_input)
+        elif tool_name == "generate_seed_data":
+            return self._generate_seed_data(tool_input)
+        elif tool_name == "validate_schema":
+            return self._validate_schema(
+                tool_input["content"],
+                tool_input.get("dialect", self._db_config.name),
+            )
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _write_file(self, path: str, content: str) -> str:
+        if len(content) < 5:
+            return "Error: content too short — must contain actual schema definitions"
+        self._written_files[path] = content
+        return f"Written {path} ({len(content)} chars)"
+
+    def _generate_migration(self, tool_input: dict) -> str:
+        migration = {
+            "name": tool_input.get("migration_name", "unnamed"),
+            "sql_up": tool_input.get("sql_up", ""),
+            "sql_down": tool_input.get("sql_down", ""),
+        }
+        self._migrations.append(migration)
+        return f"Migration '{migration['name']}' recorded (up: {len(migration['sql_up'])} chars, down: {len(migration['sql_down'])} chars)"
+
+    def _generate_seed_data(self, tool_input: dict) -> str:
+        import json as _json
+        seed = {
+            "table_name": tool_input.get("table_name", "unknown"),
+            "rows": tool_input.get("rows", []),
+        }
+        self._seed_data.append(seed)
+        return f"Seed data for '{seed['table_name']}': {len(seed['rows'])} rows recorded"
+
+    def _validate_schema(self, content: str, dialect: str) -> str:
+        """Basic schema validation — check bracket balance and SQL keywords."""
+        # Check bracket balance
+        opens = content.count("(")
+        closes = content.count(")")
+        if opens != closes:
+            return f"Validation FAILED: unbalanced parentheses (opens={opens}, closes={closes})"
+
+        # Check for common SQL DDL keywords (relational DBs)
+        if dialect in ("postgresql", "mysql", "sqlite", "cockroachdb", "supabase"):
+            has_create = "CREATE" in content.upper()
+            if not has_create:
+                return "Validation WARNING: no CREATE statements found"
+
+        return "Validation OK — schema syntax looks correct"
 
 
 class Dhruv:
@@ -102,6 +168,18 @@ class Dhruv:
             },
         ))
 
+        self.register_tool(ToolDefinition(
+            name="validate_schema",
+            description="Validate generated SQL/schema for syntax correctness.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Schema content to validate."},
+                    "dialect": {"type": "string", "description": "Database dialect (postgresql, mysql, etc)."},
+                },
+                "required": ["content"],
+            },
+        ))
 
     def register_tool(self, tool: "ToolDefinition") -> None:
         """Register a tool available to this agent."""
@@ -126,8 +204,25 @@ class Dhruv:
     def _detect_database(contract: dict[str, Any]) -> str:
         """Detect database from architecture contract."""
         tech_stack = contract.get("tech_stack", {})
-        db = tech_stack.get("database", "postgresql")
-        return db
+        raw_db = str(tech_stack.get("database", "postgresql")).lower()
+        # AUDIT-FIX: Normalize database name for DatabaseConfig registry lookup.
+        # Contract may contain "PostgreSQL 16" but registry expects "postgresql".
+        _DB_ALIASES: dict[str, str] = {
+            "postgres": "postgresql",
+            "mysql": "mysql",
+            "mongo": "mongodb",
+            "sqlite": "sqlite",
+            "firebase": "firebase",
+            "supabase": "supabase",
+            "dynamo": "dynamodb",
+            "neo4j": "neo4j",
+            "cockroach": "cockroachdb",
+            "redis": "redis",
+        }
+        for alias, canonical in _DB_ALIASES.items():
+            if alias in raw_db:
+                return canonical
+        return "postgresql"  # Safe default
 
     # ── Helper: build dynamic system prompt from DatabaseConfig ────────
 
@@ -354,11 +449,28 @@ class Dhruv:
         # Build dynamic system prompt from DatabaseConfig
         system_prompt = self._build_system_prompt(db_config, backend_framework)
 
+        # Add agentic instructions
+        system_prompt += "\n".join([
+            "",
+            "## TOOLS",
+            "You have tools to generate database artifacts iteratively:",
+            "- write_file: Write schema files (models, migrations, configs)",
+            "- generate_migration: Create migration scripts with up/down SQL",
+            "- generate_seed_data: Create seed data for development",
+            "- validate_schema: Validate your generated schema for correctness",
+            "",
+            "Workflow:",
+            "1. Generate the main schema/DDL and write it with write_file",
+            "2. Validate the schema with validate_schema",
+            "3. Generate migration scripts with generate_migration",
+            "4. Generate seed data with generate_seed_data",
+            "5. If validation fails, fix and re-write",
+        ])
+
         import orjson
         tables_json = orjson.dumps(tables).decode("utf-8")
         compliance = contract.get("compliance", {})
 
-        # Use the appropriate terminology in the user prompt
         entity_label = "Tables"
         if db_config.category == "document":
             entity_label = "Collections"
@@ -373,16 +485,18 @@ class Dhruv:
             f"## Compliance Requirements\n{compliance}"
         )
 
+        handler = DhruvToolHandler(db_config=db_config)
+
         try:
-            response = await call_ai(self, 
+            response = await call_ai_with_tools(
+                agent=self,
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 task_type="general",
-                temperature=0.1,
-                enable_thinking=True,
+                tool_handler=handler,
+                max_tool_rounds=10,
             )
         except Exception as exc:
-            # R21-FIX: Sanitize exception to prevent API key leakage.
             from app.services.ai_router import _sanitize_error
             return AgentResult(
                 agent_name=self.name,
@@ -390,8 +504,12 @@ class Dhruv:
                 error=f"AI call failed: {_sanitize_error(exc)}",
             )
 
+        # Build output from tool handler results + any final text response
         output = {
             "database_artifacts": response.content,
+            "written_files": handler._written_files,
+            "migrations": handler._migrations,
+            "seed_data": handler._seed_data,
             "table_count": len(tables),
             "database": db_config.name,
             "database_display_name": db_config.display_name,

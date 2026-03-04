@@ -23,6 +23,7 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -64,6 +65,32 @@ class Challenge:
             "description": self.description,
             "recommendation": self.recommendation,
         }
+
+
+class ChallengerToolHandler:
+    """Handles tool calls for Challenger's agentic architecture review loop."""
+
+    def __init__(self) -> None:
+        self._challenges: list[Challenge] = []
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "raise_challenge":
+            return self._raise_challenge(tool_input)
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _raise_challenge(self, tool_input: dict) -> str:
+        severity = tool_input.get("severity", SEVERITY_MEDIUM).lower()
+        if severity not in (SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW):
+            severity = SEVERITY_MEDIUM
+        challenge = Challenge(
+            category=tool_input.get("category", "general"),
+            severity=severity,
+            description=tool_input.get("description", ""),
+            recommendation=tool_input.get("recommendation", ""),
+        )
+        self._challenges.append(challenge)
+        return f"Challenge raised: [{severity}] {challenge.description[:80]}"
 
 
 class Challenger:
@@ -205,7 +232,7 @@ class Challenger:
         challenges = []
         tech = contract.get("tech_stack", {})
         endpoints = contract.get("api", {}).get("endpoints", [])
-        models = contract.get("database", {}).get("models", [])
+        models = contract.get("database", {}).get("tables", [])
 
         # Too many microservices for a simple app
         services = contract.get("services", [])
@@ -241,7 +268,9 @@ class Challenger:
     def _check_security_gaps(self, contract: dict[str, Any]) -> list[Challenge]:
         """Check for missing security measures."""
         challenges = []
-        auth = contract.get("auth", {})
+        # AUDIT-FIX: Contract stores auth info under "security", not "auth".
+        security = contract.get("security", {})
+        auth = security.get("auth_method", security.get("auth", {}))
         endpoints = contract.get("api", {}).get("endpoints", [])
 
         # No auth defined
@@ -308,11 +337,14 @@ class Challenger:
         """Check for contradictions between requirements and tech choices."""
         challenges = []
         tech = contract.get("tech_stack", {})
-        requirements = contract.get("requirements", "")
+        # AUDIT-FIX: Contract doesn't have a "requirements" key — requirements
+        # live in Saanvi's output. Check description and features instead.
+        req_text = str(contract.get("description", "")).lower()
+        features_text = str(contract.get("features", [])).lower()
+        combined_text = req_text + " " + features_text
 
         # Real-time requirements with no WebSocket support
-        req_text = str(requirements).lower()
-        if any(word in req_text for word in ["real-time", "realtime", "live", "instant"]):
+        if any(word in combined_text for word in ["real-time", "realtime", "live", "instant"]):
             backend = str(tech.get("backend", "")).lower()
             if "socket" not in str(contract).lower() and "sse" not in str(contract).lower():
                 challenges.append(Challenge(
@@ -328,7 +360,7 @@ class Challenger:
         """Check for scalability concerns."""
         challenges = []
         database = contract.get("database", {})
-        models = database.get("models", [])
+        models = database.get("tables", [])
 
         # No indexes defined for a complex schema
         if len(models) > 5:
@@ -350,62 +382,49 @@ class Challenger:
         contract: dict[str, Any],
         context: dict[str, Any],
     ) -> list[Challenge]:
-        """Use AI for deeper architecture analysis."""
+        """Use AI agentic loop for deeper architecture analysis.
+
+        The AI uses the raise_challenge tool to report issues it finds,
+        enabling structured output without JSON parsing fragility.
+        """
         import orjson
 
         contract_json = orjson.dumps(contract, option=orjson.OPT_INDENT_2).decode("utf-8")
 
+        handler = ChallengerToolHandler()
+
         system_prompt = (
             "You are a senior software architect acting as devil's advocate. "
-            "Review this architecture contract and find problems.\n\n"
+            "Review this architecture contract and raise challenges using the raise_challenge tool.\n\n"
+            "For each problem you find, call raise_challenge with:\n"
+            "- category: over_engineering, missing_edge_case, security_gap, "
+            "contradiction, scalability, or maintainability\n"
+            "- severity: critical, high, medium, or low\n"
+            "- description: clear explanation of the problem\n"
+            "- recommendation: actionable fix\n\n"
             "Focus on:\n"
-            "1. Over-engineering (unnecessary complexity)\n"
-            "2. Missing edge cases (error handling, race conditions)\n"
-            "3. Security vulnerabilities\n"
-            "4. Contradictions between choices\n"
+            "1. Over-engineering (unnecessary complexity for the scale)\n"
+            "2. Missing edge cases (error handling, empty states, race conditions)\n"
+            "3. Security vulnerabilities (auth bypass, injection, IDOR)\n"
+            "4. Contradictions between tech choices and requirements\n"
             "5. Scalability bottlenecks\n\n"
-            "Return ONLY a JSON array of challenges, each with: "
-            "category, severity (critical/high/medium/low), description, recommendation.\n"
-            "If the architecture is solid, return an empty array: []"
+            "If the architecture is solid, don't raise any challenges."
         )
 
         try:
-            response = await call_ai(self, 
+            await call_ai_with_tools(
+                agent=self,
                 messages=[{"role": "user", "content": f"Review this contract:\n```json\n{contract_json}\n```"}],
                 system_prompt=system_prompt,
                 task_type="general",
-                temperature=0.3,
+                tool_handler=handler,
+                max_tool_rounds=8,
             )
-
-            # Parse AI response
-            import json
-            text = response.content.strip()
-            # Handle markdown code blocks
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                # R30-FIX-3: Normalize severity to lowercase. AI models return
-                # mixed-case strings ("Critical", "HIGH", "Medium") that don't
-                # match our lowercase constants, causing challenges to fall
-                # through all severity buckets and be silently dropped.
-                return [
-                    Challenge(
-                        category=c.get("category", "general"),
-                        severity=c.get("severity", SEVERITY_MEDIUM).lower(),
-                        description=c.get("description", ""),
-                        recommendation=c.get("recommendation", ""),
-                    )
-                    for c in parsed
-                    if isinstance(c, dict) and c.get("description")
-                ]
         except Exception as exc:
-            # R29-FIX-5: Sanitize error (same as above).
             from app.services.ai_router import _sanitize_error
-            logger.warning("ai_review_parse_failed", error=_sanitize_error(exc))
+            logger.warning("challenger_ai_review_failed", error=_sanitize_error(exc))
 
-        return []
+        return handler._challenges
 
 
 # Register the agent

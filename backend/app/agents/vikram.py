@@ -35,7 +35,7 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
-    call_ai,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -173,8 +173,15 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
         for i, table in enumerate(db["tables"]):
             if "name" not in table:
                 errors.append(f"database.tables[{i}] missing 'name'")
+            # AUDIT-FIX: Validate data types, not just presence.
+            # A contract with "name": 123 or "columns": "not a list"
+            # passes presence checks but crashes downstream agents.
+            elif not isinstance(table.get("name"), str):
+                errors.append(f"Table at index {i}: 'name' must be a string, got {type(table.get('name')).__name__}")
             if "columns" not in table:
                 errors.append(f"database.tables[{i}] missing 'columns'")
+            elif not isinstance(table["columns"], list):
+                errors.append(f"Table '{table.get('name', i)}': 'columns' must be a list")
 
     # Check API has endpoints
     api = contract.get("api", {})
@@ -257,7 +264,13 @@ class Vikram:
         pipeline_run_id: str,
         context: dict[str, Any],
     ) -> AgentResult:
-        """Generate the architecture contract from Saanvi's analysis."""
+        """Generate the architecture contract from Saanvi's analysis.
+
+        Uses call_ai_with_tools() so the validate_schema and write_contract
+        tools are actually executed in a real tool-use loop instead of being
+        ignored (the previous call_ai() approach passed tools to the model
+        declaration but never wired up a handler).
+        """
         saanvi_output = context.get("saanvi")
         tilotma_output = context.get("tilotma")
 
@@ -275,6 +288,11 @@ class Vikram:
             "You are Vikram, the Chief Architect at NexSidi. Generate a complete "
             "Architecture Contract — the machine-readable JSON that ALL downstream "
             "agents will use as their single source of truth.\n\n"
+            "WORKFLOW:\n"
+            "1. Design the full architecture contract\n"
+            "2. Call validate_schema({contract: <your contract>}) to check for errors\n"
+            "3. Fix any errors reported and re-validate if necessary\n"
+            "4. Call write_contract({contract: <valid contract>}) to save the final contract\n\n"
             "The contract MUST include:\n"
             "1. project_name: string\n"
             "2. tech_stack: {backend, frontend, database, cache, hosting}\n"
@@ -295,7 +313,7 @@ class Vikram:
             "- Include seed data tables if compliance flags exist\n"
             "- Foreign keys MUST reference existing table names\n"
             "- Column types: uuid, varchar, text, integer, boolean, timestamp, jsonb, decimal\n\n"
-            "Output ONLY valid JSON. No markdown, no explanation."
+            "You MUST call write_contract() to save the contract — do not output raw JSON."
         )
 
         # PROMPT-INJECTION-FIX: Wrap raw user input in XML-style delimiters
@@ -309,13 +327,60 @@ class Vikram:
             f"## Requirements Analysis (from Saanvi)\n{analysis}"
         )
 
+        # State captured by the tool handler closure
+        _written_contract: dict[str, Any] | None = None
+        _validation_errors: list[str] = []
+
+        async def _tool_handler(name: str, tool_input: dict[str, Any]) -> Any:
+            nonlocal _written_contract, _validation_errors
+
+            if name == "validate_schema":
+                contract = tool_input.get("contract")
+                if not isinstance(contract, dict):
+                    return {"error": "contract must be a JSON object"}
+                errors = validate_contract(contract)
+                return {
+                    "valid": len(errors) == 0,
+                    "errors": errors,
+                    "message": (
+                        "Contract is valid — call write_contract() to save it."
+                        if not errors
+                        else f"{len(errors)} error(s) found. Fix them and re-validate."
+                    ),
+                }
+
+            if name == "write_contract":
+                contract = tool_input.get("contract")
+                if not isinstance(contract, dict):
+                    return {"error": "contract must be a JSON object"}
+                errors = validate_contract(contract)
+                _validation_errors = errors
+                _written_contract = contract
+                if errors:
+                    logger.warning(
+                        "contract_written_with_errors",
+                        errors=errors,
+                        count=len(errors),
+                    )
+                    return {
+                        "saved": True,
+                        "valid": False,
+                        "errors": errors,
+                        "message": "Contract saved but has validation errors.",
+                    }
+                logger.info("contract_written", is_valid=True)
+                return {"saved": True, "valid": True, "message": "Contract saved successfully."}
+
+            return {"error": f"Unknown tool: {name}"}
+
         try:
-            response = await call_ai(self, 
+            response = await call_ai_with_tools(
+                self,
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 task_type="general",
-                temperature=0.1,  # Very low for precise JSON generation
-                enable_thinking=True,  # Complex task needs reasoning
+                tool_handler=_tool_handler,
+                max_tool_rounds=6,  # validate → fix → validate → fix → write → done
             )
         except Exception as exc:
             # R21-FIX: Sanitize exception to prevent API key leakage in error
@@ -327,28 +392,37 @@ class Vikram:
                 error=f"AI call failed: {_sanitize_error(exc)}",
             )
 
-        # Parse and validate the contract
-        contract = self._parse_contract(response.content)
-        if contract is None:
+        # Fallback: if the model returned raw JSON instead of calling write_contract,
+        # parse it from the response content for backward compatibility.
+        if _written_contract is None and response.content:
+            _written_contract = self._parse_contract(response.content)
+            if _written_contract is not None:
+                _validation_errors = validate_contract(_written_contract)
+                logger.warning(
+                    "contract_parsed_from_content",
+                    reason="Model did not call write_contract — fell back to JSON parse",
+                )
+
+        if _written_contract is None:
             return AgentResult(
                 agent_name=self.name,
                 status=AgentStatus.FAILED,
-                error="Failed to parse architecture contract as valid JSON",
+                error="Failed to generate architecture contract",
                 output={"raw_response": response.content},
             )
 
-        validation_errors = validate_contract(contract)
-        if validation_errors:
+        if _validation_errors:
             logger.warning(
                 "contract_validation_errors",
-                errors=validation_errors,
-                count=len(validation_errors),
+                errors=_validation_errors,
+                count=len(_validation_errors),
             )
 
+        contract = _written_contract
         output = {
             "contract": contract,
-            "validation_errors": validation_errors,
-            "is_valid": len(validation_errors) == 0,
+            "validation_errors": _validation_errors,
+            "is_valid": len(_validation_errors) == 0,
             "stats": {
                 "tables": len(contract.get("database", {}).get("tables", [])),
                 "endpoints": len(contract.get("api", {}).get("endpoints", [])),
@@ -363,12 +437,12 @@ class Vikram:
 
         await store_output(self, pipeline_run_id, output)
 
-        result_status = AgentStatus.FAILED if validation_errors else AgentStatus.COMPLETED
+        result_status = AgentStatus.FAILED if _validation_errors else AgentStatus.COMPLETED
         return AgentResult(
             agent_name=self.name,
             status=result_status,
             output=output,
-            error=f"Contract validation failed: {'; '.join(validation_errors)}" if validation_errors else None,
+            error=f"Contract validation failed: {'; '.join(_validation_errors)}" if _validation_errors else None,
             model_used=response.model_used,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
@@ -380,8 +454,14 @@ class Vikram:
         cleaned = content.strip()
         if cleaned.startswith("```"):
             lines = cleaned.split("\n")
-            # Remove first and last line (```json and ```)
-            lines = [l for l in lines if not l.strip().startswith("```")]
+            # AUDIT-FIX: Remove only the FIRST and LAST fence lines, not ALL
+            # lines containing triple backticks. The old list comprehension
+            # deleted lines with ``` inside JSON string values (e.g., code
+            # examples in description fields), silently corrupting the contract.
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
             cleaned = "\n".join(lines)
 
         try:

@@ -19,7 +19,6 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    ToolDefinition,
     call_ai,
     register_agent,
     run_agent,
@@ -38,46 +37,10 @@ class Vanya:
     default_complexity = TaskComplexity.MEDIUM
     default_model: str | None = None
 
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        self.register_tool(ToolDefinition(
-            name="write_design_spec",
-            description="Write a design specification document.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "component": {"type": "string"},
-                    "spec": {"type": "object"},
-                },
-                "required": ["component", "spec"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="generate_wireframe_description",
-            description="Generate a text-based wireframe description for a page.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "page_name": {"type": "string"},
-                    "layout": {"type": "string", "description": "Layout description."},
-                    "components": {"type": "array", "items": {"type": "string"}},
-                    "responsive_notes": {"type": "string"},
-                },
-                "required": ["page_name", "layout"],
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
-
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list:
+        """No tools — Vanya is a single-shot design spec generator."""
+        return []
 
     async def run(
         self,
@@ -135,9 +98,13 @@ class Vanya:
         import orjson
         pages_json = orjson.dumps(pages).decode("utf-8")
 
+        # AUDIT-FIX: Wrap contract-derived data in XML delimiters for defense-in-depth.
         user_content = (
+            "<project_context>\n"
             f"## Project: {project_name}\n\n"
-            f"## Pages from Architecture Contract\n```json\n{pages_json}\n```"
+            f"## Pages to Design\n{pages_json}\n"
+            "</project_context>\n\n"
+            "Generate the UI/UX design specification for the pages described above."
         )
 
         try:

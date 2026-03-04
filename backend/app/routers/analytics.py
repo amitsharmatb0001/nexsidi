@@ -5,6 +5,7 @@ agent success rates, and organization-level usage summaries.
 """
 from __future__ import annotations
 
+import uuid
 import structlog
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
@@ -17,7 +18,7 @@ logger = structlog.get_logger(__name__)
 
 @router.get("/projects/{project_id}/analytics")
 async def get_project_analytics(
-    project_id: str,
+    project_id: uuid.UUID,
     ctx: CurrentContext,
     session: TenantSession,
 ) -> dict:
@@ -137,7 +138,7 @@ async def get_org_usage(
 
 
 @router.get("/projects/{project_id}/export")  # EXPORT-FIX
-async def export_project(project_id: str, ctx: CurrentContext, session: TenantSession) -> dict:
+async def export_project(project_id: uuid.UUID, ctx: CurrentContext, session: TenantSession) -> dict:
     """Export all pipeline run history for a project as structured JSON.
 
     EXPORT-FIX: Compliance and backup endpoint — returns complete history

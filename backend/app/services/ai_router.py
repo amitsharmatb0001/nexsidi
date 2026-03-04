@@ -251,8 +251,21 @@ _MODE_GENERATION_MAP: dict[str, dict[str, str]] = {
 
 
 def get_ai_mode() -> str:
-    """Get the current AI provider mode from settings."""
-    return get_settings().ai_provider_mode
+    """Get the current AI provider mode from settings.
+
+    Feature flag logic:
+    - Default: ``ai_provider_mode="gemini"`` (Gemini-only for beta)
+    - When ``enable_claude=True``: upgrades ``"gemini"`` to ``"mixed"``
+      so Claude models become available alongside Gemini
+    - Explicit ``ai_provider_mode="mixed"`` or ``"claude"`` via env var
+      is respected regardless of the feature flag
+    """
+    settings = get_settings()
+    mode = settings.ai_provider_mode
+    # Feature flag: activate Claude alongside Gemini
+    if settings.enable_claude and mode == "gemini":
+        return "mixed"
+    return mode
 
 
 # ── Circuit Breaker ─────────────────────────────────────────────────
@@ -293,7 +306,12 @@ class CircuitState:
         self._lock: asyncio.Lock | None = None
 
     def _get_lock(self) -> asyncio.Lock:
+        # AUDIT-FIX: Double-check pattern is safe in asyncio (single-threaded),
+        # but we document the invariant explicitly. No `await` between check and
+        # assignment means no coroutine interleaving is possible here.
         if self._lock is None:
+            # Safe: no await between None-check and assignment = no interleaving.
+            # This runs on the asyncio event loop thread; no preemption possible.
             self._lock = asyncio.Lock()
         return self._lock
 

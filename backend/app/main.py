@@ -16,8 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import close_database, get_session_factory, run_migrations, setup_database
+from app.services.agent_message_bus import init_agent_message_bus, shutdown_agent_message_bus
 from app.services.ai_router import get_ai_router, shutdown_ai_router
 from app.services.context_engine import init_context_engine, shutdown_context_engine
+from app.services.pipeline_events import init_pipeline_events, shutdown_pipeline_events
 from app.services.prompt_engine import init_prompt_engine, shutdown_prompt_engine
 from app.services.token_revocation import init_revocation_store, shutdown_revocation_store
 
@@ -54,6 +56,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("context_engine_deferred", error=_sanitize_error(exc))
 
     try:
+        await init_agent_message_bus()
+        logger.info("agent_message_bus_ready")
+    except Exception as exc:
+        logger.warning("agent_message_bus_deferred", error=_sanitize_error(exc))
+
+    try:
+        await init_pipeline_events()
+        logger.info("pipeline_events_ready")
+    except Exception as exc:
+        logger.warning("pipeline_events_deferred", error=_sanitize_error(exc))
+
+    try:
         await init_prompt_engine()
         logger.info("prompt_engine_ready")
     except Exception as exc:
@@ -61,18 +75,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # PHASE-1: Token revocation store (Valkey-backed JWT blocklist)
     # R34-FIX: Check the return value of init_revocation_store(). In production,
-    # it returns None (instead of raising) when Valkey is unavailable. Without
-    # this check, "revocation_store_ready" is logged even when the store is None,
-    # masking total auth service failure from operators.
+    # fail hard if Valkey is unavailable — operating without token revocation means
+    # logout and /logout-all are silently broken, and compromised tokens cannot
+    # be killed. In dev/staging, log an error and degrade gracefully.
     try:
         store = await init_revocation_store()
         if store is None:
+            if settings.is_production:
+                raise RuntimeError(
+                    "Token revocation store (Valkey) is unavailable. "
+                    "Cannot start in production without working token revocation — "
+                    "logout and security lockouts would silently fail. "
+                    "Ensure Valkey is running and VALKEY_URL is correct."
+                )
             logger.error("revocation_store_init_returned_none",
                          hint="Valkey unavailable — token revocation is NOT working")
         else:
             logger.info("revocation_store_ready")
+    except RuntimeError:
+        raise  # Re-raise production startup failures
     except Exception as exc:
+        if settings.is_production:
+            raise RuntimeError(
+                f"Token revocation store failed to initialize in production: {_sanitize_error(exc)}"
+            ) from exc
         logger.warning("revocation_store_deferred", error=_sanitize_error(exc))
+
+    # CELERY-PROD-FIX: Celery is required in production for horizontal scaling.
+    # use_celery=False runs pipelines inside the API process — same event loop,
+    # same crash domain, no horizontal scale. One rogue pipeline OOMs the server.
+    if settings.is_production and not settings.use_celery:
+        raise RuntimeError(
+            "USE_CELERY must be True in production. "
+            "In-process pipeline execution (use_celery=False) cannot scale horizontally "
+            "and shares memory + crash domain with the API server. "
+            "Set USE_CELERY=true and configure CELERY_BROKER_URL."
+        )
 
     # AI Router (lazy-init, just ensure it's importable)
     _ = get_ai_router()
@@ -115,6 +153,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await shutdown_ai_router()
     await shutdown_context_engine()
+    await shutdown_agent_message_bus()
+    await shutdown_pipeline_events()
     await shutdown_prompt_engine()
     await shutdown_revocation_store()
 
@@ -288,6 +328,8 @@ def create_app() -> FastAPI:
 
     # --- Mount routers ---
     from app.routers.auth import router as auth_router
+    from app.routers.password_reset import router as password_reset_router
+    from app.routers.users import router as users_router
     from app.routers.projects import router as projects_router
     from app.routers.pipeline import router as pipeline_router
     from app.routers.chat import router as chat_router
@@ -296,8 +338,12 @@ def create_app() -> FastAPI:
     from app.routers.analytics import router as analytics_router  # ANALYTICS-FIX
     from app.routers.webhooks import router as webhooks_router
     from app.routers.templates import router as templates_router  # TEMPLATE-FIX
+    from app.routers import api_keys, teams, billing
 
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
+    # Password reset + email verification routes share the /api/v1/auth prefix
+    app.include_router(password_reset_router, prefix="/api/v1/auth", tags=["auth"])
+    app.include_router(users_router, prefix="/api/v1/users", tags=["users"])
     app.include_router(projects_router, prefix="/api/v1/projects", tags=["projects"])
     app.include_router(pipeline_router, prefix="/api/v1/pipeline", tags=["pipeline"])
     app.include_router(chat_router, prefix="/api/v1/chat", tags=["chat"])
@@ -306,6 +352,9 @@ def create_app() -> FastAPI:
     app.include_router(analytics_router, prefix="/api/v1", tags=["analytics"])  # ANALYTICS-FIX
     app.include_router(webhooks_router, prefix="/api/v1/webhooks", tags=["webhooks"])
     app.include_router(templates_router, prefix="/api/v1/templates", tags=["templates"])  # TEMPLATE-FIX
+    app.include_router(api_keys.router, prefix="/api/v1/api-keys", tags=["api-keys"])
+    app.include_router(teams.router, prefix="/api/v1/teams", tags=["teams"])
+    app.include_router(billing.router, prefix="/api/v1/billing", tags=["billing"])
 
     return app
 

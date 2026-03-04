@@ -31,7 +31,6 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    ToolDefinition,
     register_agent,
     run_agent,
     store_output,
@@ -174,6 +173,8 @@ class GitOperationResult:
     commit_sha: str = ""
     files_pushed: int = 0
     error: str = ""
+    # True when GITHUB_TOKEN was absent and the operation was simulated.
+    is_simulation: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -220,59 +221,10 @@ class GitAgent:
     default_complexity = TaskComplexity.MEDIUM
     default_model: str | None = None
 
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        self.register_tool(ToolDefinition(
-            name="create_repo",
-            description="Create a new Git repository on GitHub or GitLab.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Repository name."},
-                    "provider": {"type": "string", "enum": ["github", "gitlab"]},
-                    "visibility": {"type": "string", "enum": ["public", "private"]},
-                },
-                "required": ["name"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="push_code",
-            description="Push generated code to a repository.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "repo_url": {"type": "string"},
-                    "branch": {"type": "string"},
-                },
-                "required": ["repo_url"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="create_pull_request",
-            description="Create a pull request with generated code.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "repo_url": {"type": "string"},
-                    "title": {"type": "string"},
-                    "branch": {"type": "string"},
-                },
-                "required": ["repo_url", "title"],
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
-
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list:
+        """No tools — Git Agent is pure automation, no AI tool loop."""
+        return []
 
     async def run(
         self,
@@ -334,6 +286,12 @@ class GitAgent:
             files_pushed=push_result.files_pushed,
         )
 
+        # is_simulation_git is True if ANY operation was simulated.
+        is_simulation_git = (
+            create_result.is_simulation
+            or push_result.is_simulation
+            or pr_result.is_simulation
+        )
         output = {
             "repo_url": create_result.repo_url,
             "repo_name": repo_config.name,
@@ -343,6 +301,8 @@ class GitAgent:
             "files_pushed": push_result.files_pushed,
             "pr_url": pr_result.pr_url,
             "pr_number": pr_result.pr_number,
+            # Honest reporting: True when no real GitHub API calls were made.
+            "is_simulation_git": is_simulation_git,
             "operations": [
                 create_result.to_dict(),
                 push_result.to_dict(),
@@ -382,7 +342,7 @@ class GitAgent:
         else:
             parts = url.split("/")
         owner = parts[0] if parts else "nexsidi"
-        repo = parts[1].rstrip(".git") if len(parts) > 1 else "project"
+        repo = parts[1].removesuffix(".git") if len(parts) > 1 else "project"
         return owner, repo
 
     @staticmethod
@@ -459,12 +419,14 @@ class GitAgent:
             except RuntimeError as exc:
                 logger.warning("git_create_repo_api_error", error=str(exc)[:200])
 
-        # Fallback: generate expected URL without API call
+        # Fallback: generate expected URL without API call (simulated)
         repo_url = f"https://{config.provider.value}.com/nexsidi/{config.name}"
+        logger.warning("git_create_repo_simulated", reason="No GITHUB_TOKEN or unsupported provider")
         return GitOperationResult(
             operation=GitOperationType.CREATE_REPO,
             status=GitOperationStatus.COMPLETED,
             repo_url=repo_url,
+            is_simulation=True,
         )
 
     async def _push_code(  # GIT-FIX
@@ -493,56 +455,98 @@ class GitAgent:
 
         if token and "github.com" in repo_url:
             owner, repo = self._parse_owner_repo(repo_url)
-            commit_sha = ""
-            pushed = 0
+            feature_branch = "nexsidi/generated"
             try:
+                # AUDIT-FIX: Use Git Trees API for atomic batch push.
+                # Old approach: 1 PUT per file = 100-200 HTTP calls for 50-100 files.
+                # New approach: N blob creates + 1 tree + 1 commit + 1 ref = N+3 calls.
+                # Also atomic — all files appear in a single commit.
+
+                # Step 1: Get base commit SHA from main
+                ref_data = await self._github_api(
+                    "GET", f"/repos/{owner}/{repo}/git/ref/heads/main", token
+                )
+                base_sha = ref_data.get("object", {}).get("sha", "")
+
+                # Step 2: Create blobs for each file
+                tree_items: list[dict[str, str]] = []
                 for path, content_str in all_files.items():
                     safe_path = path.lstrip("/")
-                    b64_content = base64.b64encode(
-                        content_str.encode("utf-8")
-                    ).decode("ascii")
-                    # Check if file already exists (need its SHA to update)
-                    existing_sha: str | None = None
-                    try:
-                        existing = await self._github_api(
-                            "GET", f"/repos/{owner}/{repo}/contents/{safe_path}", token
-                        )
-                        existing_sha = existing.get("sha")
-                    except RuntimeError:
-                        pass  # File doesn't exist yet — create it
-
-                    payload: dict[str, Any] = {
-                        "message": f"feat: add {safe_path}",
-                        "content": b64_content,
-                        "branch": "main",
-                    }
-                    if existing_sha:
-                        payload["sha"] = existing_sha
-
-                    result = await self._github_api(
-                        "PUT",
-                        f"/repos/{owner}/{repo}/contents/{safe_path}",
+                    blob = await self._github_api(
+                        "POST",
+                        f"/repos/{owner}/{repo}/git/blobs",
                         token,
-                        json=payload,
+                        json={
+                            "content": base64.b64encode(
+                                content_str.encode("utf-8")
+                            ).decode("ascii"),
+                            "encoding": "base64",
+                        },
                     )
-                    commit_sha = (
-                        result.get("commit", {}).get("sha", commit_sha)
-                    )
-                    pushed += 1
+                    tree_items.append({
+                        "path": safe_path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": blob["sha"],
+                    })
 
-                logger.info("git_code_pushed", repo=repo_url, files_pushed=pushed)
+                # Step 3: Create tree from blobs (based on main's tree)
+                base_commit = await self._github_api(
+                    "GET", f"/repos/{owner}/{repo}/git/commits/{base_sha}", token
+                )
+                base_tree_sha = base_commit.get("tree", {}).get("sha", "")
+
+                tree = await self._github_api(
+                    "POST",
+                    f"/repos/{owner}/{repo}/git/trees",
+                    token,
+                    json={"base_tree": base_tree_sha, "tree": tree_items},
+                )
+
+                # Step 4: Create commit pointing to the new tree
+                commit = await self._github_api(
+                    "POST",
+                    f"/repos/{owner}/{repo}/git/commits",
+                    token,
+                    json={
+                        "message": f"feat: NexSidi generated project ({len(all_files)} files)",
+                        "tree": tree["sha"],
+                        "parents": [base_sha],
+                    },
+                )
+                commit_sha = commit["sha"]
+
+                # Step 5: Create or update feature branch ref
+                try:
+                    await self._github_api(
+                        "POST",
+                        f"/repos/{owner}/{repo}/git/refs",
+                        token,
+                        json={"ref": f"refs/heads/{feature_branch}", "sha": commit_sha},
+                    )
+                except RuntimeError:
+                    # Branch exists — update it
+                    await self._github_api(
+                        "PATCH",
+                        f"/repos/{owner}/{repo}/git/refs/heads/{feature_branch}",
+                        token,
+                        json={"sha": commit_sha, "force": True},
+                    )
+
+                logger.info("git_code_pushed", repo=repo_url, branch=feature_branch, files_pushed=len(all_files))
                 return GitOperationResult(
                     operation=GitOperationType.PUSH_CODE,
                     status=GitOperationStatus.COMPLETED,
                     repo_url=repo_url,
-                    branch="main",
-                    commit_sha=commit_sha or secrets.token_hex(20),
-                    files_pushed=pushed,
+                    branch=feature_branch,
+                    commit_sha=commit_sha,
+                    files_pushed=len(all_files),
                 )
             except RuntimeError as exc:
                 logger.warning("git_push_api_error", error=str(exc)[:200])
 
         # Fallback: simulated SHA (no token or non-GitHub provider)
+        logger.warning("git_push_simulated", reason="No GITHUB_TOKEN or unsupported provider", files=total)
         return GitOperationResult(
             operation=GitOperationType.PUSH_CODE,
             status=GitOperationStatus.COMPLETED,
@@ -550,6 +554,7 @@ class GitAgent:
             branch="main",
             commit_sha=secrets.token_hex(20),
             files_pushed=total,
+            is_simulation=True,
         )
 
     async def _create_pr(  # GIT-FIX
@@ -596,22 +601,10 @@ class GitAgent:
         if token and "github.com" in repo_url:
             owner, repo = self._parse_owner_repo(repo_url)
             try:
-                # Create feature branch first
+                # AUDIT-FIX: Branch is already created by _push_code. No need
+                # to create it again here — _push_code now pushes to the
+                # feature branch directly, so the PR will show a real diff.
                 branch_name = "nexsidi/generated"
-                try:
-                    # Get default branch SHA
-                    ref_data = await self._github_api(
-                        "GET", f"/repos/{owner}/{repo}/git/ref/heads/main", token
-                    )
-                    base_sha = ref_data.get("object", {}).get("sha", "")
-                    await self._github_api(
-                        "POST",
-                        f"/repos/{owner}/{repo}/git/refs",
-                        token,
-                        json={"ref": f"refs/heads/{branch_name}", "sha": base_sha},
-                    )
-                except RuntimeError:
-                    pass  # Branch may already exist
 
                 pr_data = await self._github_api(
                     "POST",
@@ -639,7 +632,9 @@ class GitAgent:
                 logger.warning("git_create_pr_api_error", error=str(exc)[:200])
 
         # Fallback: simulated PR number
+        # Fallback: simulated PR (no token or unsupported provider)
         pr_number = secrets.randbelow(9000) + 1000
+        logger.warning("git_pr_simulated", reason="No GITHUB_TOKEN or unsupported provider")
         return GitOperationResult(
             operation=GitOperationType.CREATE_PR,
             status=GitOperationStatus.COMPLETED,
@@ -647,6 +642,7 @@ class GitAgent:
             branch="nexsidi/generated",
             pr_url=f"{repo_url}/pull/{pr_number}",
             pr_number=pr_number,
+            is_simulation=True,
         )
 
     async def commit_files(  # GIT-FIX

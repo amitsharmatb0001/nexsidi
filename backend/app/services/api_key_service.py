@@ -1,4 +1,16 @@
-"""API Key Service: manages enterprise API keys (billing.api_keys).
+"""DEPRECATED: In-memory API Key Service — replaced by api_key_auth.py (DB-backed).
+
+This module stored keys in a Python dict (process memory) and was never connected
+to the billing.api_keys database table used by the CRUD router. It has been
+superseded by app.services.api_key_auth which:
+  - Authenticates via SHA-256 lookup against billing.api_keys in PostgreSQL
+  - Works across multi-worker/multi-replica deployments
+  - Integrates with FastAPI via the ApiKeyContext dependency in dependencies.py
+
+Do NOT use this module for new code. Use api_key_auth.authenticate_api_key() instead.
+
+Original doc:
+API Key Service: manages enterprise API keys (billing.api_keys).
 
 Security (AUDIT FIX - Missing 6):
 - Keys generated with secrets.token_urlsafe(64) (512-bit entropy)

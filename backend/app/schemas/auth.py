@@ -21,7 +21,9 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
     name: str = Field(min_length=1, max_length=255)
-    organization_name: str = Field(min_length=1, max_length=255)
+    # L-3-FIX: Capped at 100 chars. The slug generator truncated at 100 but
+    # the raw name had no cap — unbounded org names could be stored in the DB.
+    organization_name: str = Field(min_length=1, max_length=100)
 
     @field_validator("password")
     @classmethod
@@ -44,6 +46,10 @@ class UserLogin(BaseModel):
     # memory. While bcrypt truncates to 72 bytes, the full string is still
     # parsed by Pydantic and held in memory — a lightweight DoS vector.
     password: str = Field(..., max_length=1024)
+    # F-2-FIX: Optional TOTP code required when user has 2FA enabled.
+    # Clients that don't support TOTP can detect the requirement by catching
+    # the 401 {"totp_required": true} response and prompting the user.
+    totp_code: str | None = Field(None, pattern=r"^\d{6}$", description="6-digit TOTP code (required if 2FA enabled)")
 
 
 class TokenRefresh(BaseModel):

@@ -48,6 +48,7 @@ from jose import JWTError
 
 from app.services.auth import decode_token, verify_token
 from app.services.pipeline import PipelineRunStatus, get_orchestrator
+from app.services.pipeline_events import get_pipeline_event_subscriber
 
 logger = structlog.get_logger(__name__)
 
@@ -327,6 +328,26 @@ async def pipeline_websocket(
     if not connected:
         return
 
+    # PUBSUB-FIX: Register a pub-sub handler so events published by OTHER
+    # processes (e.g. Celery workers, other FastAPI workers) are forwarded to
+    # this WebSocket client. The handler is a closure over `websocket` and is
+    # unregistered in the finally block when the connection closes.
+    async def _forward_to_ws(event: dict) -> None:
+        """Forward a pub-sub event to this WebSocket connection."""
+        try:
+            await asyncio.wait_for(websocket.send_json(event), timeout=5.0)
+        except Exception:
+            pass  # Connection dead — next heartbeat/broadcast will clean it up
+
+    _subscriber = get_pipeline_event_subscriber()
+    if _subscriber is not None:
+        try:
+            await _subscriber.subscribe_run(run_id, _forward_to_ws)
+        except Exception as _sub_exc:
+            # Non-fatal: single-process delivery still works without pub-sub
+            logger.warning("ws_pubsub_subscribe_failed", run_id=run_id, error=str(_sub_exc))
+            _subscriber = None  # Don't attempt unsubscribe in finally
+
     # R18-FIX: Moved send_json inside the try block. Previously, if auth_ok
     # send failed (client disconnected between connect and send), the exception
     # propagated past the try/finally, leaving a "ghost connection" registered
@@ -377,6 +398,14 @@ async def pipeline_websocket(
         from app.services.ai_router import _sanitize_error
         logger.warning("ws_error", run_id=run_id, error=_sanitize_error(exc))
     finally:
+        # PUBSUB-FIX: Always unregister the pub-sub handler before disconnecting
+        # from the local manager. This prevents the subscriber from trying to
+        # deliver events to a closed WebSocket after disconnect.
+        if _subscriber is not None:
+            try:
+                await _subscriber.unsubscribe_run(run_id, _forward_to_ws)
+            except Exception:
+                pass  # Best-effort cleanup
         manager.disconnect(run_id, websocket)
 
 

@@ -21,7 +21,7 @@ Supported providers (10 via CloudConfig registry):
 - Heroku (PaaS -- full-stack)
 
 Security (AUDIT FIX #17):
-- Deployment uses Sonnet 4.6 for all AI calls (security-critical)
+- No AI calls — pure template-based config generation
 - No secrets in generated configs -- secrets are injected at deploy time
 - Deployment logs are sanitized (no tokens/keys)
 """
@@ -38,7 +38,6 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    ToolDefinition,
     register_agent,
     run_agent,
     store_output,
@@ -115,7 +114,7 @@ class DeployConfig:
         """
         project_name = contract.get("project_name", "app")
         # Sanitize project name for service naming
-        service_name = re.sub(r"[^a-z0-9-]", "-", project_name.lower())[:50]
+        service_name = re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", project_name.lower()))[:50].strip("-")
 
         deploy_config = contract.get("deployment", {})
 
@@ -152,6 +151,9 @@ class DeployResult:
     health_check_passed: bool = False
     error: str = ""
     duration_seconds: float = 0.0
+    # Simulation transparency: True when no real deploy was executed.
+    # Populated by _deploy() and surfaced in agent output for UI/API honesty.
+    is_simulation: bool = True
 
 
 # -- Pranav Agent --------------------------------------------------------------
@@ -160,71 +162,19 @@ class DeployResult:
 class Pranav:
     """Deployment Agent -- deploys to any of 10 cloud providers via CloudConfig.
 
-    ALWAYS uses Sonnet 4.6 for AI calls (deployment is security-critical).
+    Pure automation agent — no AI calls. Generates deploy configs from templates.
     """
 
     name = "pranav"
     display_name = "Pranav -- Deployment Engineer"
     default_complexity = TaskComplexity.HIGH
-    default_model = "claude-sonnet-4-6"  # AUDIT FIX #17: security-critical
-
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        # Build the provider enum list from the live CloudConfig registry
-        all_providers = list_clouds()
-
-        self.register_tool(ToolDefinition(
-            name="deploy",
-            description="Deploy the built project to the selected provider.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "provider": {
-                        "type": "string",
-                        "enum": all_providers,
-                    },
-                },
-                "required": ["provider"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="generate_deploy_config",
-            description="Generate deployment configuration files for the selected provider.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "provider": {
-                        "type": "string",
-                        "enum": all_providers,
-                    },
-                },
-                "required": ["provider"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="health_check",
-            description="Verify deployment health after deploy.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "Deployment URL to check."},
-                },
-                "required": ["url"],
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
+    # AUDIT-FIX: Removed model override — Pranav makes zero AI calls.
+    default_model: str | None = None
 
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list:
+        """No tools — Pranav is pure automation, no AI tool loop."""
+        return []
 
     async def run(
         self,
@@ -308,6 +258,9 @@ class Pranav:
             "category": cloud_config.category,
             "deployment_url": result.deployment_url,
             "health_check_passed": result.health_check_passed,
+            # Simulation transparency — always present so UI/API consumers can
+            # show "simulated output" banners when no real deploy ran.
+            "is_simulation_deploy": result.is_simulation,
             "config_files": config_files,
             # R30-FIX-9: Sanitize build_log too. Previously only deploy_log was
             # sanitized. Build logs from `docker build` or `npm run build` can
@@ -332,8 +285,9 @@ class Pranav:
                     failed=smoke_results["failed"],
                 )
             except Exception as exc:
-                logger.warning("smoke_tests_error", url=result.deployment_url, error=str(exc)[:200])
-                output["smoke_tests"] = {"error": str(exc)[:200], "passed": 0, "failed": 0, "checks": []}
+                from app.services.ai_router import _sanitize_error
+                logger.warning("smoke_tests_error", url=result.deployment_url, error=_sanitize_error(exc)[:200])
+                output["smoke_tests"] = {"error": _sanitize_error(exc)[:200], "passed": 0, "failed": 0, "checks": []}
 
         await store_output(self, pipeline_run_id, output)
 
@@ -596,17 +550,10 @@ class Pranav:
 
         elapsed = time.monotonic() - start
 
-        # -- Phase 4: Smoke tests on successful live deploy -----------------------
-        if health_passed and deploy_mode != "simulation":
-            try:
-                smoke = await _run_smoke_tests(deployment_url)
-                logger.info(
-                    "deploy_smoke_tests",
-                    passed=smoke.get("passed", 0),
-                    failed=smoke.get("failed", 0),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("deploy_smoke_tests_error", error=str(exc)[:100])
+        # AUDIT-FIX: Removed duplicate smoke tests from _deploy(). Smoke tests
+        # are run in execute() after _deploy() returns (lines 276-289), where the
+        # results are actually stored in output["smoke_tests"]. Running them here
+        # too was pure waste — the results were logged and discarded.
 
         return DeployResult(
             status=DeployStatus.LIVE if health_passed else DeployStatus.FAILED,
@@ -617,6 +564,7 @@ class Pranav:
             deploy_log=deploy_log,
             health_check_passed=health_passed,
             duration_seconds=elapsed,
+            is_simulation=(deploy_mode == "simulation"),
         )
 
 

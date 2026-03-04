@@ -5,7 +5,8 @@ Runs post-delivery to create comprehensive project documentation:
 2. User guide from architecture contract + UI design
 3. README with setup instructions, tech stack, and deployment info
 
-Uses AI to generate human-readable documentation from structured data.
+Uses template-based generation from structured pipeline context data.
+No AI calls — pure string templating from contract + generated file metadata.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    ToolDefinition,
     register_agent,
     run_agent,
     store_output,
@@ -25,6 +25,13 @@ from app.agents.base import (
 from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
+
+
+# AUDIT-FIX: Escape curly braces in values before str.format().
+# Prevents KeyError/ValueError when project names or endpoint paths
+# contain { or } (e.g., "My {Cool} Project", "/users/{id}").
+def _safe(val: str) -> str:
+    return str(val).replace("{", "{{").replace("}", "}}")
 
 
 # ── Documentation Templates ──────────────────────────────────────
@@ -99,39 +106,10 @@ class DocsAgent:
     default_complexity = TaskComplexity.MEDIUM
     default_model: str | None = None
 
-    def __init__(self) -> None:
-        self._tools: dict[str, ToolDefinition] = {}
-
-        self.register_tool(ToolDefinition(
-            name="generate_readme",
-            description="Generate a README.md for the project.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "format": {"type": "string", "enum": ["markdown", "rst"]},
-                },
-                "required": ["format"],
-            },
-        ))
-
-        self.register_tool(ToolDefinition(
-            name="generate_api_docs",
-            description="Generate API documentation from endpoints.",
-            parameters={
-                "type": "object",
-                "properties": {},
-            },
-        ))
-
-
-    def register_tool(self, tool: "ToolDefinition") -> None:
-        """Register a tool available to this agent."""
-        self._tools[tool.name] = tool
-
     @property
-    def tools(self) -> list["ToolDefinition"]:
-        """All registered tools."""
-        return list(self._tools.values())
+    def tools(self) -> list:
+        """No tools — DocsAgent is a template engine, no AI calls."""
+        return []
 
     async def run(
         self,
@@ -215,8 +193,8 @@ class DocsAgent:
             project_structure += f"\n... and {len(all_paths) - 20} more files"
 
         return README_SKELETON.format(
-            project_name=project_name,
-            description=contract.get("description", f"{project_name} — built with NexSidi"),
+            project_name=_safe(project_name),
+            description=_safe(contract.get("description", f"{project_name} — built with NexSidi")),
             backend_stack=backend_stack,
             frontend_stack=frontend_stack,
             database_stack=database_stack,
@@ -225,7 +203,7 @@ class DocsAgent:
             install_steps="git clone <repo-url>\ncd " + project_name.lower().replace(" ", "-") + "\npip install -r requirements.txt\nnpm install",
             run_steps="# Backend\nuvicorn app.main:app --reload\n\n# Frontend\nnpm run dev",
             api_summary=api_summary,
-            project_structure=project_structure,
+            project_structure=_safe(project_structure),
             deploy_info=f"Deployed via {deploy_provider}. See deployment config in `/deploy` directory.",
             license_text="MIT License",
         )
@@ -240,7 +218,7 @@ class DocsAgent:
             method = ep.get("method", "GET").upper()
             path = ep.get("path", "/")
             description = ep.get("description", "")
-            auth = "Requires authentication" if ep.get("auth", True) else "Public"
+            auth = "Requires authentication" if ep.get("auth_required", True) else "Public"
 
             sections.append(
                 f"### `{method} {path}`\n\n"
@@ -248,10 +226,14 @@ class DocsAgent:
                 f"**Auth**: {auth}\n"
             )
 
+        # AUDIT-FIX: Escape curly braces in all values before .format().
+        # Endpoint paths like /users/{id} contain { and } which crash str.format()
+        # with KeyError. This is the common case for any real API project.
+        endpoints_doc = "\n---\n\n".join(sections) if sections else "No endpoints defined."
         return API_DOC_TEMPLATE.format(
-            project_name=project_name,
+            project_name=_safe(project_name),
             base_url="/api/v1",
-            endpoints_doc="\n---\n\n".join(sections) if sections else "No endpoints defined.",
+            endpoints_doc=_safe(endpoints_doc),
         )
 
     def _generate_setup_guide(self, contract: dict[str, Any], context: dict[str, Any]) -> str:
@@ -288,7 +270,7 @@ class DocsAgent:
             "```env",
             "DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/db",
             "JWT_SECRET_KEY=your-secret-key-here",
-            f"ENVIRONMENT={'development'}",
+            "ENVIRONMENT=development",
             "```",
             "",
             "## Running Tests",
