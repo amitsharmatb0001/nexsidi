@@ -212,7 +212,7 @@ class TemplateEngine:
         slug = re.sub(r"[^\w\s-]", "", slug)
         slug = re.sub(r"[\s_]+", "-", slug)
         slug = re.sub(r"-+", "-", slug)
-        return slug.strip("-")
+        return slug.strip("-") or "project"  # V7.4-FIX: fallback for all-symbol inputs
 
     # ── Built-in Templates ──────────────────────────────────────────
 

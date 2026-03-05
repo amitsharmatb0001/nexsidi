@@ -152,6 +152,9 @@ _ALLOWED_ROUTES: dict[str, set[str]] = {
     # Security audit can route to fixing if critical issues found,
     # or proceed to compliance check
     "security_audit": {"fixing", "compliance_check"},
+    # V3-FIX: Backend build can rewind to architecture when contract
+    # coherence validation fails (max 2 retries)
+    "backend_build": {"architecture"},
 }
 
 # I2-FIX: Agent context dependency map ────────────────────────────
@@ -196,7 +199,7 @@ def _build_filtered_context(ctx: dict[str, Any], agent_name: str) -> dict[str, A
 # Agent output values larger than this are offloaded to context_engine
 # storage and replaced with a reference dict.  Downstream agents that
 # need the full content get it hydrated transparently.
-_CONTEXT_COMPACT_THRESHOLD = 16 * 1024  # D2-FIX: Lowered from 64KB to 16KB
+_CONTEXT_COMPACT_THRESHOLD = 32 * 1024  # V7.5-FIX: Raised from 16KB (too aggressive) to 32KB
 
 # Redo rewind targets: which stage to jump back to when user says "redo"
 CHECKPOINT_REDO_TARGETS: dict[PipelineStage, PipelineStage] = {
@@ -1035,9 +1038,9 @@ class PipelineOrchestrator:
         if isinstance(agent_name, list):
             return await self._execute_parallel(run, stage, agent_name)
 
-        # Contract coherence check: fail-fast before Shubham consumes the contract.
-        # If FK references or endpoint paths are broken, stop now instead of
-        # generating thousands of lines of incorrect code.
+        # Contract coherence check before Shubham consumes the contract.
+        # V3-FIX: Route back to ARCHITECTURE with errors instead of hard-fail.
+        # Max 2 retries, then hard-fail as before.
         if stage == PipelineStage.BACKEND_BUILD:
             contract = run.context.get("vikram", {}).get("contract", {})
             if contract:
@@ -1048,32 +1051,66 @@ class PipelineOrchestrator:
                     error_summary = "; ".join(coherence_errors[:5])
                     if len(coherence_errors) > 5:
                         error_summary += f" … and {len(coherence_errors) - 5} more"
-                    logger.error(
-                        "contract_coherence_fail_fast",
-                        run_id=run.run_id,
-                        error_count=len(coherence_errors),
-                        errors=coherence_errors,
-                    )
+
+                    retries = run.context.get("__coherence_retries__", 0)
                     from app.agents.base import AgentResult, AgentStatus
 
-                    failed_result = AgentResult(
-                        agent_name="contract_coherence_validator",
-                        status=AgentStatus.FAILED,
-                        error=(
-                            f"Architecture contract has {len(coherence_errors)} coherence "
-                            f"error(s): {error_summary}"
-                        ),
-                    )
-                    step = StepResult(
-                        stage=stage,
-                        agent_name="contract_coherence_validator",
-                        result=failed_result,
-                        completed_at=datetime.now(timezone.utc),
-                    )
-                    await self._persist_step(run, step)
-                    run.status = PipelineRunStatus.FAILED
-                    run.error = failed_result.error
-                    return step
+                    if retries < 2:
+                        # V3-FIX: Rewind to ARCHITECTURE — Vikram re-generates
+                        # with coherence errors as correction context.
+                        run.context["__coherence_retries__"] = retries + 1
+                        run.context["__coherence_errors__"] = coherence_errors
+                        logger.warning(
+                            "contract_coherence_rewind",
+                            run_id=run.run_id,
+                            retry=retries + 1,
+                            error_count=len(coherence_errors),
+                            errors=coherence_errors[:5],
+                        )
+                        rewind_result = AgentResult(
+                            agent_name="contract_coherence_validator",
+                            status=AgentStatus.COMPLETED,
+                            error=None,
+                            output={
+                                "__coherence_rewind__": True,
+                                "coherence_errors": coherence_errors,
+                                "retry": retries + 1,
+                            },
+                        )
+                        step = StepResult(
+                            stage=stage,
+                            agent_name="contract_coherence_validator",
+                            result=rewind_result,
+                            completed_at=datetime.now(timezone.utc),
+                        )
+                        await self._persist_step(run, step)
+                        return step
+                    else:
+                        # Max retries exhausted — hard-fail
+                        logger.error(
+                            "contract_coherence_fail_fast",
+                            run_id=run.run_id,
+                            error_count=len(coherence_errors),
+                            errors=coherence_errors,
+                        )
+                        failed_result = AgentResult(
+                            agent_name="contract_coherence_validator",
+                            status=AgentStatus.FAILED,
+                            error=(
+                                f"Architecture contract has {len(coherence_errors)} coherence "
+                                f"error(s) after {retries} retries: {error_summary}"
+                            ),
+                        )
+                        step = StepResult(
+                            stage=stage,
+                            agent_name="contract_coherence_validator",
+                            result=failed_result,
+                            completed_at=datetime.now(timezone.utc),
+                        )
+                        await self._persist_step(run, step)
+                        run.status = PipelineRunStatus.FAILED
+                        run.error = failed_result.error
+                        return step
 
         # Execute single agent
         return await self._execute_agent(run, stage, agent_name)
@@ -1616,6 +1653,19 @@ class PipelineOrchestrator:
             # skipping the challenge-retry and fix-retest loops entirely.
             # This silently disabled two critical quality gates in debug mode.
 
+            # V3-FIX: Contract coherence rewind — if execute_stage() detected
+            # coherence errors and returned a rewind marker, jump back to
+            # ARCHITECTURE so Vikram can fix the contract.
+            if (
+                step_result.result
+                and step_result.result.output
+                and isinstance(step_result.result.output, dict)
+                and step_result.result.output.get("__coherence_rewind__")
+            ):
+                run.current_stage = PipelineStage.ARCHITECTURE
+                await self._persist_run(run)
+                continue
+
             # Architecture challenge-retry loop: after ARCHITECTURE_REVIEW,
             # if critical challenges found, rewind to ARCHITECTURE for Vikram
             # to re-generate with challenges as constraints (max 2 retries).
@@ -1699,8 +1749,25 @@ class PipelineOrchestrator:
                         severity=fix_severity,
                     )
                     run.current_stage = PipelineStage.TESTING
+                elif fix_severity == "MODERATE":
+                    # V4-FIX: MODERATE fast-path — skip security+compliance
+                    # but keep quality review, testing, tilotma for functional
+                    # validation.  Skip flags are cleared after loop exit.
+                    run.context["__fix_fast_path__"] = True
+                    run.context["__skip_security_audit__"] = True
+                    run.context["__skip_compliance__"] = True
+                    logger.info(
+                        "fix_retest_moderate_fast_path",
+                        run_id=run.run_id,
+                        cycle=run.fix_retest_cycle,
+                        severity=fix_severity,
+                    )
+                    run.current_stage = PipelineStage.QUALITY_REVIEW
                 else:
+                    # STRUCTURAL — full cycle, clear skip flags from prior cycles
                     run.context.pop("__fix_fast_path__", None)
+                    run.context.pop("__skip_security_audit__", None)
+                    run.context.pop("__skip_compliance__", None)
                     logger.info(
                         "fix_retest_loop",
                         run_id=run.run_id,
@@ -1712,6 +1779,13 @@ class PipelineOrchestrator:
 
                 await self._persist_run(run)
                 continue
+
+            # V4-FIX: Clear MODERATE fast-path skip flags when exiting fix-retest
+            # loop so they don't leak into normal sequential pipeline flow.
+            if run.current_stage == PipelineStage.FIXING:
+                run.context.pop("__skip_security_audit__", None)
+                run.context.pop("__skip_compliance__", None)
+                run.context.pop("__fix_fast_path__", None)
 
             # R21-FIX: Clear bulky output from step_result after persistence
             # AND after all checks that read output (fix-retest, challenge-retry).

@@ -1003,25 +1003,9 @@ class ShubhamToolHandler:
         return result
 
     async def _ask_architect(self, question: str, context: str = "") -> str:
-        # PATH A: Real-time message bus (works when agents run concurrently)
-        try:
-            from app.services.agent_message_bus import get_agent_message_bus
-
-            bus = get_agent_message_bus()
-            answer = await bus.ask(
-                from_agent="shubham",
-                to_agent="vikram",
-                pipeline_run_id=self._pipeline_run_id,
-                question=question,
-                context={"context": context},
-                timeout=10.0,  # Short timeout — fall back to oracle quickly
-            )
-            return answer
-        except Exception:
-            pass  # Fall through to oracle
-
-        # PATH B: Context oracle fallback — Vikram ran before us, so look up
-        # the completed contract from the pipeline context.
+        # V1-FIX: Go straight to oracle — pipeline runs agents sequentially,
+        # so the message bus BLPOP always times out (target agent never listens).
+        # When concurrent agent execution is added, re-enable message bus here.
         if self._pipeline_context:
             from app.services.agent_oracle import query_agent_context
             return query_agent_context(self._pipeline_context, "vikram", question)

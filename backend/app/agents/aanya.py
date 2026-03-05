@@ -270,7 +270,12 @@ class AanyaToolHandler:
         else:
             return f"Unknown tool: {tool_name}"
 
+    # V7.1-FIX: Reject oversized files (LLM could generate multi-MB output)
+    _MAX_FILE_SIZE = 500 * 1024  # 500KB
+
     async def _write_file(self, path: str, content: str) -> str:
+        if len(content) > self._MAX_FILE_SIZE:
+            return f"Error: file too large ({len(content)} bytes, max {self._MAX_FILE_SIZE})"
         self._files[path] = content
         return f"Written {path} ({len(content)} chars)"
 
@@ -316,24 +321,9 @@ class AanyaToolHandler:
         return "\n".join(lines)
 
     async def _ask_agent(self, agent_name: str, question: str, context: str = "") -> str:
-        # PATH A: Real-time message bus (works when agents run concurrently)
-        try:
-            from app.services.agent_message_bus import get_agent_message_bus
-            bus = get_agent_message_bus()
-            answer = await bus.ask(
-                from_agent="aanya",
-                to_agent=agent_name,
-                pipeline_run_id=self._pipeline_run_id,
-                question=question,
-                context={"context": context},
-                timeout=10.0,  # Short timeout — fall back to oracle quickly
-            )
-            return answer
-        except Exception:
-            pass  # Fall through to oracle
-
-        # PATH B: Context oracle fallback — for sequential pipeline where the
-        # target agent has already completed (Vikram and Shubham run before Aanya).
+        # V1-FIX: Go straight to oracle — pipeline runs agents sequentially,
+        # so the message bus BLPOP always times out (target agent never listens).
+        # When concurrent agent execution is added, re-enable message bus here.
         if self._pipeline_context:
             from app.services.agent_oracle import query_agent_context
             return query_agent_context(self._pipeline_context, agent_name, question)

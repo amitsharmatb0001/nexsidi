@@ -345,6 +345,17 @@ class Vikram:
             f"## Requirements Analysis (from Saanvi)\n{analysis}"
         )
 
+        # V3-FIX: If this is a coherence-rewind retry, inject the errors
+        # from the previous attempt so Vikram can fix them.
+        coherence_errors = context.get("__coherence_errors__")
+        if coherence_errors:
+            user_content += (
+                "\n\n## CONTRACT COHERENCE ERRORS (from previous attempt)\n"
+                "The following errors were found in your architecture contract. "
+                "You MUST fix ALL of them in this attempt:\n"
+                + "\n".join(f"- {e}" for e in coherence_errors)
+            )
+
         # State captured by the tool handler closure
         _written_contract: dict[str, Any] | None = None
         _validation_errors: list[str] = []

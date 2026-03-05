@@ -175,7 +175,7 @@ class Settings(BaseSettings):
 
     # I5-FIX: Worker type — "celery" or "async" (native asyncio worker).
     # "async" uses BLPOP-based Valkey queue (app.workers.async_worker).
-    worker_type: str = "celery"
+    worker_type: str = "async"  # V2-FIX: Default to async (non-blocking)
 
     # I6-FIX: Executor type — "docker" or "kubernetes".
     # "kubernetes" uses ephemeral K8s Jobs for sandbox isolation.

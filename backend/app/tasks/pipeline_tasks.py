@@ -489,6 +489,17 @@ def run_pipeline_task(
     Returns:
         Dict with run_id, status, current_stage, and error (if any).
     """
+    # V2-FIX: Celery pipeline dispatch is deprecated in favor of async_worker.py.
+    # Set PIPELINE_DISPATCH_MODE=async in config to use the native asyncio worker.
+    import warnings
+    warnings.warn(
+        "Celery pipeline dispatch is deprecated. Set PIPELINE_DISPATCH_MODE=async "
+        "to use the native asyncio worker (async_worker.py) which avoids blocking "
+        "the OS thread for the entire pipeline duration.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
+
     is_retry = self.request.retries > 0
 
     logger.info(
