@@ -60,7 +60,9 @@ class AgentInterruptRequest(Exception):
     pipeline's ``_execute_agent()`` catches it, re-runs the target agent
     with interrupt context, then resumes the requesting agent.
 
-    Max 2 interrupts per agent-pair per pipeline run (prevents loops).
+    C2c-FIX: Added ``partial_output`` field so the requesting agent's work
+    done before the interrupt is preserved and can be resumed from.
+    Limit is now configurable via ``settings.max_interrupts_per_pair``.
     """
 
     def __init__(
@@ -69,11 +71,13 @@ class AgentInterruptRequest(Exception):
         target_agent: str,
         reason: str,
         required_changes: str,
+        partial_output: dict | None = None,
     ) -> None:
         self.requesting_agent = requesting_agent
         self.target_agent = target_agent
         self.reason = reason
         self.required_changes = required_changes
+        self.partial_output = partial_output  # Work done before interrupt
         super().__init__(
             f"{requesting_agent} requests {target_agent} re-run: {reason}"
         )

@@ -40,8 +40,16 @@ google-auth>=2.36.0
 # Static analysis (used by build agents for import/type validation)
 pyright>=1.1.390
 
-# Kubernetes executor (optional — only needed when executor_type=kubernetes)
-# kubernetes>=31.0.0
+# C3-FIX: Fast Python linter for validate_syntax tool (catches undefined names,
+# unused imports, common bugs — not just syntax errors like ast.parse)
+ruff>=0.8.0
+
+# C1-FIX: Native async Kubernetes client (replaces sync kubernetes + asyncio.to_thread)
+# Optional — only needed when executor_type=kubernetes
+# kubernetes_asyncio>=31.0.0
+
+# GCS object storage for K8s code delivery (already pulled by google-cloud-secret-manager)
+# google-cloud-storage>=2.18.0
 
 # Utilities
 python-dotenv>=1.0.1

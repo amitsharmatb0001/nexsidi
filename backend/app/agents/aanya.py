@@ -350,19 +350,28 @@ class AanyaToolHandler:
     def _request_agent_rerun(
         self, target_agent: str, reason: str, required_changes: str
     ) -> str:
-        """Request another agent to re-run with updated requirements."""
+        """Request another agent to re-run with updated requirements.
+
+        C2c-FIX: Uses configurable max_interrupts_per_pair from settings
+        instead of hardcoded 2.  Also passes partial_output so work done
+        before the interrupt isn't lost.
+        """
+        from app.config import get_settings
+
+        max_interrupts = get_settings().max_interrupts_per_pair
         counter_key = f"__interrupt_count__aanya_{target_agent}__"
         count = self._pipeline_context.get(counter_key, 0)
-        if count >= 2:
+        if count >= max_interrupts:
             return (
-                f"Cannot request {target_agent} re-run: max 2 interrupts "
-                f"per agent pair reached ({count}/2). Proceed with best judgment."
+                f"Cannot request {target_agent} re-run: max {max_interrupts} interrupts "
+                f"per agent pair reached ({count}/{max_interrupts}). Proceed with best judgment."
             )
         raise AgentInterruptRequest(
             requesting_agent="aanya",
             target_agent=target_agent,
             reason=reason,
             required_changes=required_changes,
+            partial_output=dict(self._files),  # Preserve work done so far
         )
 
     # I3-FIX: Import & type validation during generation ─────────────

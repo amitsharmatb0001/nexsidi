@@ -1,30 +1,28 @@
-"""Kubernetes Job-based sandbox executor.
+"""Kubernetes Job-based sandbox executor — native async.
 
-I6-FIX: Alternative to Docker-in-Docker ExecutionEngine for production
-environments with a Kubernetes cluster.  Creates ephemeral K8s Jobs in
-isolated namespaces with NetworkPolicy, ResourceQuota, and auto-cleanup
-via Job TTL.
+C1-FIX: Production-grade K8s executor replacing I6-FIX.  Key changes:
+- ``kubernetes_asyncio`` for native async K8s API calls (no asyncio.to_thread)
+- GCS object store for code delivery (no ConfigMap etcd thrashing)
+- Watch API for pod readiness (no poll loop)
+- InitContainer + emptyDir pattern for code injection
 
-Current Docker sandbox is already hardened (gVisor + seccomp + AppArmor +
-resource limits + isolated network + approved base images).  This K8s
-executor adds true process isolation — sandboxes run on separate nodes
-and never share the API host's Docker daemon.
+Architecture:
+    build_sandbox()   → Create namespace, NetworkPolicy, ResourceQuota, upload code to GCS
+    start_sandbox()   → Create Job with InitContainer (GCS download), watch for pod ready
+    run_api_tests()   → httpx tests against pod ClusterIP
+    cleanup_sandbox() → Delete namespace + GCS blob
 
 Configuration:
     Set ``executor_type=kubernetes`` in settings to enable.
-    Requires ``kubernetes`` Python package and kubeconfig / in-cluster SA.
-
-Architecture:
-    build_sandbox()   → Create namespace, NetworkPolicy, ResourceQuota, ConfigMap
-    start_sandbox()   → Create Job, wait for pod ready
-    run_api_tests()   → Port-forward to pod, reuse httpx testing
-    cleanup_sandbox() → Delete namespace (cascading delete)
+    Requires ``kubernetes_asyncio`` package, kubeconfig / in-cluster SA,
+    and optionally ``gcs_code_bucket`` for large project files.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
+import io
+import tarfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +46,8 @@ class K8sConfig:
     storage_limit: str = "5Gi"
     max_pods: int = 5
     builder_image: str = "nexsidi/sandbox-builder:latest"
+    gcs_bucket: str = ""                 # GCS bucket for project files (empty = ConfigMap fallback)
+    init_image: str = "google/cloud-sdk:slim"  # InitContainer image for GCS download
 
 
 @dataclass(slots=True)
@@ -60,56 +60,169 @@ class K8sSandboxState:
     is_running: bool = False
     is_healthy: bool = False
     base_url: str = ""
+    gcs_blob_path: str = ""  # GCS path for cleanup
 
 
 # ── Executor ───────────────────────────────────────────────────────
 
 
 class KubernetesExecutor:
-    """Kubernetes Job-based sandbox executor.
+    """Kubernetes Job-based sandbox executor (native async).
 
     Lifecycle:
-    1. ``build_sandbox()``:   Create namespace + NetworkPolicy + ResourceQuota + ConfigMap
-    2. ``start_sandbox()``:   Create Job, wait for pod healthy
-    3. ``run_api_tests()``:   Port-forward to pod, run httpx tests
-    4. ``cleanup_sandbox()``: Delete namespace (cascading delete of all resources)
+    1. ``build_sandbox()``:   Create namespace + NetworkPolicy + ResourceQuota + upload code
+    2. ``start_sandbox()``:   Create Job with InitContainer, watch for pod ready
+    3. ``run_api_tests()``:   httpx tests against pod ClusterIP
+    4. ``cleanup_sandbox()``: Delete namespace + GCS blob
     """
 
     def __init__(self, config: K8sConfig | None = None) -> None:
         self._config = config or K8sConfig()
         self._active_sandboxes: dict[str, K8sSandboxState] = {}
         self._k8s_available: bool | None = None
+        self._api_client: Any | None = None
 
-    def _get_k8s(self) -> Any:
-        """Lazy-init Kubernetes client."""
+    async def _get_k8s(self) -> tuple[Any, Any]:
+        """Lazy-init async Kubernetes client.
+
+        Returns (client_module, api_client_instance).
+        """
         try:
-            from kubernetes import client, config as k8s_config
+            from kubernetes_asyncio import client, config as k8s_config
 
-            try:
-                k8s_config.load_incluster_config()
-            except k8s_config.ConfigException:
-                k8s_config.load_kube_config()
-            return client
+            if self._api_client is None:
+                try:
+                    k8s_config.load_incluster_config()
+                except k8s_config.ConfigException:
+                    await k8s_config.load_kube_config()
+                self._api_client = client.ApiClient()
+
+            return client, self._api_client
         except ImportError:
             raise RuntimeError(
-                "kubernetes package not installed. "
-                "Install via: pip install kubernetes>=31.0.0"
+                "kubernetes_asyncio package not installed. "
+                "Install via: pip install kubernetes_asyncio>=31.0.0"
             )
 
-    def check_available(self) -> bool:
-        """Check if Kubernetes is available."""
+    async def close(self) -> None:
+        """Clean up the async API client connection pool."""
+        if self._api_client is not None:
+            try:
+                await self._api_client.close()
+            except Exception:
+                pass
+            self._api_client = None
+
+    async def check_available(self) -> bool:
+        """Check if Kubernetes is available (async)."""
         if self._k8s_available is not None:
             return self._k8s_available
         try:
-            k8s = self._get_k8s()
-            core_v1 = k8s.CoreV1Api()
+            k8s, api_client = await self._get_k8s()
+            core_v1 = k8s.CoreV1Api(api_client)
             # Quick check: list namespaces (will fail if no access)
-            core_v1.list_namespace(limit=1)
+            await core_v1.list_namespace(limit=1)
             self._k8s_available = True
         except Exception as exc:
             logger.warning("k8s_not_available", error=str(exc)[:200])
             self._k8s_available = False
         return self._k8s_available
+
+    # ── Code delivery ──────────────────────────────────────────────
+
+    async def _upload_to_gcs(
+        self, run_id: str, project_files: dict[str, str],
+    ) -> str:
+        """Upload project files as tar.gz to GCS, return gs:// URI.
+
+        Uses google-cloud-storage (already in requirements for secret manager).
+        Runs the sync GCS client in a thread to avoid blocking the event loop
+        (GCS client is sync-only, but it's a single upload — acceptable).
+        """
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for filepath, content in project_files.items():
+                data = content.encode("utf-8")
+                info = tarfile.TarInfo(name=filepath)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        buf.seek(0)
+
+        blob_path = f"sandboxes/{run_id}/project.tar.gz"
+
+        def _do_upload() -> None:
+            from google.cloud import storage
+            client = storage.Client()
+            bucket = client.bucket(self._config.gcs_bucket)
+            blob = bucket.blob(blob_path)
+            blob.upload_from_file(buf, content_type="application/gzip")
+
+        await asyncio.to_thread(_do_upload)
+
+        gcs_uri = f"gs://{self._config.gcs_bucket}/{blob_path}"
+        logger.info("gcs_code_uploaded", uri=gcs_uri, files=len(project_files))
+        return gcs_uri
+
+    async def _cleanup_gcs(self, blob_path: str) -> None:
+        """Delete the GCS blob for a sandbox."""
+        if not blob_path or not self._config.gcs_bucket:
+            return
+
+        def _do_delete() -> None:
+            from google.cloud import storage
+            client = storage.Client()
+            bucket = client.bucket(self._config.gcs_bucket)
+            blob = bucket.blob(blob_path)
+            blob.delete()
+
+        try:
+            await asyncio.to_thread(_do_delete)
+            logger.info("gcs_code_cleaned_up", blob=blob_path)
+        except Exception as exc:
+            logger.warning("gcs_cleanup_failed", blob=blob_path, error=str(exc)[:200])
+
+    async def _create_configmap_fallback(
+        self,
+        core_v1: Any,
+        k8s: Any,
+        namespace: str,
+        project_files: dict[str, str],
+    ) -> None:
+        """Fallback: create ConfigMaps when GCS is not configured (dev mode).
+
+        Chunks files to stay under etcd's 1MB limit per ConfigMap.
+        """
+        chunk: dict[str, str] = {}
+        chunk_size = 0
+        chunk_idx = 0
+
+        for filepath, content in project_files.items():
+            safe_key = filepath.replace("/", "__").replace(".", "_dot_")
+            content_bytes = len(content.encode("utf-8"))
+            if chunk_size + content_bytes > 900_000:
+                cm = k8s.V1ConfigMap(
+                    metadata=k8s.V1ObjectMeta(name=f"project-files-{chunk_idx}"),
+                    data=chunk,
+                )
+                await core_v1.create_namespaced_config_map(
+                    namespace=namespace, body=cm,
+                )
+                chunk = {}
+                chunk_size = 0
+                chunk_idx += 1
+            chunk[safe_key] = content
+            chunk_size += content_bytes
+
+        if chunk:
+            cm = k8s.V1ConfigMap(
+                metadata=k8s.V1ObjectMeta(name=f"project-files-{chunk_idx}"),
+                data=chunk,
+            )
+            await core_v1.create_namespaced_config_map(
+                namespace=namespace, body=cm,
+            )
+
+    # ── Sandbox lifecycle ──────────────────────────────────────────
 
     async def build_sandbox(
         self,
@@ -117,8 +230,8 @@ class KubernetesExecutor:
         project_files: dict[str, str],
         timeout_seconds: int = 300,
     ) -> bool:
-        """Create K8s namespace with NetworkPolicy and ConfigMap."""
-        k8s = self._get_k8s()
+        """Create K8s namespace with NetworkPolicy, upload code to GCS."""
+        k8s, api_client = await self._get_k8s()
 
         # Sanitize run ID for K8s naming (max 63 chars, lowercase alphanumeric + dash)
         safe_id = pipeline_run_id[:8].lower().replace("_", "-")
@@ -130,8 +243,8 @@ class KubernetesExecutor:
         )
 
         try:
-            core_v1 = k8s.CoreV1Api()
-            networking_v1 = k8s.NetworkingV1Api()
+            core_v1 = k8s.CoreV1Api(api_client)
+            networking_v1 = k8s.NetworkingV1Api(api_client)
 
             # 1. Create namespace
             ns = k8s.V1Namespace(
@@ -143,7 +256,7 @@ class KubernetesExecutor:
                     },
                 ),
             )
-            await asyncio.to_thread(core_v1.create_namespace, body=ns)
+            await core_v1.create_namespace(body=ns)
             logger.info("k8s_namespace_created", namespace=namespace)
 
             # 2. Create NetworkPolicy — deny all egress except DNS
@@ -167,17 +280,15 @@ class KubernetesExecutor:
                     ingress=[
                         # Allow intra-namespace only
                         k8s.V1NetworkPolicyIngressRule(
-                            from_=[k8s.V1NetworkPolicyPeer(
+                            _from=[k8s.V1NetworkPolicyPeer(
                                 pod_selector=k8s.V1LabelSelector(),
                             )],
                         ),
                     ],
                 ),
             )
-            await asyncio.to_thread(
-                networking_v1.create_namespaced_network_policy,
-                namespace=namespace,
-                body=net_policy,
+            await networking_v1.create_namespaced_network_policy(
+                namespace=namespace, body=net_policy,
             )
 
             # 3. Create ResourceQuota
@@ -190,33 +301,30 @@ class KubernetesExecutor:
                     "persistentvolumeclaims": "1",
                 }),
             )
-            await asyncio.to_thread(
-                core_v1.create_namespaced_resource_quota,
-                namespace=namespace,
-                body=quota,
+            await core_v1.create_namespaced_resource_quota(
+                namespace=namespace, body=quota,
             )
 
-            # 4. Create ConfigMaps with project files (1MB limit per ConfigMap)
-            chunk: dict[str, str] = {}
-            chunk_size = 0
-            chunk_idx = 0
-            for filepath, content in project_files.items():
-                # K8s ConfigMap keys must be valid: replace / and . with safe chars
-                safe_key = filepath.replace("/", "__").replace(".", "_dot_")
-                content_bytes = len(content.encode("utf-8"))
-                if chunk_size + content_bytes > 900_000:  # Leave margin
-                    await self._create_configmap(
-                        core_v1, k8s, namespace, f"project-files-{chunk_idx}", chunk,
-                    )
-                    chunk = {}
-                    chunk_size = 0
-                    chunk_idx += 1
-                chunk[safe_key] = content
-                chunk_size += content_bytes
-
-            if chunk:
-                await self._create_configmap(
-                    core_v1, k8s, namespace, f"project-files-{chunk_idx}", chunk,
+            # 4. Upload project files — GCS (production) or ConfigMap (dev fallback)
+            if self._config.gcs_bucket:
+                gcs_uri = await self._upload_to_gcs(pipeline_run_id, project_files)
+                blob_path = f"sandboxes/{pipeline_run_id}/project.tar.gz"
+                state.gcs_blob_path = blob_path
+                # Store GCS URI in namespace annotation for start_sandbox()
+                ns_patch = k8s.V1Namespace(
+                    metadata=k8s.V1ObjectMeta(
+                        annotations={"nexsidi.dev/gcs-uri": gcs_uri},
+                    ),
+                )
+                await core_v1.patch_namespace(name=namespace, body=ns_patch)
+            else:
+                await self._create_configmap_fallback(
+                    core_v1, k8s, namespace, project_files,
+                )
+                logger.info(
+                    "k8s_configmap_fallback",
+                    namespace=namespace,
+                    files=len(project_files),
                 )
 
             self._active_sandboxes[pipeline_run_id] = state
@@ -227,38 +335,64 @@ class KubernetesExecutor:
             logger.error("k8s_sandbox_build_failed", error=str(exc)[:500])
             # Best-effort cleanup
             try:
-                await asyncio.to_thread(
-                    k8s.CoreV1Api().delete_namespace, name=namespace,
-                )
+                core_v1_cleanup = k8s.CoreV1Api(api_client)
+                await core_v1_cleanup.delete_namespace(name=namespace)
             except Exception:
                 pass
             return False
 
-    async def _create_configmap(
-        self, core_v1: Any, k8s: Any, namespace: str, name: str, data: dict[str, str],
-    ) -> None:
-        cm = k8s.V1ConfigMap(
-            metadata=k8s.V1ObjectMeta(name=name),
-            data=data,
-        )
-        await asyncio.to_thread(
-            core_v1.create_namespaced_config_map,
-            namespace=namespace,
-            body=cm,
-        )
-
     async def start_sandbox(
         self, pipeline_run_id: str, timeout_seconds: int = 120,
     ) -> bool:
-        """Create K8s Job and wait for it to be ready."""
+        """Create K8s Job with InitContainer and watch for pod ready."""
         state = self._active_sandboxes.get(pipeline_run_id)
         if not state:
             return False
 
-        k8s = self._get_k8s()
-        batch_v1 = k8s.BatchV1Api()
+        k8s, api_client = await self._get_k8s()
+        batch_v1 = k8s.BatchV1Api(api_client)
+        core_v1 = k8s.CoreV1Api(api_client)
 
         try:
+            # Read GCS URI from namespace annotation (if GCS mode)
+            gcs_uri = ""
+            if self._config.gcs_bucket:
+                ns = await core_v1.read_namespace(name=state.namespace)
+                gcs_uri = (ns.metadata.annotations or {}).get(
+                    "nexsidi.dev/gcs-uri", ""
+                )
+
+            # Build pod spec with InitContainer + emptyDir
+            volumes = [
+                k8s.V1Volume(
+                    name="workspace",
+                    empty_dir=k8s.V1EmptyDirVolumeSource(
+                        size_limit=self._config.storage_limit,
+                    ),
+                ),
+            ]
+
+            workspace_mount = k8s.V1VolumeMount(
+                name="workspace", mount_path="/workspace",
+            )
+
+            # InitContainer: download code from GCS into /workspace
+            init_containers = []
+            if gcs_uri:
+                init_containers.append(k8s.V1Container(
+                    name="code-loader",
+                    image=self._config.init_image,
+                    command=["sh", "-c",
+                        f"gsutil cp {gcs_uri} /tmp/project.tar.gz && "
+                        f"tar xzf /tmp/project.tar.gz -C /workspace",
+                    ],
+                    volume_mounts=[workspace_mount],
+                    resources=k8s.V1ResourceRequirements(
+                        requests={"cpu": "100m", "memory": "128Mi"},
+                        limits={"cpu": "500m", "memory": "256Mi"},
+                    ),
+                ))
+
             job = k8s.V1Job(
                 metadata=k8s.V1ObjectMeta(name=state.job_name),
                 spec=k8s.V1JobSpec(
@@ -269,9 +403,11 @@ class KubernetesExecutor:
                             labels={"app": "nexsidi-sandbox", "role": "runner"},
                         ),
                         spec=k8s.V1PodSpec(
+                            init_containers=init_containers or None,
                             containers=[k8s.V1Container(
                                 name="sandbox",
                                 image=self._config.builder_image,
+                                volume_mounts=[workspace_mount],
                                 resources=k8s.V1ResourceRequirements(
                                     limits={
                                         "cpu": self._config.cpu_limit,
@@ -292,6 +428,7 @@ class KubernetesExecutor:
                                     ),
                                 ),
                             )],
+                            volumes=volumes,
                             restart_policy="Never",
                             automount_service_account_token=False,
                         ),
@@ -299,23 +436,25 @@ class KubernetesExecutor:
                 ),
             )
 
-            await asyncio.to_thread(
-                batch_v1.create_namespaced_job,
-                namespace=state.namespace,
-                body=job,
+            await batch_v1.create_namespaced_job(
+                namespace=state.namespace, body=job,
             )
 
-            # Wait for pod to be ready
-            deadline = time.monotonic() + timeout_seconds
-            core_v1 = k8s.CoreV1Api()
-            while time.monotonic() < deadline:
-                pods = await asyncio.to_thread(
+            # Watch for pod ready — replaces poll loop
+            from kubernetes_asyncio import watch
+
+            w = watch.Watch()
+            try:
+                async for event in w.stream(
                     core_v1.list_namespaced_pod,
                     namespace=state.namespace,
                     label_selector="app=nexsidi-sandbox,role=runner",
-                )
-                for pod in pods.items:
-                    if pod.status and pod.status.phase == "Running":
+                    timeout_seconds=timeout_seconds,
+                ):
+                    pod = event["object"]
+                    phase = pod.status.phase if pod.status else None
+
+                    if phase == "Running":
                         state.is_running = True
                         state.is_healthy = True
                         state.base_url = f"http://{pod.status.pod_ip}:8000"
@@ -325,7 +464,18 @@ class KubernetesExecutor:
                             pod_ip=pod.status.pod_ip,
                         )
                         return True
-                await asyncio.sleep(2)
+
+                    if phase in ("Failed", "Unknown"):
+                        logger.error(
+                            "k8s_sandbox_pod_failed",
+                            namespace=state.namespace,
+                            phase=phase,
+                        )
+                        return False
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                w.stop()
 
             logger.error("k8s_sandbox_start_timeout", namespace=state.namespace)
             return False
@@ -393,17 +543,20 @@ class KubernetesExecutor:
         }
 
     async def cleanup_sandbox(self, pipeline_run_id: str) -> None:
-        """Delete the namespace (cascading delete of all resources)."""
+        """Delete the namespace (cascading delete) and GCS blob."""
         state = self._active_sandboxes.pop(pipeline_run_id, None)
         if not state:
             return
 
+        # Clean up GCS blob
+        if state.gcs_blob_path:
+            await self._cleanup_gcs(state.gcs_blob_path)
+
+        # Delete K8s namespace (cascading delete of all resources)
         try:
-            k8s = self._get_k8s()
-            await asyncio.to_thread(
-                k8s.CoreV1Api().delete_namespace,
-                name=state.namespace,
-            )
+            k8s, api_client = await self._get_k8s()
+            core_v1 = k8s.CoreV1Api(api_client)
+            await core_v1.delete_namespace(name=state.namespace)
             logger.info("k8s_sandbox_cleaned_up", namespace=state.namespace)
         except Exception as exc:
             logger.error(

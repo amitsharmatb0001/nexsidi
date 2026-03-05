@@ -40,10 +40,11 @@ from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
 
-# R37-FIX-23: Cap the total accumulated code injected into prompts to prevent
-# quadratic token cost growth.  Each round keeps all prior file contents; without
-# this cap a large project would exhaust the context window.
-_MAX_ACCUMULATED_CHARS = 100_000  # int; ~25K tokens; safe for 200K-token models
+# C3-FIX: Removed _MAX_ACCUMULATED_CHARS (was 100_000).  Instead of injecting
+# full file contents into prompts and truncating at a char budget, we now use a
+# file manifest (path + line count + exports) and let the LLM pull files on
+# demand via read_file / search_codebase.  This eliminates silent truncation
+# and lets the LLM work with arbitrarily large codebases.
 
 FASTAPI_GENERATION_ORDER: list[dict[str, str]] = [
     {"name": "models", "path": "backend/app/models.py", "task_type": "general",
@@ -681,6 +682,35 @@ SHUBHAM_TOOLS: list[ToolDefinition] = [
             "properties": {},
         },
     ),
+    # C3-FIX: Codebase search — lets the LLM find where a model, function, or
+    # import is defined across all generated files before writing code that
+    # depends on it.  Eliminates hallucinated imports.
+    ToolDefinition(
+        name="search_codebase",
+        description=(
+            "Search across all generated files by text pattern or keyword. "
+            "Use this to find where a model, function, or import is defined "
+            "before writing code that depends on it. Returns matching lines "
+            "with file paths and line numbers."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Text or regex pattern to search for "
+                        "(e.g., 'class User', 'def create_', 'from app.models')"
+                    ),
+                },
+                "file_glob": {
+                    "type": "string",
+                    "description": "Optional file pattern filter (e.g., '*.py', 'routers/*')",
+                },
+            },
+            "required": ["pattern"],
+        },
+    ),
     ToolDefinition(
         name="ask_architect",
         description=(
@@ -797,6 +827,9 @@ class ShubhamToolHandler:
             return await self._validate_syntax(**tool_input)
         elif tool_name == "list_files":
             return self._list_files()
+        # C3-FIX: Codebase search across all generated files
+        elif tool_name == "search_codebase":
+            return await self._search_codebase(**tool_input)
         elif tool_name == "ask_architect":
             return await self._ask_architect(**tool_input)
         elif tool_name == "task_complete":
@@ -817,26 +850,111 @@ class ShubhamToolHandler:
         return f"Written {path} ({len(content)} chars)"
 
     async def _read_file(self, path: str) -> str:
+        # C3-FIX: Raised read limit from 10K to 50K so the LLM can inspect
+        # its own large generated files without truncation.
         if path in self._files:
             content = self._files[path]
-            if len(content) > 10000:
-                return content[:10000] + "\n... [truncated, use validate_syntax for full file]"
+            if len(content) > 50_000:
+                return (
+                    content[:50_000]
+                    + f"\n... [truncated at 50K chars, file is {len(content)} chars total]"
+                )
             return content
-        return f"File not found: {path}. Available: {list(self._files.keys())[:10]}"
+        return f"File not found: {path}. Available: {list(self._files.keys())[:20]}"
 
     async def _validate_syntax(self, path: str, content: str | None = None) -> str:
-        import ast
+        """C3-FIX: Validate code with ruff (Python) or basic checks (non-Python).
+
+        Runs ``ruff check`` which catches:
+        - Syntax errors (E999)
+        - Undefined names (F821)
+        - Unused imports (F401)
+        - Import ordering issues (I001)
+        - Common bugs (B series)
+        Falls back to ``ast.parse()`` if ruff is not installed.
+        """
+        import os
+        import subprocess
+        import tempfile
 
         code = content or self._files.get(path, "")
         if not code:
             return f"No content for {path}"
+
         if not path.endswith(".py"):
-            return "OK (non-Python file, skipping AST check)"
+            return self._validate_non_python(path, code)
+
+        # Try ruff first (fast, comprehensive)
         try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8",
+            ) as f:
+                f.write(code)
+                temp_path = f.name
+
+            proc = subprocess.run(
+                [
+                    "ruff", "check",
+                    "--select", "E,F,I,B",
+                    "--no-fix",
+                    "--output-format", "text",
+                    temp_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+            if proc.returncode == 0:
+                return "OK — ruff check passed (syntax + imports + common bugs)"
+
+            # Parse ruff output — show top 10 issues
+            issues = [
+                ln for ln in proc.stdout.strip().split("\n")
+                if ln.strip()
+            ][:10]
+            return (
+                f"Issues found in {path}:\n"
+                + "\n".join(f"  {line}" for line in issues)
+            )
+
+        except FileNotFoundError:
+            # ruff not installed — fall back to ast.parse
+            pass
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+
+        # Fallback: ast.parse (syntax only)
+        try:
+            import ast
+
             ast.parse(code)
-            return "OK"
+            return "OK (ast.parse only — install ruff for comprehensive checking)"
         except SyntaxError as e:
             return f"SyntaxError at line {e.lineno}: {e.msg}"
+
+    def _validate_non_python(self, path: str, code: str) -> str:
+        """Basic validation for non-Python files (bracket balance)."""
+        stack: list[str] = []
+        pairs = {")": "(", "]": "[", "}": "{"}
+        for i, ch in enumerate(code):
+            if ch in "([{":
+                stack.append(ch)
+            elif ch in ")]}":
+                if not stack or stack[-1] != pairs[ch]:
+                    line = code[:i].count("\n") + 1
+                    return f"Unmatched '{ch}' at line {line}"
+                stack.pop()
+        if stack:
+            return f"Unclosed bracket: {stack[-1]}"
+        return "OK (non-Python file, basic validation passed)"
 
     def _list_files(self) -> str:
         if not self._files:
@@ -846,6 +964,43 @@ class ShubhamToolHandler:
             for path, content in self._files.items()
         ]
         return "\n".join(lines)
+
+    # C3-FIX: Codebase search ──────────────────────────────────────
+
+    async def _search_codebase(self, pattern: str, file_glob: str = "") -> str:
+        """Search all generated files for a text pattern.
+
+        Lets the LLM find exactly where a class, function, or import is
+        defined before writing code that depends on it.  Returns matching
+        lines with file paths and line numbers (capped at 50 matches).
+        """
+        import fnmatch
+        import re
+
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            # If the pattern has invalid regex chars, treat as literal
+            regex = re.compile(re.escape(pattern), re.IGNORECASE)
+
+        matches: list[str] = []
+        for path, content in self._files.items():
+            if file_glob and not fnmatch.fnmatch(path, file_glob):
+                continue
+            for line_num, line in enumerate(content.split("\n"), 1):
+                if regex.search(line):
+                    matches.append(f"{path}:{line_num}: {line.strip()[:120]}")
+                    if len(matches) >= 50:
+                        break
+            if len(matches) >= 50:
+                break
+
+        if not matches:
+            return f"No matches for '{pattern}' across {len(self._files)} files."
+        result = f"Found {len(matches)} match(es):\n" + "\n".join(matches)
+        if len(matches) == 50:
+            result += "\n... (capped at 50 matches, narrow your pattern)"
+        return result
 
     async def _ask_architect(self, question: str, context: str = "") -> str:
         # PATH A: Real-time message bus (works when agents run concurrently)
@@ -888,19 +1043,27 @@ class ShubhamToolHandler:
         Raises AgentInterruptRequest which is caught by the pipeline's
         _execute_agent() to pause this agent, re-run the target, and
         then resume this agent with fresh context.
+
+        C2c-FIX: Uses configurable max_interrupts_per_pair from settings
+        instead of hardcoded 2.  Also passes partial_output so work done
+        before the interrupt isn't lost.
         """
+        from app.config import get_settings
+
+        max_interrupts = get_settings().max_interrupts_per_pair
         counter_key = f"__interrupt_count__shubham_{target_agent}__"
         count = self._pipeline_context.get(counter_key, 0)
-        if count >= 2:
+        if count >= max_interrupts:
             return (
-                f"Cannot request {target_agent} re-run: max 2 interrupts "
-                f"per agent pair reached ({count}/2). Proceed with best judgment."
+                f"Cannot request {target_agent} re-run: max {max_interrupts} interrupts "
+                f"per agent pair reached ({count}/{max_interrupts}). Proceed with best judgment."
             )
         raise AgentInterruptRequest(
             requesting_agent="shubham",
             target_agent=target_agent,
             reason=reason,
             required_changes=required_changes,
+            partial_output=dict(self._files),  # Preserve work done so far
         )
 
     # I3-FIX: Import & type validation during generation ─────────────
@@ -950,7 +1113,9 @@ class Shubham:
     def __init__(self) -> None:
         # tools is a module-level constant — expose it as the instance attribute
         # that call_ai_with_tools() reads via agent.tools.
-        pass
+        # _generated_files_ref is set during execute() so _build_agentic_system_prompt
+        # can build the file manifest without receiving the full dict as a parameter.
+        self._generated_files_ref: dict[str, str] = {}
 
     @property
     def tools(self) -> list[ToolDefinition]:
@@ -1062,6 +1227,10 @@ class Shubham:
         from app.services.ai_router import ProjectCostTracker
 
         cost_tracker = get_run_cost_tracker(pipeline_run_id) or ProjectCostTracker(pipeline_run_id=pipeline_run_id)
+
+        # C3-FIX: Store reference to generated_files so _build_file_manifest()
+        # can build compact manifests without passing the full dict through params.
+        self._generated_files_ref = generated_files
 
         system_prompt = self._build_agentic_system_prompt(
             contract=contract,
@@ -1274,6 +1443,52 @@ class Shubham:
             "passed": len(errors) == 0,
         }
 
+    # ── C3-FIX: File manifest (compact representation for prompt) ────
+
+    def _build_file_manifest(self, files: dict[str, str]) -> str:
+        """Build a compact manifest of generated files for the LLM prompt.
+
+        Instead of injecting full file contents (which caused truncation at
+        100K chars), shows path, line count, and key exports.  The LLM uses
+        read_file / search_codebase to load files on demand.
+        """
+        lines = ["## Files Already Generated (use read_file to inspect)"]
+        for path, content in files.items():
+            if not content:
+                lines.append(f"- `{path}` (template)")
+                continue
+            line_count = content.count("\n") + 1
+            exports = self._extract_exports(path, content)
+            export_str = f" — exports: {', '.join(exports[:8])}" if exports else ""
+            lines.append(f"- `{path}` ({line_count} lines){export_str}")
+        lines.append("")
+        lines.append(
+            "Use read_file to inspect any file before writing code that depends on it. "
+            "Use search_codebase to find specific classes, functions, or imports."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_exports(path: str, content: str) -> list[str]:
+        """Extract top-level class/function/constant names from code."""
+        if not path.endswith(".py"):
+            return []
+        try:
+            import ast
+
+            tree = ast.parse(content)
+            names: list[str] = []
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.append(node.name)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id.isupper():
+                            names.append(target.id)
+            return names
+        except SyntaxError:
+            return []
+
     def _build_agentic_system_prompt(
         self,
         contract: dict[str, Any],
@@ -1402,35 +1617,35 @@ class Shubham:
                 "",
             ])
 
-        # ── 8. Tool Usage Rules ──
+        # ── 8. Tool Usage Rules (C3-FIX: updated for search_codebase + ruff) ──
         prompt_parts.extend([
             "## Tool Usage Rules",
             "1. Write models/entities FIRST before anything that depends on them.",
-            "2. After writing a Python file, call validate_syntax to check for errors.",
-            "3. Before writing a file that imports from another, use read_file to verify imports.",
-            "4. Use ask_architect if the contract is ambiguous or contradictory.",
-            "5. Use list_files to check what you have written so far.",
-            "6. Call task_complete ONLY when ALL required files are written and validated.",
-            "7. Each file must be COMPLETE — no truncation, no placeholder comments.",
-            "8. Every function must be fully implemented with real business logic.",
-            f"9. Error comments use `{fw_config.error_comment_prefix}`.",
-            "10. Match table/column names EXACTLY from the contract.",
+            "2. After writing a Python file, call validate_syntax to check for errors, imports, and bugs.",
+            "3. Before writing a file that depends on another, use search_codebase to find exact class/function names.",
+            "4. Use read_file to inspect any previously generated file — don't guess at its content.",
+            "5. Use ask_architect if the contract is ambiguous or contradictory.",
+            "6. Use list_files to check what you have written so far.",
+            "7. Call task_complete ONLY when ALL required files are written and validated.",
+            "8. Each file must be COMPLETE — no truncation, no placeholder comments.",
+            "9. Every function must be fully implemented with real business logic.",
+            f"10. Error comments use `{fw_config.error_comment_prefix}`.",
+            "11. Match table/column names EXACTLY from the contract.",
             "",
         ])
 
-        # ── 9. Template Files Already Available ──
+        # ── 9. File Manifest (C3-FIX: compact manifest instead of full code) ──
+        # Instead of injecting full file contents (which caused truncation at
+        # 100K chars), show a compact manifest with path, line count, and
+        # key exports.  The LLM uses read_file / search_codebase on demand.
         if template_file_paths:
             prompt_parts.append(
-                "## Template Files Already Generated (available via read_file)"
+                self._build_file_manifest(
+                    {p: self._generated_files_ref.get(p, "") for p in template_file_paths}
+                    if hasattr(self, "_generated_files_ref")
+                    else {p: "" for p in template_file_paths}
+                )
             )
-            for path in template_file_paths:
-                prompt_parts.append(f"- {path}")
-            prompt_parts.append(
-                "These include Dockerfile, docker-compose, requirements.txt, "
-                "database.py, config.py, main.py. Use read_file to inspect them "
-                "and ensure your generated code imports from them correctly."
-            )
-            prompt_parts.append("")
 
         # ── 10. Completeness Rules ──
         prompt_parts.extend([
@@ -1467,31 +1682,18 @@ class Shubham:
         The new agentic system sends ONE system prompt for ALL files; this shim
         wraps _build_agentic_system_prompt() so existing test assertions still pass.
 
-        R37-FIX-23: Apply _MAX_ACCUMULATED_CHARS budget — only the most recent
-        files within the budget are injected, preventing OOM on large projects.
+        C3-FIX: Removed _MAX_ACCUMULATED_CHARS budget-cap.  Instead of injecting
+        full file contents and truncating, we pass file paths as a manifest.
+        The LLM uses read_file / search_codebase to load files on demand.
         """
-        # Build a generation order from the single step (test compat)
         generation_order = [step]
 
-        # Budget-cap accumulated_code before injecting it (R37-FIX-23)
-        budget = _MAX_ACCUMULATED_CHARS
-        capped: dict[str, str] = {}
-        for path, code in reversed(list(accumulated_code.items())):
-            if budget <= 0:
-                break
-            snippet = code[:budget]
-            capped[path] = snippet
-            budget -= len(snippet)
-        if len(capped) < len(accumulated_code):
-            logger.debug(
-                "accumulated_code_budget_exceeded",
-                total_files=len(accumulated_code),
-                included_files=len(capped),
-                omitted=len(accumulated_code) - len(capped),
-            )
+        # C3-FIX: Store accumulated code reference for manifest building
+        self._generated_files_ref = accumulated_code
 
-        # Template files list derived from capped accumulated code
-        template_file_paths = list(capped.keys())
+        # Pass all file paths — the prompt now uses a manifest (path + line count
+        # + exports) instead of injecting full contents.
+        template_file_paths = list(accumulated_code.keys())
 
         return self._build_agentic_system_prompt(
             contract=contract,

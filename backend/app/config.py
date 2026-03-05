@@ -181,6 +181,15 @@ class Settings(BaseSettings):
     # "kubernetes" uses ephemeral K8s Jobs for sandbox isolation.
     executor_type: str = "docker"
 
+    # C1-FIX: InitContainer image for K8s executor GCS code download.
+    gcs_init_image: str = "google/cloud-sdk:slim"
+
+    # C2c-FIX: Max interrupts per agent pair per pipeline run.
+    # Agents can request another agent to re-run (e.g., Shubham asks Vikram
+    # to update the contract).  This caps the number of interrupts per
+    # (requester, target) pair to prevent infinite re-run loops.
+    max_interrupts_per_pair: int = Field(default=3, ge=1, le=10)
+
     # --- Object Storage (generated code) ---
     # REVIEW-FIX: Large generated codebases should be stored durably (not in Valkey).
     # When gcs_code_bucket is set, content >64KB is offloaded to GCS.

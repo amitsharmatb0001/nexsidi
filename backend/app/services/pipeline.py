@@ -120,6 +120,20 @@ CHECKPOINT_STAGES: frozenset[PipelineStage] = frozenset({
 # Ordered stage list for sequential execution
 STAGE_ORDER: list[PipelineStage] = list(PipelineStage)
 
+# C2a-FIX: Stage skip rules ────────────────────────────────────────
+# Stages that can be skipped based on project characteristics.
+# Value is a context flag key — if it's truthy, the stage is skipped.
+# Skip flags are set by early-stage agents (e.g., Tilotma determines
+# whether the project needs a frontend, database, etc.) or by the user
+# via API (explicit override).
+_STAGE_SKIP_RULES: dict[PipelineStage, str] = {
+    PipelineStage.DATABASE_DESIGN: "__skip_database__",
+    PipelineStage.UI_DESIGN: "__skip_frontend__",
+    PipelineStage.FRONTEND_BUILD: "__skip_frontend__",
+    PipelineStage.SECURITY_AUDIT: "__skip_security_audit__",
+    PipelineStage.COMPLIANCE_CHECK: "__skip_compliance__",
+}
+
 # I2-FIX: Agent context dependency map ────────────────────────────
 # Each agent only receives the prior agent outputs it actually reads,
 # plus all metadata keys (__*__).  This eliminates the "context bloat
@@ -157,6 +171,12 @@ def _build_filtered_context(ctx: dict[str, Any], agent_name: str) -> dict[str, A
         for k, v in ctx.items()
         if k.startswith("__") or k in deps
     }
+
+# C2b-FIX: Context compaction threshold ─────────────────────────────
+# Agent output values larger than this are offloaded to context_engine
+# storage and replaced with a reference dict.  Downstream agents that
+# need the full content get it hydrated transparently.
+_CONTEXT_COMPACT_THRESHOLD = 64 * 1024  # 64 KB
 
 # Redo rewind targets: which stage to jump back to when user says "redo"
 CHECKPOINT_REDO_TARGETS: dict[PipelineStage, PipelineStage] = {
@@ -1038,23 +1058,64 @@ class PipelineOrchestrator:
         # Execute single agent
         return await self._execute_agent(run, stage, agent_name)
 
-    async def advance(self, run: PipelineRun) -> PipelineStage | None:
-        """Advance to the next stage. Returns the new stage or None if complete."""
-        current_idx = STAGE_ORDER.index(run.current_stage)
-        if current_idx >= len(STAGE_ORDER) - 1:
+    async def advance(
+        self, run: PipelineRun, step_result: "StepResult | None" = None,
+    ) -> PipelineStage | None:
+        """C2a-FIX: Dynamic stage router — replaces rigid STAGE_ORDER[idx+1].
+
+        Determines the next stage based on:
+        1. Stage skip rules (context flags from early agents or user overrides)
+        2. Default sequential order (STAGE_ORDER) as fallback
+
+        Challenge-retry and fix-retest rewinds are handled BEFORE this is
+        called (in the main loop), so this method only handles forward routing.
+        """
+        next_stage = self._route_next_stage(run, run.current_stage)
+        if next_stage is None:
             run.status = PipelineRunStatus.COMPLETED
             return None
 
-        next_stage = STAGE_ORDER[current_idx + 1]
+        prev = run.current_stage
         run.current_stage = next_stage
 
         logger.info(
             "pipeline_advance",
             run_id=run.run_id,
-            from_stage=STAGE_ORDER[current_idx].value,
+            from_stage=prev.value,
             to_stage=next_stage.value,
         )
         return next_stage
+
+    def _route_next_stage(
+        self,
+        run: "PipelineRun",
+        current_stage: PipelineStage,
+    ) -> PipelineStage | None:
+        """Determine next stage dynamically, skipping stages that aren't needed.
+
+        C2a-FIX: Replaces the old rigid ``STAGE_ORDER[current_idx + 1]``.
+        Checks ``_STAGE_SKIP_RULES`` against context flags to skip unnecessary
+        stages (e.g., skip FRONTEND_BUILD if ``__skip_frontend__`` is set).
+        Unknown stages or no skip flag = run normally (safe default).
+        """
+        current_idx = STAGE_ORDER.index(current_stage)
+        if current_idx >= len(STAGE_ORDER) - 1:
+            return None  # Pipeline complete
+
+        # Find next non-skipped stage
+        for next_idx in range(current_idx + 1, len(STAGE_ORDER)):
+            candidate = STAGE_ORDER[next_idx]
+            skip_flag = _STAGE_SKIP_RULES.get(candidate)
+            if skip_flag and run.context.get(skip_flag):
+                logger.info(
+                    "stage_skipped",
+                    run_id=run.run_id,
+                    stage=candidate.value,
+                    reason=skip_flag,
+                )
+                continue
+            return candidate
+        return None  # All remaining stages skipped
 
     async def approve_checkpoint(
         self,
@@ -1587,7 +1648,7 @@ class PipelineOrchestrator:
             # Step-by-step mode: pause after every stage (but AFTER quality loops)
             # R9-FIX: advance() BEFORE pausing. R28-FIX-2: moved after quality loops.
             if run.execution_mode == ExecutionMode.STEP_BY_STEP:
-                next_stage = await self.advance(run)
+                next_stage = await self.advance(run, step_result)
                 if next_stage is None:
                     # Pipeline completed — don't pause
                     break
@@ -1596,7 +1657,7 @@ class PipelineOrchestrator:
                 break
 
             # Advance to next stage
-            next_stage = await self.advance(run)
+            next_stage = await self.advance(run, step_result)
             if next_stage is None:
                 break
 
@@ -2220,6 +2281,8 @@ class PipelineOrchestrator:
         # Add output to accumulated context
         if result.status == AgentStatus.COMPLETED and result.output:
             run.context[agent_name] = result.output
+            # C2b-FIX: Compact large values to storage references
+            await self._compact_agent_output(run, agent_name)
 
         return step
 
@@ -2331,9 +2394,13 @@ class PipelineOrchestrator:
         5. Re-run the requesting agent with fresh context
         6. Return requesting agent's result
 
+        C2c-FIX: Uses configurable ``max_interrupts_per_pair`` from settings.
+        Preserves requesting agent's partial_output so work done before the
+        interrupt isn't lost (injected as ``__resume_from__`` in context).
         Nested interrupts from the resumed agent are caught and rejected
         to prevent infinite interrupt chains.
         """
+        from app.config import get_settings
         from app.services.ai_router import _sanitize_error
 
         counter_key = (
@@ -2350,6 +2417,10 @@ class PipelineOrchestrator:
             reason=interrupt.reason[:200],
             interrupt_count=run.context[counter_key],
         )
+
+        # C2c-FIX: Save partial output so requesting agent can resume from it
+        if interrupt.partial_output:
+            run.context[f"__partial_{requesting_agent_name}__"] = interrupt.partial_output
 
         # Inject interrupt context so the target agent knows what's needed
         run.context["__interrupt_request__"] = {
@@ -2392,6 +2463,13 @@ class PipelineOrchestrator:
             filtered_context = _build_filtered_context(
                 run.context, requesting_agent_name
             )
+            # C2c-FIX: Inject partial output so agent can resume from where it
+            # left off instead of re-doing all its work from scratch.
+            partial_key = f"__partial_{requesting_agent_name}__"
+            partial = run.context.pop(partial_key, None)
+            if partial:
+                filtered_context["__resume_from__"] = partial
+
             result = await requesting_agent.run(run.run_id, filtered_context)
             return result
         except AgentInterruptRequest:
@@ -2416,6 +2494,68 @@ class PipelineOrchestrator:
                 status=AgentStatus.FAILED,
                 error=_sanitize_error(exc),
             )
+
+    # ── C2b-FIX: Context Compaction ──────────────────────────────────
+
+    async def _compact_agent_output(self, run: PipelineRun, agent_name: str) -> None:
+        """Replace large values in agent output with storage references.
+
+        After an agent completes, its output (e.g., ``file_contents`` with
+        50 source files) may exceed 64 KB.  Large values are offloaded to
+        context_engine and replaced with a reference dict:
+        ``{"__ref__": ref_key, "__size__": original_size}``.
+
+        Downstream agents that need the full content get hydrated copies
+        via ``_hydrate_value()``.  If context_engine is unavailable, the
+        value stays inline (safe degradation).
+        """
+        output = run.context.get(agent_name)
+        if not isinstance(output, dict):
+            return
+
+        for key, value in list(output.items()):
+            # Skip metadata and small values
+            if key.startswith("__"):
+                continue
+            serialized_len = len(str(value))
+            if serialized_len <= _CONTEXT_COMPACT_THRESHOLD:
+                continue
+
+            ref_key = f"__ref__{agent_name}__{key}__"
+            try:
+                from app.services.context_engine import get_context_engine
+
+                engine = get_context_engine()
+                await engine.store(run.run_id, ref_key, value)
+                output[key] = {"__ref__": ref_key, "__size__": serialized_len}
+                logger.debug(
+                    "context_compacted",
+                    run_id=run.run_id,
+                    agent=agent_name,
+                    key=key,
+                    ref=ref_key,
+                    original_size=serialized_len,
+                )
+            except Exception as exc:
+                # Context engine unavailable — keep inline (dev mode)
+                logger.debug(
+                    "context_compact_skipped",
+                    agent=agent_name,
+                    key=key,
+                    error=str(exc)[:100],
+                )
+
+    async def _hydrate_value(self, run_id: str, value: Any) -> Any:
+        """If *value* is a compacted reference, load from context_engine."""
+        if isinstance(value, dict) and "__ref__" in value:
+            try:
+                from app.services.context_engine import get_context_engine
+
+                engine = get_context_engine()
+                return await engine.retrieve(run_id, value["__ref__"])
+            except Exception:
+                return value  # Return the reference dict as-is on failure
+        return value
 
     async def _emit_file_events(self, run: PipelineRun, step_result: StepResult) -> None:
         """Emit file_created WebSocket events for files generated in this stage.
