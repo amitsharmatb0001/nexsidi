@@ -212,6 +212,88 @@ def _sanitize_message(message: str) -> str:
     return sanitized
 
 
+# ── D3-FIX: Search/Replace Helpers ─────────────────────────────────
+
+
+def _fuzzy_line_match(content: str, search: str) -> tuple[int, int] | None:
+    """Find search text in content using line-by-line rstrip() comparison.
+
+    Returns (start_pos, end_pos) in the original content, or None.
+    """
+    content_lines = content.split("\n")
+    search_lines = [line.rstrip() for line in search.split("\n")]
+
+    # Remove leading/trailing empty search lines
+    while search_lines and not search_lines[0].strip():
+        search_lines.pop(0)
+    while search_lines and not search_lines[-1].strip():
+        search_lines.pop()
+
+    if not search_lines:
+        return None
+
+    for i in range(len(content_lines) - len(search_lines) + 1):
+        matches = True
+        for j, search_line in enumerate(search_lines):
+            if content_lines[i + j].rstrip() != search_line:
+                matches = False
+                break
+        if matches:
+            # Calculate byte positions in original content
+            start = sum(len(line) + 1 for line in content_lines[:i])
+            end = sum(len(line) + 1 for line in content_lines[:i + len(search_lines)])
+            # Don't include trailing newline of last matched line
+            if end > 0 and end <= len(content) + 1:
+                end -= 1
+            return (start, min(end, len(content)))
+    return None
+
+
+def _normalized_find(content: str, search: str) -> tuple[int, int] | None:
+    """Find search text using whitespace-normalized comparison.
+
+    Collapses all whitespace runs to single spaces in both content and search,
+    finds the match position, then maps back to original content positions.
+
+    Returns (start_pos, end_pos) in the original content, or None.
+    """
+    import re as _re
+
+    norm_search = _re.sub(r"\s+", " ", search).strip()
+    if not norm_search:
+        return None
+
+    norm_content = _re.sub(r"\s+", " ", content).strip()
+    norm_idx = norm_content.find(norm_search)
+    if norm_idx == -1:
+        return None
+
+    # Map normalized positions back to original content
+    # Walk through original content counting non-whitespace-collapsed chars
+    orig_start = _map_norm_pos(content, norm_idx)
+    orig_end = _map_norm_pos(content, norm_idx + len(norm_search))
+    return (orig_start, orig_end)
+
+
+def _map_norm_pos(original: str, norm_pos: int) -> int:
+    """Map a position in whitespace-normalized text back to the original."""
+    import re as _re
+
+    norm_idx = 0
+    in_ws = False
+    for i, ch in enumerate(original):
+        if norm_idx >= norm_pos:
+            return i
+        if ch in " \t\n\r":
+            if not in_ws:
+                norm_idx += 1  # Collapsed whitespace run = 1 space
+                in_ws = True
+        else:
+            norm_idx += 1
+            in_ws = False
+    return len(original)
+
+
 # ── Fixer Tool Handler ─────────────────────────────────────────────
 
 
@@ -237,11 +319,13 @@ class FixerToolHandler:
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "read_file":
-            return self._read_file(tool_input["path"])
+            return await self._read_file(tool_input["path"])
         elif tool_name == "write_file":
             return self._write_file(tool_input["path"], tool_input["content"])
         elif tool_name == "apply_diff":
-            return self._apply_diff(tool_input["path"], tool_input["diff"])
+            return await self._apply_diff(tool_input["path"], tool_input["diff"])
+        elif tool_name == "search_replace":
+            return await self._search_replace(tool_input["path"], tool_input["operations"])
         elif tool_name == "validate_syntax":
             return self._validate_syntax(tool_input["path"], tool_input.get("content"))
         elif tool_name == "read_error_report":
@@ -253,7 +337,7 @@ class FixerToolHandler:
                 tool_input.get("validation_passed", False),
             )
         elif tool_name == "check_imports":
-            return self._check_imports(tool_input["path"])
+            return await self._check_imports(tool_input["path"])
         elif tool_name == "search_solution":
             return await self._search_solution(
                 tool_input["error_message"],
@@ -262,23 +346,39 @@ class FixerToolHandler:
         else:
             return f"Unknown tool: {tool_name}"
 
-    def _read_file(self, path: str) -> str:
+    async def _read_file(self, path: str) -> str:
         # Check written_files first (latest version)
         if path in self._written_files:
             content = self._written_files[path]
-            if len(content) > 10000:
-                return content[:10000] + "\n...[truncated]"
+            if len(content) > 50000:
+                return content[:50000] + f"\n...[truncated at 50K, file is {len(content)} chars]"
             return content
-        # Fall back to context (original generated content)
+
+        # D2-FIX: Try VFS first for offloaded files
+        if self._pipeline_run_id:
+            try:
+                from app.services.vfs import get_vfs
+
+                vfs = get_vfs()
+                content = await vfs.read_file(self._pipeline_run_id, path)
+                if content is not None:
+                    if len(content) > 50000:
+                        return content[:50000] + f"\n...[truncated at 50K, file is {len(content)} chars]"
+                    return content
+            except Exception:
+                pass  # VFS unavailable — fall through to inline context
+
+        # Fall back to inline context (original generated content)
         for agent in ("shubham", "aanya"):
             agent_out = self._context.get(agent, {})
             if isinstance(agent_out, dict):
                 fc = agent_out.get("file_contents", {})
-                if path in fc:
-                    content = fc[path]
-                    if len(content) > 10000:
-                        return content[:10000] + "\n...[truncated]"
-                    return content
+                if isinstance(fc, dict) and not fc.get("__vfs__"):
+                    if path in fc:
+                        content = fc[path]
+                        if len(content) > 50000:
+                            return content[:50000] + f"\n...[truncated at 50K, file is {len(content)} chars]"
+                        return content
         return f"File not found: {path}"
 
     def _write_file(self, path: str, content: str) -> str:
@@ -287,7 +387,7 @@ class FixerToolHandler:
         self._written_files[path] = content
         return f"Written {path} ({len(content)} chars)"
 
-    def _apply_diff(self, path: str, diff_text: str) -> str:
+    async def _apply_diff(self, path: str, diff_text: str) -> str:
         """Apply a unified diff to an existing file.
 
         REVIEW-FIX: Fixer now supports targeted patches instead of full file
@@ -303,7 +403,7 @@ class FixerToolHandler:
              context line
         """
         # Get current file content
-        current = self._read_file(path)
+        current = await self._read_file(path)
         if current.startswith("File not found"):
             return f"Cannot apply diff: {current}"
 
@@ -443,6 +543,81 @@ class FixerToolHandler:
 
         return None
 
+    # ── D3-FIX: Search/Replace ────────────────────────────────────────
+
+    async def _search_replace(self, path: str, operations: list[dict]) -> str:
+        """Apply search/replace operations to a file.
+
+        D3-FIX: More reliable than unified diffs for LLM-generated patches.
+        Each operation has:
+            search: exact text to find (multi-line)
+            replace: text to replace it with (multi-line)
+
+        Three-tier matching:
+        1. Exact string match
+        2. Whitespace-normalized fuzzy match
+        3. Line-by-line rstrip() match
+
+        Operations are applied sequentially.  If a search string is not found,
+        the operation is skipped with a warning.
+        """
+        current = await self._read_file(path)
+        if current.startswith("File not found"):
+            return f"Cannot apply search/replace: {current}"
+
+        applied = 0
+        errors: list[str] = []
+        content = current
+
+        for i, op in enumerate(operations):
+            search = op.get("search", "")
+            replace = op.get("replace", "")
+
+            if not search:
+                errors.append(f"Op {i + 1}: empty search string")
+                continue
+
+            # Tier 1: Exact string match
+            if search in content:
+                content = content.replace(search, replace, 1)
+                applied += 1
+                continue
+
+            # Tier 2: Line-by-line fuzzy match (rstrip comparison)
+            match_result = _fuzzy_line_match(content, search)
+            if match_result is not None:
+                start_pos, end_pos = match_result
+                content = content[:start_pos] + replace + content[end_pos:]
+                applied += 1
+                continue
+
+            # Tier 3: Whitespace-normalized match
+            norm_idx = _normalized_find(content, search)
+            if norm_idx is not None:
+                start_pos, end_pos = norm_idx
+                content = content[:start_pos] + replace + content[end_pos:]
+                applied += 1
+                continue
+
+            # No match found
+            preview = search[:60].replace("\n", "\\n")
+            errors.append(f"Op {i + 1}: search text not found: {preview!r}")
+
+        if applied == 0:
+            return (
+                f"Error: all {len(operations)} operations failed. "
+                f"Errors: {'; '.join(errors)}. "
+                f"Use write_file with complete content instead."
+            )
+
+        self._written_files[path] = content
+        self._used_diff = True
+
+        msg = f"Applied {applied}/{len(operations)} search/replace operations to {path}"
+        if errors:
+            msg += f". Warnings: {'; '.join(errors)}"
+        return msg
+
     def _validate_syntax(self, path: str, content: str | None = None) -> str:
         code = content or self._written_files.get(path, "")
         if not code:
@@ -467,7 +642,7 @@ class FixerToolHandler:
         self._complete = True
         return f"Fix reported as complete: {fix_description}"
 
-    def _check_imports(self, path: str) -> str:
+    async def _check_imports(self, path: str) -> str:
         """Verify all imports in a Python file resolve to known modules.
 
         I3-FIX: Delegates to shared code_validator for consistency across
@@ -475,7 +650,7 @@ class FixerToolHandler:
         """
         code = self._written_files.get(path, "")
         if not code:
-            code = self._read_file(path)
+            code = await self._read_file(path)
             if code.startswith("File not found"):
                 return code
 
@@ -569,9 +744,9 @@ class Fixer:
             name="apply_diff",
             description=(
                 "Apply a targeted unified diff patch to fix specific lines. "
-                "PREFERRED over write_file for small fixes — saves tokens and "
-                "avoids accidentally changing unrelated code. Use standard "
-                "unified diff format with @@ hunk headers."
+                "Use standard unified diff format with @@ hunk headers. "
+                "NOTE: Prefer search_replace over apply_diff — it's more "
+                "reliable because it uses content matching instead of line numbers."
             ),
             parameters={
                 "type": "object",
@@ -595,6 +770,53 @@ class Fixer:
                     },
                 },
                 "required": ["path", "diff"],
+            },
+        ))
+
+        # D3-FIX: Search/Replace tool — more reliable than unified diffs
+        self.register_tool(ToolDefinition(
+            name="search_replace",
+            description=(
+                "Apply search/replace operations to fix specific code sections. "
+                "PREFERRED over apply_diff — more reliable because it uses content "
+                "matching instead of line numbers. Each operation finds exact text "
+                "and replaces it. Include 2-3 context lines in the search string "
+                "for unique matching. Use for targeted fixes; use write_file for "
+                "complete rewrites (>50%% of file changed)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path to modify.",
+                    },
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "search": {
+                                    "type": "string",
+                                    "description": (
+                                        "Exact text to find (multi-line OK). "
+                                        "Include enough surrounding context "
+                                        "lines for unique matching."
+                                    ),
+                                },
+                                "replace": {
+                                    "type": "string",
+                                    "description": "Replacement text.",
+                                },
+                            },
+                            "required": ["search", "replace"],
+                        },
+                        "description": (
+                            "List of search/replace operations applied sequentially."
+                        ),
+                    },
+                },
+                "required": ["path", "operations"],
             },
         ))
 
@@ -901,17 +1123,26 @@ class Fixer:
             "6. For Python files: call validate_syntax to confirm fix is valid",
             "7. Call report_complete with a brief description and validation result",
             "",
-            "Tools available:",
+            "Tools available (in priority order):",
             "- read_error_report: get structured error details",
             "- read_file: read current file content",
-            "- apply_diff: apply a targeted unified diff patch (PREFERRED — saves tokens, safer)",
-            "- write_file: write complete file (only for new files or massive rewrites)",
+            "- search_replace: apply search/replace operations (PREFERRED for targeted fixes)",
+            "- apply_diff: apply a unified diff patch (fallback if search_replace doesn't fit)",
+            "- write_file: write complete file (LAST RESORT — only for new files or >50% changes)",
             "- validate_syntax: check Python syntax after fixing",
             "- check_imports: verify all Python imports resolve correctly",
             "- search_solution: search web for error solutions (use for unfamiliar errors)",
             "- report_complete: signal the fix is done",
             "",
-            "IMPORTANT — Use apply_diff for targeted fixes:",
+            "PREFERRED — Use search_replace for targeted fixes:",
+            "Provide the exact text to find and its replacement.",
+            "Include 2-3 surrounding context lines for unique matching.",
+            "Example: search_replace(path='app/models.py', operations=[",
+            '  {"search": "class User(Base):\\n    email = Column(String)",',
+            '   "replace": "class User(Base):\\n    email = Column(String, unique=True)"}',
+            "])",
+            "",
+            "FALLBACK — Use apply_diff when unified diff format is clearer:",
             "```",
             "--- a/app/models.py",
             "+++ b/app/models.py",
@@ -922,7 +1153,7 @@ class Fixer:
             "+    email_verified = Column(Boolean, default=False)",
             "     name = Column(String(100))",
             "```",
-            "apply_diff applies ONLY the changed lines, preserving everything else.",
+            "",
             "write_file replaces the ENTIRE file — use only when necessary.",
             "",
             "Rules:",

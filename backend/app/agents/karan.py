@@ -499,11 +499,12 @@ class KaranToolHandler:
                 except ValueError:
                     sev = FindingSeverity.MEDIUM
 
+                # D4-FIX: Improved category mapping based on CWE + tool context
+                category = _map_scan_category(tool_name, sf)
+
                 self._report.add(SecurityFinding(
                     severity=sev,
-                    category=FindingCategory.DEPENDENCY_VULNERABILITY
-                    if tool_name in ("safety", "npm_audit")
-                    else FindingCategory.MISCONFIGURATION,
+                    category=category,
                     file_path=sf.get("file", "(sandbox)"),
                     line=sf.get("line"),
                     title=sf.get("title", f"{tool_name} finding"),
@@ -521,6 +522,57 @@ class KaranToolHandler:
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
             return f"Scanner '{tool_name}' failed: {_sanitize_error(exc)}"
+
+
+# D4-FIX: CWE-to-category mapping for security scan findings
+_CWE_TO_CATEGORY: dict[str, "FindingCategory"] = {}
+
+
+def _map_scan_category(tool_name: str, finding: dict[str, Any]) -> "FindingCategory":
+    """Map scan tool findings to FindingCategory.
+
+    D4-FIX: Uses CWE IDs for precise classification, with fallbacks
+    based on tool name and finding text patterns.
+    """
+    # Lazy-init the CWE map (avoid import-order issues)
+    if not _CWE_TO_CATEGORY:
+        _CWE_TO_CATEGORY.update({
+            "CWE-89": FindingCategory.SQL_INJECTION,
+            "CWE-79": FindingCategory.XSS,
+            "CWE-352": FindingCategory.CSRF,
+            "CWE-78": FindingCategory.COMMAND_INJECTION,
+            "CWE-22": FindingCategory.PATH_TRAVERSAL,
+            "CWE-918": FindingCategory.SSRF,
+            "CWE-502": FindingCategory.INSECURE_DESERIALIZATION,
+            "CWE-798": FindingCategory.HARDCODED_SECRET,
+            "CWE-327": FindingCategory.WEAK_CRYPTO,
+            "CWE-311": FindingCategory.WEAK_CRYPTO,
+            "CWE-326": FindingCategory.WEAK_CRYPTO,
+        })
+
+    # Dependency vulnerability tools
+    if tool_name in ("safety", "npm_audit"):
+        return FindingCategory.DEPENDENCY_VULNERABILITY
+
+    # Try CWE-based mapping
+    cwe = finding.get("cwe_id", "")
+    if cwe and cwe in _CWE_TO_CATEGORY:
+        return _CWE_TO_CATEGORY[cwe]
+
+    # Keyword-based fallback from title/description
+    text = (finding.get("title", "") + " " + finding.get("description", "")).lower()
+    if "sql" in text and "inject" in text:
+        return FindingCategory.SQL_INJECTION
+    if "xss" in text or "cross-site script" in text:
+        return FindingCategory.XSS
+    if "command inject" in text or "os.system" in text:
+        return FindingCategory.COMMAND_INJECTION
+    if "hardcoded" in text and ("secret" in text or "password" in text or "key" in text):
+        return FindingCategory.HARDCODED_SECRET
+    if "path traversal" in text or "directory traversal" in text:
+        return FindingCategory.PATH_TRAVERSAL
+
+    return FindingCategory.MISCONFIGURATION
 
 
 # ── Karan Agent ────────────────────────────────────────────────────
@@ -604,7 +656,8 @@ class Karan:
             description=(
                 "Run a real security scanning tool against the Docker sandbox. "
                 "Available tools: 'bandit' (Python static security), "
-                "'safety' (dependency vulnerabilities), 'npm_audit' (JS dependency vulns). "
+                "'safety' (dependency vulnerabilities), 'npm_audit' (JS dependency vulns), "
+                "'semgrep' (multi-language static analysis with OWASP/CWE rules). "
                 "Returns structured JSON results from actual scanning tools."
             ),
             parameters={
@@ -612,7 +665,7 @@ class Karan:
                 "properties": {
                     "tool": {
                         "type": "string",
-                        "enum": ["bandit", "safety", "npm_audit"],
+                        "enum": ["bandit", "safety", "npm_audit", "semgrep"],
                         "description": "The security scanning tool to run.",
                     },
                 },
@@ -649,7 +702,7 @@ class Karan:
         Phase 3: DPDP/OWASP compliance check.
         """
         # Gather all generated files from Shubham + Aanya outputs
-        all_files = self._collect_generated_files(context)
+        all_files = await self._collect_generated_files(context)
 
         if not all_files:
             return AgentResult(
@@ -720,23 +773,46 @@ class Karan:
 
     # ── Static Scanners ────────────────────────────────────────────
 
-    def _collect_generated_files(self, context: dict[str, Any]) -> dict[str, str]:
-        """Collect all generated file contents from pipeline context."""
+    async def _collect_generated_files(self, context: dict[str, Any]) -> dict[str, str]:
+        """Collect all generated file contents from pipeline context.
+
+        D2-FIX: Handles VFS-offloaded file_contents.  When file_contents is a
+        VFS manifest (``{"__vfs__": True, "__manifest__": ...}``), files are
+        loaded from VFS on demand.  Falls back to inline context for dev mode.
+        """
         files: dict[str, str] = {}
 
-        # From Shubham (backend)
-        shubham_output = context.get("shubham", {})
-        if isinstance(shubham_output, dict):
-            for path in shubham_output.get("generated_files", []):
-                files[path] = shubham_output.get("file_contents", {}).get(path, "")
+        for agent_name in ("shubham", "aanya"):
+            agent_output = context.get(agent_name, {})
+            if not isinstance(agent_output, dict):
+                continue
 
-        # From Aanya (frontend)
-        aanya_output = context.get("aanya", {})
-        if isinstance(aanya_output, dict):
-            for path in aanya_output.get("generated_files", []):
-                files[path] = aanya_output.get("file_contents", {}).get(path, "")
+            generated_paths = agent_output.get("generated_files", [])
+            fc = agent_output.get("file_contents", {})
 
-        return {k: v for k, v in files.items() if v}
+            if isinstance(fc, dict) and fc.get("__vfs__"):
+                # D2-FIX: Files are in VFS — load from Valkey
+                manifest = fc.get("__manifest__", {})
+                try:
+                    from app.services.vfs import get_vfs
+
+                    vfs = get_vfs()
+                    run_id = context.get("__pipeline_run_id__", "")
+                    for path in generated_paths:
+                        if path in manifest:
+                            content = await vfs.read_file(run_id, path)
+                            if content:
+                                files[path] = content
+                except Exception:
+                    pass  # VFS unavailable — files stay empty
+            elif isinstance(fc, dict):
+                # Inline file_contents (dev mode / not compacted)
+                for path in generated_paths:
+                    content = fc.get(path, "")
+                    if content:
+                        files[path] = content
+
+        return files
 
     def _scan_python_security(
         self, files: dict[str, str], report: SecurityReport
@@ -1028,6 +1104,7 @@ class Karan:
             "   - bandit: Python static security analysis",
             "   - safety: Python dependency vulnerability check",
             "   - npm_audit: JavaScript/Node.js dependency vulnerability check",
+            "   - semgrep: Multi-language static analysis with OWASP/CWE rules (D4-FIX)",
             "",
             "Focus on issues that static patterns miss:",
             "- Business logic vulnerabilities",

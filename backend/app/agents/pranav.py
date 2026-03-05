@@ -248,6 +248,9 @@ class Pranav:
         # Generate provider-specific config files
         config_files = self._generate_config_files(config)
 
+        # D5-FIX: Generate Terraform IaC files alongside existing configs
+        terraform_files = self._generate_terraform_files(config)
+
         # Execute the deployment
         result = await self._deploy(config, context)
 
@@ -262,6 +265,8 @@ class Pranav:
             # show "simulated output" banners when no real deploy ran.
             "is_simulation_deploy": result.is_simulation,
             "config_files": config_files,
+            # D5-FIX: Terraform IaC output (empty dict if provider has no templates)
+            "terraform_files": terraform_files,
             # R30-FIX-9: Sanitize build_log too. Previously only deploy_log was
             # sanitized. Build logs from `docker build` or `npm run build` can
             # contain env vars leaked via build-args (e.g., API_KEY=sk-...).
@@ -350,6 +355,49 @@ class Pranav:
             except (KeyError, IndexError, ValueError):
                 content = template
             files[filename] = content
+
+        return files
+
+    # -- D5-FIX: Terraform IaC generation (additive) --------------------------
+
+    def _generate_terraform_files(self, config: DeployConfig) -> dict[str, str]:
+        """Generate Terraform HCL files for the deployment provider.
+
+        D5-FIX: Additive to existing cloud config templates.  These files
+        provide Infrastructure-as-Code for users who want reproducible
+        infrastructure provisioning via ``terraform apply``.
+
+        Returns an empty dict if no Terraform templates exist for the provider.
+        """
+        from app.agents.iac_templates.terraform import get_terraform_templates
+
+        templates = get_terraform_templates(config.provider_name)
+        if not templates:
+            return {}
+
+        from collections import defaultdict
+        import re as _re
+
+        files: dict[str, str] = {}
+        values = defaultdict(
+            lambda: "",  # unknown placeholders -> empty string
+            service_name=config.service_name,
+            project_id=config.project_id,
+            region=config.region,
+            memory=config.memory,
+            cpu=config.cpu,
+            max_instances=config.max_instances,
+            min_instances=config.min_instances,
+            timeout_seconds=config.timeout_seconds,
+            health_check_path=config.health_check_path,
+        )
+
+        for filename, template in templates.items():
+            try:
+                content = template.format_map(values)
+            except (KeyError, IndexError, ValueError):
+                content = template
+            files[f"terraform/{filename}"] = content
 
         return files
 

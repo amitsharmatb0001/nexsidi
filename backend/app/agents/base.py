@@ -113,6 +113,14 @@ class AgentResult:
     model_used: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    # D1-FIX: Agent-directed routing — optional next-stage suggestion.
+    # Agents can suggest a specific next stage (PipelineStage.value string).
+    # The pipeline orchestrator validates the suggestion against an allowed
+    # transitions whitelist before applying it.  If None, standard sequential
+    # routing is used.  This enables DCG-style routing without breaking the
+    # existing linear fallback.
+    route_to: str | None = None
+    route_reason: str | None = None
 
     @property
     def duration_ms(self) -> float:

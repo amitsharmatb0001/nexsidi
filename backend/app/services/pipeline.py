@@ -134,6 +134,26 @@ _STAGE_SKIP_RULES: dict[PipelineStage, str] = {
     PipelineStage.COMPLIANCE_CHECK: "__skip_compliance__",
 }
 
+# D1-FIX: Allowed agent-directed routing transitions (whitelist).
+# Agents can suggest a next stage via AgentResult.route_to.  Only transitions
+# listed here are honoured — everything else falls back to sequential order.
+# Key = current stage's STAGE_AGENTS key, Value = set of allowed target
+# PipelineStage.value strings.
+_ALLOWED_ROUTES: dict[str, set[str]] = {
+    # Tilotma (GO/NO-GO review) can skip fixing and go to deployment,
+    # or send back to fixing if issues found
+    "tilotma_review": {"deployment", "fixing"},
+    # Fixer can jump back to testing for re-validation,
+    # or to quality_review for re-audit
+    "fixing": {"testing", "quality_review"},
+    # Architecture review can route back to architecture for redesign,
+    # or to database_design if schema needs rework
+    "architecture_review": {"architecture", "database_design"},
+    # Security audit can route to fixing if critical issues found,
+    # or proceed to compliance check
+    "security_audit": {"fixing", "compliance_check"},
+}
+
 # I2-FIX: Agent context dependency map ────────────────────────────
 # Each agent only receives the prior agent outputs it actually reads,
 # plus all metadata keys (__*__).  This eliminates the "context bloat
@@ -176,7 +196,7 @@ def _build_filtered_context(ctx: dict[str, Any], agent_name: str) -> dict[str, A
 # Agent output values larger than this are offloaded to context_engine
 # storage and replaced with a reference dict.  Downstream agents that
 # need the full content get it hydrated transparently.
-_CONTEXT_COMPACT_THRESHOLD = 64 * 1024  # 64 KB
+_CONTEXT_COMPACT_THRESHOLD = 16 * 1024  # D2-FIX: Lowered from 64KB to 16KB
 
 # Redo rewind targets: which stage to jump back to when user says "redo"
 CHECKPOINT_REDO_TARGETS: dict[PipelineStage, PipelineStage] = {
@@ -1061,16 +1081,31 @@ class PipelineOrchestrator:
     async def advance(
         self, run: PipelineRun, step_result: "StepResult | None" = None,
     ) -> PipelineStage | None:
-        """C2a-FIX: Dynamic stage router — replaces rigid STAGE_ORDER[idx+1].
+        """D1-FIX: Dynamic stage router with agent-directed routing.
 
         Determines the next stage based on:
-        1. Stage skip rules (context flags from early agents or user overrides)
-        2. Default sequential order (STAGE_ORDER) as fallback
+        1. Agent routing suggestion (AgentResult.route_to, validated via whitelist)
+        2. Stage skip rules (context flags from early agents or user overrides)
+        3. Default sequential order (STAGE_ORDER) as fallback
 
         Challenge-retry and fix-retest rewinds are handled BEFORE this is
         called (in the main loop), so this method only handles forward routing.
         """
-        next_stage = self._route_next_stage(run, run.current_stage)
+        # D1-FIX: Extract agent's routing suggestion from step result
+        agent_route = None
+        if step_result and step_result.result and step_result.result.route_to:
+            agent_route = step_result.result.route_to
+            logger.info(
+                "agent_route_suggestion",
+                run_id=run.run_id,
+                agent=step_result.result.agent_name,
+                route_to=agent_route,
+                reason=step_result.result.route_reason or "(no reason)",
+            )
+
+        next_stage = self._route_next_stage(
+            run, run.current_stage, agent_route_to=agent_route,
+        )
         if next_stage is None:
             run.status = PipelineRunStatus.COMPLETED
             return None
@@ -1090,19 +1125,61 @@ class PipelineOrchestrator:
         self,
         run: "PipelineRun",
         current_stage: PipelineStage,
+        agent_route_to: str | None = None,
     ) -> PipelineStage | None:
-        """Determine next stage dynamically, skipping stages that aren't needed.
+        """Determine next stage dynamically via agent routing + skip rules.
 
-        C2a-FIX: Replaces the old rigid ``STAGE_ORDER[current_idx + 1]``.
-        Checks ``_STAGE_SKIP_RULES`` against context flags to skip unnecessary
-        stages (e.g., skip FRONTEND_BUILD if ``__skip_frontend__`` is set).
-        Unknown stages or no skip flag = run normally (safe default).
+        D1-FIX: Adds agent-directed routing on top of C2a skip rules.
+        Priority:
+        1. Agent routing suggestion (validated against ``_ALLOWED_ROUTES``)
+        2. Skip rules (``_STAGE_SKIP_RULES`` context flags)
+        3. Sequential order (``STAGE_ORDER``) as fallback
+
+        C2a-FIX: Checks ``_STAGE_SKIP_RULES`` against context flags to skip
+        unnecessary stages (e.g., skip FRONTEND_BUILD if ``__skip_frontend__``).
         """
         current_idx = STAGE_ORDER.index(current_stage)
         if current_idx >= len(STAGE_ORDER) - 1:
             return None  # Pipeline complete
 
-        # Find next non-skipped stage
+        # D1-FIX: Check agent-directed route first
+        if agent_route_to:
+            # Resolve current stage's agent key for whitelist lookup
+            agent_key = STAGE_AGENTS.get(current_stage)
+            if isinstance(agent_key, list):
+                agent_key = current_stage.value  # parallel stages — use stage name
+            elif isinstance(agent_key, str) and agent_key.startswith("__"):
+                agent_key = current_stage.value  # checkpoint/meta — use stage name
+
+            allowed = _ALLOWED_ROUTES.get(
+                current_stage.value, _ALLOWED_ROUTES.get(agent_key or "", set())
+            )
+            if agent_route_to in allowed:
+                try:
+                    target = PipelineStage(agent_route_to)
+                    logger.info(
+                        "agent_directed_route",
+                        run_id=run.run_id,
+                        from_stage=current_stage.value,
+                        to_stage=agent_route_to,
+                    )
+                    return target
+                except ValueError:
+                    logger.warning(
+                        "invalid_route_stage",
+                        run_id=run.run_id,
+                        requested=agent_route_to,
+                    )
+            else:
+                logger.warning(
+                    "agent_route_rejected",
+                    run_id=run.run_id,
+                    from_stage=current_stage.value,
+                    requested=agent_route_to,
+                    allowed=list(allowed) if allowed else [],
+                )
+
+        # Find next non-skipped stage (sequential fallback)
         for next_idx in range(current_idx + 1, len(STAGE_ORDER)):
             candidate = STAGE_ORDER[next_idx]
             skip_flag = _STAGE_SKIP_RULES.get(candidate)
@@ -2500,22 +2577,50 @@ class PipelineOrchestrator:
     async def _compact_agent_output(self, run: PipelineRun, agent_name: str) -> None:
         """Replace large values in agent output with storage references.
 
-        After an agent completes, its output (e.g., ``file_contents`` with
-        50 source files) may exceed 64 KB.  Large values are offloaded to
-        context_engine and replaced with a reference dict:
-        ``{"__ref__": ref_key, "__size__": original_size}``.
+        D2-FIX: Enhanced to offload ``file_contents`` dicts to VFS (Valkey-backed
+        Virtual File System).  All generated code files are stored in VFS and
+        replaced with a lightweight manifest ``{"__vfs__": True, "__manifest__": ...}``.
 
-        Downstream agents that need the full content get hydrated copies
-        via ``_hydrate_value()``.  If context_engine is unavailable, the
-        value stays inline (safe degradation).
+        For non-file-contents values, the original C2b behavior is preserved:
+        values exceeding ``_CONTEXT_COMPACT_THRESHOLD`` are offloaded to
+        context_engine and replaced with ``{"__ref__": ref_key, "__size__": N}``.
+
+        If VFS or context_engine is unavailable, the value stays inline (safe
+        degradation for dev mode).
         """
         output = run.context.get(agent_name)
         if not isinstance(output, dict):
             return
 
+        # D2-FIX: Offload file_contents to VFS first (highest impact)
+        file_contents = output.get("file_contents")
+        if isinstance(file_contents, dict) and file_contents and not file_contents.get("__vfs__"):
+            try:
+                from app.services.vfs import get_vfs
+
+                vfs = get_vfs()
+                manifest = await vfs.store_files(run.run_id, file_contents, agent_name)
+                output["file_contents"] = {"__vfs__": True, "__manifest__": manifest}
+                logger.info(
+                    "vfs_offloaded",
+                    run_id=run.run_id,
+                    agent=agent_name,
+                    file_count=len(manifest),
+                )
+            except Exception as exc:
+                # VFS unavailable — fall through to general compaction
+                logger.debug(
+                    "vfs_offload_skipped",
+                    agent=agent_name,
+                    error=str(exc)[:100],
+                )
+
+        # General compaction for remaining large values (C2b behavior)
         for key, value in list(output.items()):
-            # Skip metadata and small values
+            # Skip metadata, small values, and already-compacted VFS entries
             if key.startswith("__"):
+                continue
+            if isinstance(value, dict) and (value.get("__ref__") or value.get("__vfs__")):
                 continue
             serialized_len = len(str(value))
             if serialized_len <= _CONTEXT_COMPACT_THRESHOLD:

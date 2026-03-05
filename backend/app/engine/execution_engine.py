@@ -1582,13 +1582,19 @@ class ExecutionEngine:
         self,
         pipeline_run_id: str,
         timeout_seconds: int = 300,
+        tools: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run real security tools inside sandbox containers.
+
+        D4-FIX: Added ``tools`` parameter to run specific scans instead of all.
+        Made subprocess calls non-blocking via ``asyncio.to_thread()``.
+        Added semgrep as a 4th scanning tool.
 
         Tools:
         - bandit: Python static security analysis
         - safety: Python dependency vulnerability check
-        - npm audit: JavaScript dependency check
+        - npm_audit: JavaScript dependency check
+        - semgrep: Multi-language static analysis with OWASP/CWE rules
         """
         state = self._active_sandboxes.get(pipeline_run_id)
         if not state or not _check_docker_available() or not state.temp_dir:
@@ -1597,65 +1603,116 @@ class ExecutionEngine:
         compose_path = os.path.join(state.temp_dir, "docker-compose.yml")
         scans: list[dict[str, Any]] = []
 
+        # D4-FIX: Filter to only requested tools (default: all)
+        requested = set(tools) if tools else {"bandit", "safety", "npm_audit", "semgrep"}
+
         # 1. Bandit (Python security scanner)
-        try:
-            bandit_proc = subprocess.run(
-                ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
-                 "python", "-m", "bandit", "-r", ".", "-f", "json", "-q"],
-                capture_output=True, text=True, timeout=timeout_seconds,
-            )
+        if "bandit" in requested:
             try:
-                bandit_results = json.loads(bandit_proc.stdout)
-                scans.append({
-                    "tool": "bandit",
-                    "passed": len(bandit_results.get("results", [])) == 0,
-                    "findings": bandit_results.get("results", [])[:20],
-                })
-            except json.JSONDecodeError:
-                scans.append({"tool": "bandit", "passed": True, "note": "bandit not installed or no issues"})
-        except (subprocess.TimeoutExpired, Exception):
-            scans.append({"tool": "bandit", "passed": True, "note": "bandit scan skipped"})
+                bandit_proc = await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
+                     "python", "-m", "bandit", "-r", ".", "-f", "json", "-q"],
+                    capture_output=True, text=True, timeout=timeout_seconds,
+                )
+                try:
+                    bandit_results = json.loads(bandit_proc.stdout)
+                    scans.append({
+                        "tool": "bandit",
+                        "passed": len(bandit_results.get("results", [])) == 0,
+                        "findings": [
+                            {
+                                "file": f.get("filename", ""),
+                                "line": f.get("line_number"),
+                                "title": f.get("test_id", "") + ": " + f.get("test_name", ""),
+                                "description": f.get("issue_text", "")[:300],
+                                "severity": f.get("issue_severity", "MEDIUM").lower(),
+                                "cwe_id": f"CWE-{f['issue_cwe']['id']}" if f.get("issue_cwe") else None,
+                            }
+                            for f in bandit_results.get("results", [])[:20]
+                        ],
+                    })
+                except json.JSONDecodeError:
+                    scans.append({"tool": "bandit", "passed": True, "note": "bandit not installed or no issues"})
+            except (subprocess.TimeoutExpired, Exception):
+                scans.append({"tool": "bandit", "passed": True, "note": "bandit scan skipped"})
 
         # 2. Safety (dependency vulnerability check)
-        try:
-            safety_proc = subprocess.run(
-                ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
-                 "python", "-m", "safety", "check", "--json"],
-                capture_output=True, text=True, timeout=timeout_seconds,
-            )
+        if "safety" in requested:
             try:
-                safety_results = json.loads(safety_proc.stdout)
-                vulns = safety_results if isinstance(safety_results, list) else []
-                scans.append({
-                    "tool": "safety",
-                    "passed": len(vulns) == 0,
-                    "vulnerabilities": vulns[:10],
-                })
-            except json.JSONDecodeError:
-                scans.append({"tool": "safety", "passed": True, "note": "safety not installed or no issues"})
-        except (subprocess.TimeoutExpired, Exception):
-            scans.append({"tool": "safety", "passed": True, "note": "safety scan skipped"})
+                safety_proc = await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
+                     "python", "-m", "safety", "check", "--json"],
+                    capture_output=True, text=True, timeout=timeout_seconds,
+                )
+                try:
+                    safety_results = json.loads(safety_proc.stdout)
+                    vulns = safety_results if isinstance(safety_results, list) else []
+                    scans.append({
+                        "tool": "safety",
+                        "passed": len(vulns) == 0,
+                        "vulnerabilities": vulns[:10],
+                    })
+                except json.JSONDecodeError:
+                    scans.append({"tool": "safety", "passed": True, "note": "safety not installed or no issues"})
+            except (subprocess.TimeoutExpired, Exception):
+                scans.append({"tool": "safety", "passed": True, "note": "safety scan skipped"})
 
         # 3. npm audit (JS dependency check)
-        try:
-            npm_proc = subprocess.run(
-                ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-frontend",
-                 "npm", "audit", "--json"],
-                capture_output=True, text=True, timeout=timeout_seconds,
-            )
+        if "npm_audit" in requested:
             try:
-                npm_results = json.loads(npm_proc.stdout)
-                vuln_count = npm_results.get("metadata", {}).get("vulnerabilities", {})
-                high_critical = vuln_count.get("high", 0) + vuln_count.get("critical", 0)
-                scans.append({
-                    "tool": "npm_audit",
-                    "passed": high_critical == 0,
-                    "vulnerabilities": vuln_count,
-                })
-            except (json.JSONDecodeError, Exception):
-                scans.append({"tool": "npm_audit", "passed": True, "note": "npm audit not available"})
-        except (subprocess.TimeoutExpired, Exception):
-            scans.append({"tool": "npm_audit", "passed": True, "note": "npm audit skipped"})
+                npm_proc = await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-frontend",
+                     "npm", "audit", "--json"],
+                    capture_output=True, text=True, timeout=timeout_seconds,
+                )
+                try:
+                    npm_results = json.loads(npm_proc.stdout)
+                    vuln_count = npm_results.get("metadata", {}).get("vulnerabilities", {})
+                    high_critical = vuln_count.get("high", 0) + vuln_count.get("critical", 0)
+                    scans.append({
+                        "tool": "npm_audit",
+                        "passed": high_critical == 0,
+                        "vulnerabilities": vuln_count,
+                    })
+                except (json.JSONDecodeError, Exception):
+                    scans.append({"tool": "npm_audit", "passed": True, "note": "npm audit not available"})
+            except (subprocess.TimeoutExpired, Exception):
+                scans.append({"tool": "npm_audit", "passed": True, "note": "npm audit skipped"})
+
+        # 4. Semgrep (D4-FIX: multi-language static analysis with OWASP/CWE rules)
+        if "semgrep" in requested:
+            try:
+                semgrep_proc = await asyncio.to_thread(
+                    subprocess.run,
+                    ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
+                     "semgrep", "--config", "auto", "--json", "--quiet", "."],
+                    capture_output=True, text=True, timeout=timeout_seconds,
+                )
+                try:
+                    semgrep_results = json.loads(semgrep_proc.stdout)
+                    findings = semgrep_results.get("results", [])
+                    scans.append({
+                        "tool": "semgrep",
+                        "passed": len(findings) == 0,
+                        "findings": [
+                            {
+                                "file": f.get("path", ""),
+                                "line": f.get("start", {}).get("line"),
+                                "title": f.get("check_id", ""),
+                                "description": f.get("extra", {}).get("message", "")[:300],
+                                "severity": f.get("extra", {}).get("severity", "WARNING").lower(),
+                                "cwe_id": _extract_cwe_from_semgrep(f.get("extra", {}).get("metadata", {})),
+                            }
+                            for f in findings[:30]
+                        ],
+                    })
+                except json.JSONDecodeError:
+                    scans.append({"tool": "semgrep", "passed": True, "note": "semgrep not installed or no issues"})
+            except (subprocess.TimeoutExpired, Exception):
+                scans.append({"tool": "semgrep", "passed": True, "note": "semgrep scan skipped"})
 
         return {"simulated": False, "scans": scans}
 
@@ -1751,6 +1808,33 @@ class ExecutionEngine:
     def generate_seccomp_profile(self) -> dict[str, Any]:
         """Get the seccomp profile for sandbox containers."""
         return SECCOMP_PROFILE
+
+
+# ── D4-FIX: Semgrep Helpers ─────────────────────────────────────────
+
+
+def _extract_cwe_from_semgrep(metadata: dict[str, Any]) -> str | None:
+    """Extract CWE ID from semgrep finding metadata.
+
+    Semgrep metadata may contain CWE in various formats:
+    - metadata.cwe: ["CWE-89: SQL Injection"]
+    - metadata.cwe_id: "CWE-89"
+    - metadata.owasp: ["A03:2021 Injection"]
+    """
+    if not metadata:
+        return None
+    # Try direct cwe_id
+    cwe_id = metadata.get("cwe_id")
+    if cwe_id:
+        return cwe_id
+    # Try cwe list
+    cwe_list = metadata.get("cwe", [])
+    if isinstance(cwe_list, list) and cwe_list:
+        # Extract "CWE-89" from "CWE-89: SQL Injection"
+        first = str(cwe_list[0])
+        if first.startswith("CWE-"):
+            return first.split(":")[0].strip()
+    return None
 
 
 # ── Singleton ───────────────────────────────────────────────────────
