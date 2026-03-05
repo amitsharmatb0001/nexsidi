@@ -107,6 +107,8 @@ class Settings(BaseSettings):
     # --- Deployment ---
     nexsidi_deploy_key: str = ""
     railway_token: str = ""  # DEPLOY-FIX: Railway API/CLI token for real deployments
+    vercel_token: str = ""   # REVIEW-FIX: Vercel API token for real deployments
+    vercel_org_id: str = ""  # REVIEW-FIX: Vercel team/org ID (optional)
 
     # --- CORS ---
     cors_origins: list[str] = ["http://localhost:3000"]
@@ -170,6 +172,13 @@ class Settings(BaseSettings):
     use_celery: bool = False  # Feature flag â€" False = current behavior
     celery_broker_url: str = ""  # Falls back to valkey_url if empty
     celery_result_backend: str = ""  # Falls back to valkey_url if empty
+
+    # --- Object Storage (generated code) ---
+    # REVIEW-FIX: Large generated codebases should be stored durably (not in Valkey).
+    # When gcs_code_bucket is set, content >64KB is offloaded to GCS.
+    # When empty, all content stays in Valkey (dev mode).
+    gcs_code_bucket: str = ""        # GCS bucket name (e.g., "nexsidi-generated-code")
+    local_store_dir: str = ""        # Local filesystem fallback (dev mode)
 
     # --- Proxy / Network ---
     # REFIX: Only trust X-Forwarded-For when behind a known reverse proxy.

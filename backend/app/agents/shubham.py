@@ -917,6 +917,14 @@ class Shubham:
         fw_config = get_framework_config(backend_framework)
         generation_order = list(fw_config.generation_order)  # OCP-FIX: read from plugin
 
+        # REVIEW-FIX: Reorder generation steps by dependency level so the LLM
+        # prompt lists root files (no deps) first, then layer by layer.
+        # This replaces the hardcoded array order with a topologically sorted order.
+        dep_graph = fw_config.dependency_graph or get_dependency_graph(backend_framework)
+        if dep_graph:
+            levels = compute_parallel_levels(generation_order, dep_graph)
+            generation_order = [step for level in levels for step in level]
+
         # Read user feedback if available (from checkpoint feedback loop)
         user_feedback = context.get("__user_feedback__", "")
 
@@ -1123,6 +1131,45 @@ class Shubham:
                     "issue": "No models file found but contract defines database tables",
                 })
 
+        # REVIEW-FIX: 5. Import dependency ordering check
+        # Verify that files importing from other generated files have those
+        # dependencies actually generated. Uses basic import pattern matching.
+        import re as _re_dep
+        file_modules: dict[str, str] = {}  # Map module-like names to paths
+        for path in generated_files:
+            # e.g., "backend/app/models.py" → "app.models"
+            stem = path.replace("/", ".").replace("\\", ".")
+            if stem.endswith(".py"):
+                stem = stem[:-3]
+            file_modules[stem] = path
+
+        for path, content in generated_files.items():
+            if not path.endswith(".py"):
+                continue
+            # Find import statements
+            import_lines = _re_dep.findall(
+                r"^(?:from\s+(\S+)\s+import|import\s+(\S+))",
+                content, _re_dep.MULTILINE,
+            )
+            for from_mod, import_mod in import_lines:
+                mod = from_mod or import_mod
+                if not mod:
+                    continue
+                # Check if this is an intra-project import
+                if mod.startswith(("app.", "core.", "src.")):
+                    # Check if referenced module exists in generated files
+                    matching = any(
+                        mod in fm or fm.endswith(mod)
+                        for fm in file_modules
+                    )
+                    if not matching:
+                        # It's OK if it's a template file or standard lib
+                        if not any(mod in tp for tp in generated_files):
+                            warnings.append({
+                                "file": path,
+                                "issue": f"Imports '{mod}' but no matching generated file found",
+                            })
+
         return {
             "files_checked": files_checked,
             "errors": len(errors),
@@ -1210,14 +1257,31 @@ class Shubham:
             prompt_parts.append(f"- `{step_name}` → `{path}`")
         prompt_parts.append("")
 
-        # ── 5. Required Files ──
-        prompt_parts.append("## Files You Must Generate")
+        # ── 5. Required Files (grouped by dependency level) ──
+        # REVIEW-FIX: Use compute_parallel_levels() to show files in dependency
+        # layers. This tells the LLM which files are independent (Level 0) and
+        # which depend on previously generated files (Level 1, 2, ...).
+        prompt_parts.append("## Files You Must Generate (by dependency level)")
         prompt_parts.append(
-            "Write these files IN ORDER using the write_file tool. "
-            "Each file depends on those above it."
+            "Generate files level-by-level. Files in the same level are independent "
+            "and can be written in any order. Files in later levels depend on earlier ones."
         )
-        for step in generation_order:
-            prompt_parts.append(f"- **{step['path']}** — {step['description']}")
+
+        # Try to get the dependency graph from fw_config or module-level
+        _dep_graph = getattr(fw_config, "dependency_graph", None) or {}
+        if _dep_graph:
+            _levels = compute_parallel_levels(generation_order, _dep_graph)
+            for level_idx, level_steps in enumerate(_levels):
+                level_names = ", ".join(s["name"] for s in level_steps)
+                prompt_parts.append(f"\n### Level {level_idx} ({level_names})")
+                for step in level_steps:
+                    deps = _dep_graph.get(step["name"], set())
+                    dep_note = f" (depends on: {', '.join(sorted(deps))})" if deps else " (no dependencies)"
+                    prompt_parts.append(f"- **{step['path']}** — {step['description']}{dep_note}")
+        else:
+            # Fallback: flat list if no dependency graph
+            for step in generation_order:
+                prompt_parts.append(f"- **{step['path']}** — {step['description']}")
         prompt_parts.append("")
 
         # ── 6. Mandatory Rules ──

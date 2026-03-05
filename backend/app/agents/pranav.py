@@ -513,40 +513,159 @@ class Pranav:
                 logger.warning("railway_graphql_error", error=str(exc)[:100])
                 deploy_mode = "simulation"
 
-        # -- PATH C: Simulation fallback ------------------------------------------
+        # -- PATH D: Vercel REST API -----------------------------------------------
+        vercel_token: str = (
+            os.environ.get("VERCEL_TOKEN", "") or getattr(settings, "vercel_token", "")
+        )
+        if (
+            not deployment_url
+            and deploy_mode == "simulation"
+            and vercel_token
+            and config.provider_name in ("vercel", "netlify")
+        ):
+            logger.info("deploy_mode", mode="vercel_api", service=config.service_name)
+            deploy_mode = "vercel_api"
+            try:
+                # Collect all generated files for the Vercel deployment payload
+                all_files: list[dict[str, str]] = []
+                for agent_name in ("shubham", "aanya"):
+                    agent_out = context.get(agent_name, {})
+                    if isinstance(agent_out, dict):
+                        for fpath, fcontent in agent_out.get("file_contents", {}).items():
+                            all_files.append({"file": fpath, "data": fcontent})
+
+                if all_files:
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        # Create deployment via Vercel REST API v13
+                        vercel_body: dict[str, Any] = {
+                            "name": config.service_name,
+                            "files": all_files,
+                            "target": "production",
+                            "projectSettings": {
+                                "framework": None,  # Auto-detect
+                            },
+                        }
+                        vercel_org_id = os.environ.get("VERCEL_ORG_ID", "") or getattr(settings, "vercel_org_id", "")
+                        headers: dict[str, str] = {
+                            "Authorization": f"Bearer {vercel_token}",
+                            "Content-Type": "application/json",
+                        }
+                        if vercel_org_id:
+                            headers["x-vercel-team-id"] = vercel_org_id
+
+                        resp = await client.post(
+                            "https://api.vercel.com/v13/deployments",
+                            headers=headers,
+                            json=vercel_body,
+                        )
+
+                        if resp.status_code in (200, 201):
+                            vercel_data = resp.json()
+                            deployment_url = vercel_data.get("url", "")
+                            if deployment_url and not deployment_url.startswith("https://"):
+                                deployment_url = f"https://{deployment_url}"
+                            deploy_log = f"Vercel deployment created: id={vercel_data.get('id', '?')}"
+                            deploy_mode = "vercel_api"
+
+                            # Poll for READY status (max 120s)
+                            deploy_id = vercel_data.get("id", "")
+                            if deploy_id:
+                                import asyncio as _asyncio
+
+                                for _poll in range(24):  # 24 * 5s = 120s
+                                    await _asyncio.sleep(5)
+                                    poll_resp = await client.get(
+                                        f"https://api.vercel.com/v13/deployments/{deploy_id}",
+                                        headers={"Authorization": f"Bearer {vercel_token}"},
+                                    )
+                                    if poll_resp.status_code == 200:
+                                        poll_data = poll_resp.json()
+                                        ready_state = poll_data.get("readyState", "")
+                                        if ready_state == "READY":
+                                            deployment_url = poll_data.get("url", deployment_url)
+                                            if deployment_url and not deployment_url.startswith("https://"):
+                                                deployment_url = f"https://{deployment_url}"
+                                            deploy_log += f" | Status: READY after {(_poll+1)*5}s"
+                                            break
+                                        elif ready_state in ("ERROR", "CANCELED"):
+                                            deploy_log += f" | Status: {ready_state}"
+                                            deploy_mode = "simulation"
+                                            break
+                                else:
+                                    deploy_log += " | Status: polling timed out (120s)"
+                        else:
+                            vercel_err = resp.text[:300]
+                            logger.warning("vercel_api_error", status=resp.status_code, body=vercel_err)
+                            deploy_log = f"Vercel API error ({resp.status_code}): {vercel_err}"
+                            deploy_mode = "simulation"
+            except httpx.RequestError as exc:
+                logger.warning("vercel_api_request_error", error=str(exc)[:200])
+                deploy_mode = "simulation"
+            except Exception as exc:
+                from app.services.ai_router import _sanitize_error
+                logger.warning("vercel_api_unexpected_error", error=_sanitize_error(exc)[:200])
+                deploy_mode = "simulation"
+
+        # -- PATH E: Simulation fallback ------------------------------------------
         if not deployment_url:
             logger.info(
                 "deploy_mode",
                 mode=deploy_mode,
                 provider=config.provider_name,
+                reason="no_provider_token" if deploy_mode == "simulation" else "deploy_failed",
             )
             deployment_url = _generate_deployment_url(config)
-            deploy_log = f"Simulation deploy command: {deploy_cmd}"
+            if deploy_mode == "simulation":
+                deploy_log = (
+                    f"Simulation deploy: {deploy_cmd} | "
+                    f"Reason: no provider token configured. "
+                    f"Set RAILWAY_TOKEN or VERCEL_TOKEN to enable real deployment."
+                )
+            elif not deploy_log:
+                deploy_log = f"Simulation fallback after deploy failure: {deploy_cmd}"
 
-        # -- Phase 3: Real HTTP health-check --------------------------------------
+        # -- Phase 3: Real HTTP health-check with retries -------------------------
         health_passed = False
         health_url = deployment_url.rstrip("/") + config.health_check_path
         logger.info("deploy_health_check", url=health_url, deploy_mode=deploy_mode)
 
         if deploy_mode == "simulation":
-            # Simulation: URL is invented — skip real probe
+            # Simulation: URL is invented -- skip real probe
             health_passed = True
             logger.info("deploy_health_simulated", url=health_url)
         else:
-            try:
-                async with httpx.AsyncClient(
-                    timeout=30.0, follow_redirects=True
-                ) as client:
-                    resp = await client.get(health_url)
-                    health_passed = resp.status_code < 500
-                    logger.info(
-                        "deploy_health_result",
-                        status=resp.status_code,
-                        passed=health_passed,
+            # REVIEW-FIX: Retry health check with exponential backoff.
+            # Deployments take time to become healthy. Previously a single
+            # GET was attempted, failing for slow-starting containers.
+            import asyncio as _asyncio
+
+            health_delays = [5, 10, 20]  # 3 retries: 5s, 10s, 20s
+            for attempt, delay in enumerate(health_delays, 1):
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True
+                    ) as client:
+                        resp = await client.get(health_url)
+                        health_passed = resp.status_code < 500
+                        logger.info(
+                            "deploy_health_result",
+                            attempt=attempt,
+                            status=resp.status_code,
+                            passed=health_passed,
+                        )
+                        if health_passed:
+                            break
+                except httpx.RequestError as exc:
+                    logger.warning(
+                        "deploy_health_error",
+                        attempt=attempt,
+                        error=str(exc)[:100],
                     )
-            except httpx.RequestError as exc:
-                logger.warning("deploy_health_error", error=str(exc)[:100])
-                health_passed = False
+                    health_passed = False
+
+                if not health_passed and attempt < len(health_delays):
+                    logger.info("deploy_health_retry", delay=delay, attempt=attempt)
+                    await _asyncio.sleep(delay)
 
         elapsed = time.monotonic() - start
 

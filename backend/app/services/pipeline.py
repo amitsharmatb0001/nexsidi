@@ -758,6 +758,68 @@ class PipelineOrchestrator:
             self._semaphore = asyncio.Semaphore(self._max_concurrent)
         return self._semaphore
 
+    async def _acquire_distributed_slot(self, run_id: str) -> bool:
+        """REVIEW-FIX: Acquire a slot in the distributed concurrency semaphore.
+
+        Uses Valkey INCR + TTL to count active pipelines across all workers.
+        Each worker's local asyncio.Semaphore only limits within that process.
+        This distributed counter limits TOTAL concurrent pipelines cluster-wide.
+
+        Returns True if a slot was acquired, False if at max capacity.
+        """
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            client = await get_valkey_client()
+            counter_key = "pipeline:active_count"
+
+            # Lua script: atomically check < max, increment, and set TTL
+            lua = """
+            local count = tonumber(redis.call('GET', KEYS[1]) or 0)
+            if count >= tonumber(ARGV[1]) then
+                return 0
+            end
+            redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            return 1
+            """
+            result = await client.eval(
+                lua, 1, counter_key,
+                str(self._max_concurrent),
+                str(self._timeout_seconds + 60),  # TTL = timeout + buffer
+            )
+            if result == 1:
+                # Also track this run's slot for cleanup
+                slot_key = f"pipeline:slot:{run_id}"
+                await client.set(slot_key, "1", ex=self._timeout_seconds + 60)
+                return True
+            return False
+        except Exception as exc:
+            logger.debug("distributed_semaphore_unavailable", error=str(exc))
+            return True  # Fall back to local semaphore only
+
+    async def _release_distributed_slot(self, run_id: str) -> None:
+        """REVIEW-FIX: Release a slot in the distributed concurrency semaphore."""
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            client = await get_valkey_client()
+
+            # Only decrement if this run's slot key exists (prevent double-release)
+            slot_key = f"pipeline:slot:{run_id}"
+            was_deleted = await client.delete(slot_key)
+            if was_deleted:
+                counter_key = "pipeline:active_count"
+                # DECR, but never go below 0
+                lua = """
+                local count = tonumber(redis.call('GET', KEYS[1]) or 0)
+                if count > 0 then
+                    redis.call('DECR', KEYS[1])
+                end
+                return count - 1
+                """
+                await client.eval(lua, 1, counter_key)
+        except Exception:
+            pass  # Best-effort; slots have TTL for auto-cleanup
+
     @property
     def persistence(self) -> PipelinePersistence:
         """Expose persistence layer for testing and startup recovery."""
@@ -802,8 +864,37 @@ class PipelineOrchestrator:
         return run
 
     def get_run(self, run_id: str) -> PipelineRun | None:
-        """Get a pipeline run by ID."""
+        """Get a pipeline run by ID (hot cache only — sync method).
+
+        REVIEW-FIX: For cases where the run may not be in the local cache
+        (multi-process deployment), callers should use get_run_or_load() instead.
+        This method is kept sync for backward compat (tests, sync callers).
+        """
         return self._active_runs.get(run_id)
+
+    async def get_run_or_load(
+        self, run_id: str, organization_id: str | None = None,
+    ) -> PipelineRun | None:
+        """Get a pipeline run — checks hot cache first, then DB.
+
+        REVIEW-FIX: In multi-process deployments (Cloud Run, multiple Uvicorn
+        workers), a run may live in another worker's _active_runs cache but not
+        ours. Always fall back to DB to find it. DB is the source of truth.
+        """
+        run = self._active_runs.get(run_id)
+        if run is not None:
+            return run
+
+        # DB fallback — O(1) indexed lookup by run_id
+        run_data = await self._persistence.find_run_by_id(
+            run_id, organization_id=organization_id,
+        )
+        if run_data is not None:
+            run = self._persistence.rebuild_run(run_data)
+            self._active_runs[run.run_id] = run  # Warm the cache
+            return run
+
+        return None
 
     async def load_run_metadata(
         self, run_id: str, organization_id: str | None = None,
@@ -1020,12 +1111,27 @@ class PipelineOrchestrator:
         or after every stage (in STEP_BY_STEP mode).
 
         Resource isolation:
-        - Acquires global semaphore (blocks if max_concurrent reached)
+        - REVIEW-FIX: Acquires distributed Valkey lock (cross-process)
+        - REVIEW-FIX: Acquires distributed Valkey slot (cluster-wide concurrency)
+        - Acquires local semaphore (in-process concurrency)
         - Wraps entire execution with a timeout
         - Rate-limits AI calls per project
 
         State is persisted to the database after each stage for crash recovery.
         """
+        # REVIEW-FIX: Distributed lock — ensure only ONE worker runs this pipeline
+        if not await self._acquire_distributed_lock(run.run_id, ttl_seconds=self._timeout_seconds + 60):
+            run.status = PipelineRunStatus.FAILED
+            run.error = "Another worker is already executing this pipeline"
+            return run
+
+        # REVIEW-FIX: Distributed slot — respect cluster-wide concurrency limit
+        if not await self._acquire_distributed_slot(run.run_id):
+            await self._release_distributed_lock(run.run_id)
+            run.status = PipelineRunStatus.FAILED
+            run.error = f"Cluster-wide concurrency limit ({self._max_concurrent}) reached"
+            return run
+
         async with self._get_semaphore():
             try:
                 return await asyncio.wait_for(
@@ -1066,13 +1172,6 @@ class PipelineOrchestrator:
                 return run
             except Exception as exc:
                 # R9-FIX: Catch ALL exceptions from _run_pipeline_inner.
-                # Previously only TimeoutError was caught. Any other exception
-                # (ValueError from corrupt stage, RuntimeError from DB driver)
-                # left the run permanently stuck in RUNNING status.
-                # R22-FIX: Sanitize exception to prevent API key leakage.
-                # run.error is persisted to DB and returned to clients via
-                # /status endpoint. httpx errors can contain full request
-                # headers including Authorization and x-api-key.
                 from app.services.ai_router import _sanitize_error
                 safe_err = _sanitize_error(exc)
                 run.status = PipelineRunStatus.FAILED
@@ -1092,12 +1191,7 @@ class PipelineOrchestrator:
                 )
                 return run
             except BaseException as exc:
-                # R19-FIX: CancelledError is a BaseException in Python 3.9+,
-                # NOT caught by `except Exception`. Without this, server shutdown
-                # during pipeline execution leaves runs stuck in RUNNING status
-                # forever — not resumable, not retryable, not visible as failed.
-                # Crash recovery on next startup marks them INTERRUPTED, but there
-                # can be a window where the run is orphaned.
+                # R19-FIX: CancelledError is a BaseException in Python 3.9+.
                 run.status = PipelineRunStatus.FAILED
                 run.error = f"Pipeline cancelled: {type(exc).__name__}"
                 try:
@@ -1107,8 +1201,6 @@ class PipelineOrchestrator:
                 self._active_runs.pop(run.run_id, None)
                 # R26-FIX-6: Clean up _run_locks on cancel.
                 self._run_locks.pop(run.run_id, None)
-                # R22-FIX: Sanitize cancel error too (CancelledError is
-                # typically clean, but defensive against future changes).
                 from app.services.ai_router import _sanitize_error
                 logger.warning(
                     "pipeline_cancelled",
@@ -1116,6 +1208,11 @@ class PipelineOrchestrator:
                     error=_sanitize_error(exc),
                 )
                 raise  # Re-raise to propagate cancellation
+            finally:
+                # REVIEW-FIX: Always release distributed resources regardless
+                # of how the pipeline exits (success, failure, timeout, cancel).
+                await self._release_distributed_lock(run.run_id)
+                await self._release_distributed_slot(run.run_id)
 
     async def _get_max_step_order(self, run: PipelineRun) -> int:
         """Query the max step_order from DB for this run.
@@ -1559,16 +1656,46 @@ class PipelineOrchestrator:
         REVIEW-FIX: Per-run lock prevents concurrent resume/execution of the
         same pipeline. Locks are cleaned up when runs reach terminal state.
 
-        DEFERRED-FIX-5: This lock only protects within a single process.
-        Cross-worker safety is provided by atomic DB status transition in
-        resume_run() — the UPDATE ... WHERE status='paused' RETURNING
-        pattern ensures only one worker can resume a given run. The local
-        lock still prevents races within the same process (e.g., two HTTP
-        requests to the same Uvicorn worker).
+        This provides LOCAL (in-process) locking only.  Cross-worker safety
+        is also handled by _acquire_distributed_lock() which uses Valkey
+        SET NX EX for cluster-wide mutual exclusion.
         """
         if run_id not in self._run_locks:
             self._run_locks[run_id] = asyncio.Lock()
         return self._run_locks[run_id]
+
+    async def _acquire_distributed_lock(
+        self, run_id: str, ttl_seconds: int = 300,
+    ) -> bool:
+        """REVIEW-FIX: Acquire a Valkey-based distributed lock for a pipeline run.
+
+        Uses SET NX EX (set-if-not-exists with expiry) to ensure only ONE
+        worker across all processes can execute a given pipeline run at a time.
+        The TTL prevents deadlocks if the worker crashes (lock auto-expires).
+
+        Returns True if lock acquired, False if another worker holds it.
+        """
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            client = await get_valkey_client()
+            lock_key = f"pipeline:lock:{run_id}"
+            # SET NX EX: atomic set-if-not-exists with TTL
+            was_set = await client.set(lock_key, "1", nx=True, ex=ttl_seconds)
+            return bool(was_set)
+        except Exception as exc:
+            # Valkey unavailable — fall back to local-only locking
+            logger.debug("distributed_lock_unavailable", run_id=run_id, error=str(exc))
+            return True  # Permit execution (single-process fallback)
+
+    async def _release_distributed_lock(self, run_id: str) -> None:
+        """REVIEW-FIX: Release the Valkey-based distributed lock for a pipeline run."""
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            client = await get_valkey_client()
+            lock_key = f"pipeline:lock:{run_id}"
+            await client.delete(lock_key)
+        except Exception:
+            pass  # Best-effort release; TTL will expire it anyway
 
     def _evict_stale_paused(self) -> None:
         """R17-FIX: Evict locks and hot-cache entries for abandoned PAUSED runs.

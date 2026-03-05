@@ -141,6 +141,7 @@ class FixAttempt:
     file_content_before: str  # Content before fix
     file_content_after: str   # Content after fix
     success: bool
+    diff_mode: str = "write_file"  # "apply_diff" or "write_file"
 
 
 @dataclass(slots=True)
@@ -191,12 +192,15 @@ class FixerToolHandler:
         self._fix_description = ""
         self._validation_passed = False
         self._complete = False
+        self._used_diff = False  # Track if apply_diff was used (for telemetry)
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "read_file":
             return self._read_file(tool_input["path"])
         elif tool_name == "write_file":
             return self._write_file(tool_input["path"], tool_input["content"])
+        elif tool_name == "apply_diff":
+            return self._apply_diff(tool_input["path"], tool_input["diff"])
         elif tool_name == "validate_syntax":
             return self._validate_syntax(tool_input["path"], tool_input.get("content"))
         elif tool_name == "read_error_report":
@@ -241,6 +245,162 @@ class FixerToolHandler:
             return "Error: content too short — must be a complete file"
         self._written_files[path] = content
         return f"Written {path} ({len(content)} chars)"
+
+    def _apply_diff(self, path: str, diff_text: str) -> str:
+        """Apply a unified diff to an existing file.
+
+        REVIEW-FIX: Fixer now supports targeted patches instead of full file
+        rewrites. This saves ~10x tokens and avoids accidentally deleting
+        unrelated code. Falls back to write_file if diff application fails.
+
+        Accepts standard unified diff format:
+            --- a/path
+            +++ b/path
+            @@ -start,count +start,count @@
+            -removed line
+            +added line
+             context line
+        """
+        # Get current file content
+        current = self._read_file(path)
+        if current.startswith("File not found"):
+            return f"Cannot apply diff: {current}"
+
+        lines = current.split("\n")
+        hunks = self._parse_unified_diff(diff_text)
+
+        if not hunks:
+            return "Error: could not parse any diff hunks. Expected unified diff format with @@ markers."
+
+        # Apply hunks in REVERSE order (bottom-up) so line numbers stay valid
+        hunks.sort(key=lambda h: h["old_start"], reverse=True)
+        applied = 0
+        errors: list[str] = []
+
+        for hunk in hunks:
+            old_start = hunk["old_start"] - 1  # 0-indexed
+            old_lines = hunk["old_lines"]
+            new_lines = hunk["new_lines"]
+
+            # Fuzzy match: try exact position first, then search nearby (+/- 5 lines)
+            match_offset = self._find_hunk_match(lines, old_lines, old_start)
+
+            if match_offset is not None:
+                # Replace old lines with new lines at matched position
+                lines[match_offset:match_offset + len(old_lines)] = new_lines
+                applied += 1
+            else:
+                # Context lines didn't match — report but continue with other hunks
+                preview = old_lines[0] if old_lines else "(empty)"
+                errors.append(
+                    f"Hunk at line {hunk['old_start']} failed to match "
+                    f"(expected: {preview!r})"
+                )
+
+        if applied == 0:
+            return (
+                f"Error: all {len(hunks)} hunks failed to apply. "
+                f"The file may have changed. Errors: {'; '.join(errors)}. "
+                f"Use write_file with complete content instead."
+            )
+
+        result = "\n".join(lines)
+        self._written_files[path] = result
+        self._used_diff = True
+
+        msg = f"Applied {applied}/{len(hunks)} hunks to {path} ({len(result)} chars)"
+        if errors:
+            msg += f". Warnings: {'; '.join(errors)}"
+        return msg
+
+    @staticmethod
+    def _parse_unified_diff(diff_text: str) -> list[dict]:
+        """Parse unified diff text into a list of hunk dicts.
+
+        Each hunk dict has:
+            old_start: int (1-indexed line number in original file)
+            old_lines: list[str] (lines to remove / match as context)
+            new_lines: list[str] (lines to insert)
+        """
+        import re
+
+        hunks: list[dict] = []
+        hunk_header_re = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@")
+
+        current_hunk: dict | None = None
+
+        for raw_line in diff_text.split("\n"):
+            # Skip file headers (--- and +++)
+            if raw_line.startswith("--- ") or raw_line.startswith("+++ "):
+                continue
+
+            # Detect hunk header
+            m = hunk_header_re.match(raw_line)
+            if m:
+                if current_hunk is not None:
+                    hunks.append(current_hunk)
+                current_hunk = {
+                    "old_start": int(m.group(1)),
+                    "old_lines": [],
+                    "new_lines": [],
+                }
+                continue
+
+            if current_hunk is None:
+                continue
+
+            if raw_line.startswith("-"):
+                # Removed line: goes to old_lines only
+                current_hunk["old_lines"].append(raw_line[1:])
+            elif raw_line.startswith("+"):
+                # Added line: goes to new_lines only
+                current_hunk["new_lines"].append(raw_line[1:])
+            elif raw_line.startswith(" ") or raw_line == "":
+                # Context line: goes to BOTH old and new
+                ctx = raw_line[1:] if raw_line.startswith(" ") else raw_line
+                current_hunk["old_lines"].append(ctx)
+                current_hunk["new_lines"].append(ctx)
+
+        if current_hunk is not None:
+            hunks.append(current_hunk)
+
+        return hunks
+
+    @staticmethod
+    def _find_hunk_match(
+        lines: list[str],
+        old_lines: list[str],
+        expected_start: int,
+    ) -> int | None:
+        """Find where old_lines match in the file, with fuzzy offset search.
+
+        Tries exact position first, then searches +/- 10 lines around it.
+        Returns the 0-indexed start position, or None if no match.
+        """
+        if not old_lines:
+            # Pure insertion: return expected position
+            return max(0, min(expected_start, len(lines)))
+
+        def _matches_at(offset: int) -> bool:
+            if offset < 0 or offset + len(old_lines) > len(lines):
+                return False
+            for a, b in zip(lines[offset:offset + len(old_lines)], old_lines):
+                if a.rstrip() != b.rstrip():
+                    return False
+            return True
+
+        # Try exact position first
+        if _matches_at(expected_start):
+            return expected_start
+
+        # Fuzzy search: +/- 10 lines
+        for delta in range(1, 11):
+            if _matches_at(expected_start + delta):
+                return expected_start + delta
+            if _matches_at(expected_start - delta):
+                return expected_start - delta
+
+        return None
 
     def _validate_syntax(self, path: str, content: str | None = None) -> str:
         code = content or self._written_files.get(path, "")
@@ -431,7 +591,10 @@ class Fixer:
 
         self.register_tool(ToolDefinition(
             name="write_file",
-            description="Write the fixed code to a file.",
+            description=(
+                "Write a COMPLETE file. Use ONLY for new files or when the diff is "
+                "larger than 50%% of the file. For small targeted fixes, PREFER apply_diff."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -439,6 +602,39 @@ class Fixer:
                     "content": {"type": "string", "description": "Complete fixed file content."},
                 },
                 "required": ["path", "content"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="apply_diff",
+            description=(
+                "Apply a targeted unified diff patch to fix specific lines. "
+                "PREFERRED over write_file for small fixes — saves tokens and "
+                "avoids accidentally changing unrelated code. Use standard "
+                "unified diff format with @@ hunk headers."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path to patch.",
+                    },
+                    "diff": {
+                        "type": "string",
+                        "description": (
+                            "Unified diff text. Example:\n"
+                            "--- a/app/models.py\n"
+                            "+++ b/app/models.py\n"
+                            "@@ -10,3 +10,3 @@\n"
+                            " class User:\n"
+                            "-    email = Column(String)\n"
+                            "+    email = Column(String, unique=True, index=True)\n"
+                            "     name = Column(String)\n"
+                        ),
+                    },
+                },
+                "required": ["path", "diff"],
             },
         ))
 
@@ -663,6 +859,7 @@ class Fixer:
                     "model_used": a.model_used,
                     "fix_applied": a.fix_applied,
                     "success": a.success,
+                    "diff_mode": a.diff_mode,
                 }
                 for a in report.attempts
             ],
@@ -734,18 +931,35 @@ class Fixer:
             "2. Call read_file to get the current file content",
             "3. For unfamiliar errors: call search_solution FIRST to find the right fix",
             "4. For ImportError/ModuleNotFoundError: call check_imports to find unresolved imports",
-            "5. Call write_file with the COMPLETE fixed file content",
+            "5. Apply the fix using ONE of these approaches:",
+            "   a. PREFERRED: call apply_diff with a targeted unified diff patch",
+            "   b. FALLBACK: call write_file with complete content (only for new files or >50% changes)",
             "6. For Python files: call validate_syntax to confirm fix is valid",
             "7. Call report_complete with a brief description and validation result",
             "",
             "Tools available:",
             "- read_error_report: get structured error details",
             "- read_file: read current file content",
-            "- write_file: write the fixed file (COMPLETE content, not a diff)",
+            "- apply_diff: apply a targeted unified diff patch (PREFERRED — saves tokens, safer)",
+            "- write_file: write complete file (only for new files or massive rewrites)",
             "- validate_syntax: check Python syntax after fixing",
             "- check_imports: verify all Python imports resolve correctly",
             "- search_solution: search web for error solutions (use for unfamiliar errors)",
             "- report_complete: signal the fix is done",
+            "",
+            "IMPORTANT — Use apply_diff for targeted fixes:",
+            "```",
+            "--- a/app/models.py",
+            "+++ b/app/models.py",
+            "@@ -25,3 +25,4 @@",
+            " class User(Base):",
+            "-    email = Column(String)",
+            "+    email = Column(String, unique=True, index=True)",
+            "+    email_verified = Column(Boolean, default=False)",
+            "     name = Column(String(100))",
+            "```",
+            "apply_diff applies ONLY the changed lines, preserving everything else.",
+            "write_file replaces the ENTIRE file — use only when necessary.",
             "",
             "Rules:",
             "- Make MINIMUM change needed to fix the error",
@@ -864,6 +1078,7 @@ class Fixer:
             file_content_before=file_before,
             file_content_after=fixed_content,
             success=success,
+            diff_mode="apply_diff" if handler._used_diff else "write_file",
         )
 
     # ── Error Collection ───────────────────────────────────────────

@@ -99,6 +99,11 @@ class ContextEngine:
         ctx:{run_id}:chunk:{id}:N → chunk N of large content
     """
 
+    # REVIEW-FIX: Threshold for offloading content to object store.
+    # Content >64KB is stored in GCS/local store (durable), with a reference
+    # pointer left in Valkey. Content <=64KB stays in Valkey (fast path).
+    _OFFLOAD_THRESHOLD = 64 * 1024  # 64 KB
+
     def __init__(self, redis_client: Any) -> None:
         """Initialize with an async Redis/Valkey client.
 
@@ -108,6 +113,13 @@ class ContextEngine:
         self._redis = redis_client
         self._ttl = _DEFAULT_TTL_SECONDS
         self._chunk_size = _DEFAULT_CHUNK_SIZE
+        # REVIEW-FIX: Optional object store for large content
+        self._object_store = None
+        try:
+            from app.services.object_store import get_object_store
+            self._object_store = get_object_store()
+        except Exception:
+            pass  # No object store — all content stays in Valkey
 
     # ── Write Operations ────────────────────────────────────────────
 
@@ -140,6 +152,29 @@ class ContextEngine:
         content_hash = compute_content_hash(content_bytes)
         entry_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+
+        # REVIEW-FIX: Offload large content to object store (GCS/local).
+        # Valkey stores a reference pointer instead. Small content stays in Valkey.
+        offloaded = False
+        if self._object_store is not None and len(content_bytes) > self._OFFLOAD_THRESHOLD:
+            obj_key = f"ctx/{pipeline_run_id}/{step_name}/{entry_id}"
+            try:
+                await self._object_store.put(obj_key, content_bytes)
+                offloaded = True
+                logger.info(
+                    "content_offloaded",
+                    pipeline_run_id=pipeline_run_id,
+                    step=step_name,
+                    size=len(content_bytes),
+                    obj_key=obj_key,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "content_offload_failed",
+                    step=step_name,
+                    error=str(exc),
+                )
+                # Fall back to Valkey storage
 
         # Determine chunking
         chunk_count = (len(content_bytes) + self._chunk_size - 1) // self._chunk_size
@@ -205,12 +240,25 @@ class ContextEngine:
             }
             pipe.set(entry_key, orjson.dumps(entry_meta), ex=self._ttl)
 
-            # Store content chunks
-            for i in range(chunk_count):
-                start = i * self._chunk_size
-                end = start + self._chunk_size
-                chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
-                pipe.set(chunk_key, content_bytes[start:end], ex=self._ttl)
+            # Store content chunks (or reference pointer if offloaded)
+            if offloaded:
+                # REVIEW-FIX: Content is in object store — store a reference pointer
+                from app.services.object_store import make_ref
+                ref_key = f"ctx/{pipeline_run_id}/{step_name}/{entry_id}"
+                ref_bytes = make_ref(ref_key, content_hash)
+                chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:0"
+                pipe.set(chunk_key, ref_bytes, ex=self._ttl)
+                # Override chunk_count to 1 (reference is a single value)
+                chunk_count = 1
+                entry_meta["chunk_count"] = 1
+                # Re-set entry metadata with updated chunk_count
+                pipe.set(entry_key, orjson.dumps(entry_meta), ex=self._ttl)
+            else:
+                for i in range(chunk_count):
+                    start = i * self._chunk_size
+                    end = start + self._chunk_size
+                    chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
+                    pipe.set(chunk_key, content_bytes[start:end], ex=self._ttl)
 
             # Update chain list and step index
             chain_key = f"ctx:{pipeline_run_id}:chain"
@@ -507,24 +555,41 @@ class ContextEngine:
     async def _reassemble_chunks(
         self, pipeline_run_id: str, entry_id: str, chunk_count: int
     ) -> bytes:
-        """Reassemble chunked content from Valkey."""
+        """Reassemble chunked content from Valkey or object store."""
         if chunk_count == 1:
             chunk_key = f"ctx:{pipeline_run_id}:chunk:{entry_id}:0"
             data = await self._redis.get(chunk_key)
             # R25-FIX-12: Raise ContextIntegrityError on missing single chunk.
-            # Previously returned b"" silently, which downstream code parsed as
-            # empty JSON (orjson.loads(b"") → error) or returned {"_raw": ""}.
-            # Multi-chunk already raises ContextIntegrityError on any missing
-            # chunk — single-chunk must have the same fail-closed semantics.
             if data is None:
                 logger.error("chunk_missing", entry_id=entry_id, chunk=0)
                 raise ContextIntegrityError(f"Missing chunk 0 for entry {entry_id}")
+
+            # REVIEW-FIX: Check if this is an object store reference pointer.
+            # If so, fetch the actual content from GCS/local store.
+            from app.services.object_store import is_object_ref, parse_ref
+            if is_object_ref(data):
+                obj_key, expected_hash = parse_ref(data)
+                if self._object_store is None:
+                    raise ContextIntegrityError(
+                        f"Object store reference found but no object store configured "
+                        f"(key={obj_key})"
+                    )
+                content = await self._object_store.get(obj_key)
+                if content is None:
+                    raise ContextIntegrityError(
+                        f"Object store content missing for key={obj_key}"
+                    )
+                # Verify hash integrity
+                actual_hash = compute_content_hash(content)
+                if actual_hash != expected_hash:
+                    raise ContextIntegrityError(
+                        f"Object store content hash mismatch for key={obj_key}"
+                    )
+                return content
+
             return data
 
-        # R27-FIX-12: Use MGET instead of sequential GETs.  For N chunks this
-        # reduces N round-trips to 1 and provides a consistent read snapshot
-        # (no TOCTOU between individual GETs if a concurrent clear_pipeline
-        # deletes keys between reads).
+        # R27-FIX-12: Use MGET instead of sequential GETs.
         chunk_keys = [
             f"ctx:{pipeline_run_id}:chunk:{entry_id}:{i}"
             for i in range(chunk_count)

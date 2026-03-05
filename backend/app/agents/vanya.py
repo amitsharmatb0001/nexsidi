@@ -3,6 +3,10 @@
 Vanya produces design specifications BEFORE code generation, so that
 Shubham (backend) and Aanya (frontend) have a consistent visual language.
 
+REVIEW-FIX: Converted from single-shot call_ai() to agentic call_ai_with_tools()
+with self-validation tools. Vanya can now validate design tokens (contrast ratios,
+spacing scale), validate page specs, and iteratively refine before finalizing.
+
 Output:
 - Design tokens (colors, fonts, spacing, borders, shadows)
 - Page wireframe descriptions (layout, components, interactions)
@@ -12,6 +16,8 @@ Output:
 
 from __future__ import annotations
 
+import json as _json
+import re as _re
 from typing import Any
 
 import structlog
@@ -19,7 +25,8 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
-    call_ai,
+    ToolDefinition,
+    call_ai_with_tools,
     register_agent,
     run_agent,
     store_output,
@@ -27,6 +34,184 @@ from app.agents.base import (
 from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int] | None:
+    """Convert hex color to RGB tuple."""
+    hex_color = hex_color.strip().lstrip("#")
+    if len(hex_color) == 3:
+        hex_color = "".join(c * 2 for c in hex_color)
+    if len(hex_color) != 6 or not all(c in "0123456789abcdefABCDEF" for c in hex_color):
+        return None
+    return (int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
+
+
+def _relative_luminance(r: int, g: int, b: int) -> float:
+    """Calculate relative luminance per WCAG 2.1."""
+    def _linearize(c: int) -> float:
+        s = c / 255.0
+        return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
+    return 0.2126 * _linearize(r) + 0.7152 * _linearize(g) + 0.0722 * _linearize(b)
+
+
+def _contrast_ratio(rgb1: tuple[int, int, int], rgb2: tuple[int, int, int]) -> float:
+    """Calculate WCAG contrast ratio between two colors."""
+    l1 = _relative_luminance(*rgb1)
+    l2 = _relative_luminance(*rgb2)
+    lighter = max(l1, l2)
+    darker = min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+class VanyaToolHandler:
+    """Handles tool calls for Vanya's agentic design spec loop."""
+
+    def __init__(self) -> None:
+        self._design_spec: dict[str, Any] | None = None
+        self._tokens_validated: bool = False
+        self._spec_validated: bool = False
+        self._complete: bool = False
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name == "validate_tokens":
+            return self._validate_tokens(tool_input["tokens_json"])
+        elif tool_name == "validate_page_specs":
+            return self._validate_page_specs(tool_input["page_specs_json"])
+        elif tool_name == "write_design_spec":
+            return self._write_design_spec(tool_input["spec"])
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _validate_tokens(self, tokens_json: str) -> str:
+        """Validate design tokens: check colors, contrast, spacing scale."""
+        try:
+            tokens = _json.loads(tokens_json)
+        except _json.JSONDecodeError as e:
+            return f"Validation FAILED: invalid JSON — {e}"
+
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        # -- Colors validation --
+        colors = tokens.get("colors", {})
+        if not isinstance(colors, dict):
+            errors.append("'colors' must be an object")
+        else:
+            required_colors = [
+                "primary", "secondary", "background", "surface",
+                "text_primary", "text_secondary", "error", "success",
+            ]
+            for color_name in required_colors:
+                val = colors.get(color_name)
+                if not val:
+                    errors.append(f"Missing color: '{color_name}'")
+                elif not isinstance(val, str) or not _re.match(r"^#[0-9a-fA-F]{3,8}$", val.strip()):
+                    errors.append(f"Color '{color_name}' must be a valid hex (got '{val}')")
+
+            # WCAG contrast checks
+            bg_rgb = _hex_to_rgb(colors.get("background", ""))
+            text_rgb = _hex_to_rgb(colors.get("text_primary", ""))
+            if bg_rgb and text_rgb:
+                ratio = _contrast_ratio(bg_rgb, text_rgb)
+                if ratio < 4.5:
+                    errors.append(
+                        f"WCAG AA FAIL: text_primary on background has contrast "
+                        f"{ratio:.1f}:1 (need >= 4.5:1)"
+                    )
+                elif ratio < 7.0:
+                    warnings.append(
+                        f"WCAG AAA: text_primary on background has contrast "
+                        f"{ratio:.1f}:1 (AAA needs >= 7:1)"
+                    )
+
+            text2_rgb = _hex_to_rgb(colors.get("text_secondary", ""))
+            if bg_rgb and text2_rgb:
+                ratio = _contrast_ratio(bg_rgb, text2_rgb)
+                if ratio < 4.5:
+                    errors.append(
+                        f"WCAG AA FAIL: text_secondary on background has contrast "
+                        f"{ratio:.1f}:1 (need >= 4.5:1)"
+                    )
+
+        # -- Typography validation --
+        typo = tokens.get("typography", {})
+        if not isinstance(typo, dict):
+            errors.append("'typography' must be an object")
+        else:
+            if not typo.get("font_family"):
+                errors.append("Typography missing 'font_family'")
+
+        # -- Spacing validation --
+        spacing = tokens.get("spacing", {})
+        if not isinstance(spacing, dict):
+            errors.append("'spacing' must be an object")
+        else:
+            required_spacing = ["xs", "sm", "md", "lg", "xl"]
+            for sp in required_spacing:
+                if sp not in spacing:
+                    errors.append(f"Spacing missing '{sp}'")
+
+        result_parts = []
+        if errors:
+            result_parts.append("Validation FAILED:\n" + "\n".join(f"- {e}" for e in errors))
+        if warnings:
+            result_parts.append("Warnings:\n" + "\n".join(f"- {w}" for w in warnings))
+        if not errors:
+            self._tokens_validated = True
+            result_parts.append("Design tokens validation PASSED")
+
+        return "\n\n".join(result_parts)
+
+    def _validate_page_specs(self, page_specs_json: str) -> str:
+        """Validate page specifications structure."""
+        try:
+            specs = _json.loads(page_specs_json)
+        except _json.JSONDecodeError as e:
+            return f"Validation FAILED: invalid JSON — {e}"
+
+        if not isinstance(specs, list):
+            return "Validation FAILED: page_specs must be an array"
+
+        if len(specs) == 0:
+            return "Validation FAILED: page_specs is empty — at least 1 page required"
+
+        errors: list[str] = []
+        for i, page in enumerate(specs):
+            if not isinstance(page, dict):
+                errors.append(f"Page [{i}]: must be an object")
+                continue
+            if not page.get("name"):
+                errors.append(f"Page [{i}]: missing 'name'")
+            if not page.get("route"):
+                errors.append(f"Page [{i}]: missing 'route'")
+            if not page.get("layout_type"):
+                errors.append(f"Page [{i}]: missing 'layout_type'")
+            sections = page.get("sections", [])
+            if not isinstance(sections, list) or len(sections) == 0:
+                errors.append(f"Page [{i}] '{page.get('name', '?')}': missing or empty 'sections'")
+
+        if errors:
+            return "Validation FAILED:\n" + "\n".join(f"- {e}" for e in errors)
+
+        self._spec_validated = True
+        return f"Page specs validation PASSED ({len(specs)} pages verified)"
+
+    def _write_design_spec(self, spec: str) -> str:
+        """Finalize and store the design specification."""
+        try:
+            data = _json.loads(spec) if isinstance(spec, str) else spec
+        except _json.JSONDecodeError as e:
+            return f"Error: invalid JSON in write_design_spec — {e}"
+
+        if not self._tokens_validated:
+            return "Error: call validate_tokens first to ensure design tokens are correct"
+
+        if not self._spec_validated:
+            return "Error: call validate_page_specs first to ensure page specs are correct"
+
+        self._design_spec = data
+        self._complete = True
+        return "Design specification written successfully. Task complete."
 
 
 class Vanya:
@@ -37,10 +222,77 @@ class Vanya:
     default_complexity = TaskComplexity.MEDIUM
     default_model: str | None = None
 
+    def __init__(self) -> None:
+        self._tools: dict[str, ToolDefinition] = {}
+
+        self.register_tool(ToolDefinition(
+            name="validate_tokens",
+            description=(
+                "Validate design tokens JSON for completeness and WCAG compliance. "
+                "Checks that all required colors exist and are valid hex values, "
+                "verifies WCAG 2.1 AA contrast ratios (text on background >= 4.5:1), "
+                "checks typography and spacing scale completeness. "
+                "ALWAYS call this before write_design_spec."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tokens_json": {
+                        "type": "string",
+                        "description": "JSON string containing design_tokens object.",
+                    },
+                },
+                "required": ["tokens_json"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="validate_page_specs",
+            description=(
+                "Validate page specifications for structural correctness. "
+                "Checks that each page has name, route, layout_type, and sections. "
+                "ALWAYS call this before write_design_spec."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "page_specs_json": {
+                        "type": "string",
+                        "description": "JSON string containing page_specs array.",
+                    },
+                },
+                "required": ["page_specs_json"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="write_design_spec",
+            description=(
+                "Finalize and store the complete design specification. "
+                "Call AFTER both validate_tokens and validate_page_specs pass. "
+                "Signals task completion."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "string",
+                        "description": (
+                            "The complete design spec JSON with keys: "
+                            "design_tokens, page_specs, component_specs."
+                        ),
+                    },
+                },
+                "required": ["spec"],
+            },
+        ))
+
+    def register_tool(self, tool: ToolDefinition) -> None:
+        self._tools[tool.name] = tool
+
     @property
-    def tools(self) -> list:
-        """No tools — Vanya is a single-shot design spec generator."""
-        return []
+    def tools(self) -> list[ToolDefinition]:
+        return list(self._tools.values())
 
     async def run(
         self,
@@ -92,7 +344,16 @@ class Vanya:
             "}\n\n"
             "Design should be modern, clean, and professional. "
             "Use a neutral color palette with one accent color. "
-            "Ensure WCAG 2.1 AA contrast ratios."
+            "Ensure WCAG 2.1 AA contrast ratios.\n\n"
+            "## WORKFLOW (use tools in this order):\n"
+            "1. Generate design tokens with WCAG-compliant colors\n"
+            "2. Call validate_tokens to verify contrast ratios and completeness\n"
+            "3. If validation fails, fix the issues and re-validate\n"
+            "4. Generate page specs for all pages\n"
+            "5. Call validate_page_specs to verify structure\n"
+            "6. If validation fails, fix and re-validate\n"
+            "7. Once both validations pass, call write_design_spec with the "
+            "complete spec (design_tokens + page_specs + component_specs)"
         )
 
         import orjson
@@ -107,12 +368,16 @@ class Vanya:
             "Generate the UI/UX design specification for the pages described above."
         )
 
+        handler = VanyaToolHandler()
+
         try:
-            response = await call_ai(self, 
+            response = await call_ai_with_tools(
+                agent=self,
                 messages=[{"role": "user", "content": user_content}],
                 system_prompt=system_prompt,
                 task_type="general",
-                temperature=0.5,  # Moderate creativity for design
+                tool_handler=handler,
+                max_tool_rounds=10,
             )
         except Exception as exc:
             # R21-FIX: Sanitize exception to prevent API key leakage.
@@ -123,8 +388,13 @@ class Vanya:
                 error=f"AI call failed: {_sanitize_error(exc)}",
             )
 
+        # Use tool handler's validated spec if available
+        design_spec = handler._design_spec or response.content
+
         output = {
-            "design_spec": response.content,
+            "design_spec": design_spec,
+            "tokens_validated": handler._tokens_validated,
+            "spec_validated": handler._spec_validated,
             "page_count": len(pages),
             "model_used": response.model_used,
             "tokens": {

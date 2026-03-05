@@ -1038,3 +1038,66 @@ async def preview_project(run_id: str, ctx: CurrentContext) -> HTMLResponse:
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+# ── Complexity Estimation ─────────────────────────────────────────────
+
+
+@router.post(
+    "/estimate",
+    summary="Estimate project complexity and cost",
+    response_description="Complexity score, pricing tier, estimated cost and duration",
+)
+async def estimate_pipeline(
+    body: dict,
+    ctx: CurrentContext,
+) -> dict:
+    """REVIEW-FIX: Pre-pipeline cost estimation endpoint.
+
+    Computes project complexity score (heuristic, no AI call) and estimates:
+    - Complexity score (1-10) with dimensional breakdown
+    - Pricing tier (basic/standard/professional/enterprise)
+    - Estimated AI API cost (USD/INR)
+    - Estimated pipeline duration (minutes)
+    - Detected entities and features
+
+    Request body:
+        description: Project description text
+        tech_stack: Optional dict with keys like "backend", "frontend", "database"
+
+    Returns instantly — no AI calls involved.
+    """
+    description = body.get("description", "")
+    tech_stack = body.get("tech_stack")
+
+    if not description or len(description.strip()) < 10:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="description must be at least 10 characters",
+        )
+
+    from app.services.complexity_scorer import score_complexity
+
+    result = score_complexity(description=description, tech_stack=tech_stack)
+
+    return {
+        "complexity": {
+            "overall_score": result.overall_score,
+            "dimensions": result.dimensions,
+            "tier": result.tier,
+        },
+        "pricing": {
+            "tier": result.tier,
+            "price_inr": result.pricing_inr,
+            "price_usd": result.pricing_usd,
+        },
+        "estimate": {
+            "ai_cost_usd": result.estimated_cost_usd,
+            "ai_cost_inr": round(result.estimated_cost_usd * 84.0, 2),
+            "duration_minutes": result.estimated_duration_minutes,
+        },
+        "analysis": {
+            "entities_detected": result.entities_detected,
+            "features_detected": result.features_detected,
+        },
+    }
