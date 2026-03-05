@@ -118,23 +118,23 @@ _MODEL_ID_TO_KEY: dict[str, str] = {
     "gemini-2.5-pro": "gemini-pro",
     "gemini-2.5-flash": "gemini-flash",
     "gemini-3-flash-preview": "gemini-3-flash",
-    "gemini-3-pro-preview": "gemini-3-pro",
+    "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
     "gemini-3.1-pro-preview": "gemini-3.1-pro",
 }
 
 # Remap targets when an agent's default model doesn't match the mode
 _CLAUDE_TO_GEMINI: dict[str, str] = {
     "haiku": "gemini-flash",
-    "sonnet-4.5": "gemini-3-pro",
-    "sonnet": "gemini-3-pro",
+    "sonnet-4.5": "gemini-3.1-flash-lite",
+    "sonnet": "gemini-3.1-flash-lite",
     "opus": "gemini-3.1-pro",
 }
 # M4-FIX: gemini-pro is tier 2, maps to sonnet-4.5 (tier 3) not haiku (tier 1)
 _GEMINI_TO_CLAUDE: dict[str, str] = {
     "gemini-flash": "haiku",          # tier 1 → tier 1
     "gemini-pro": "sonnet-4.5",       # tier 2 → tier 3 (was haiku — wrong tier)
-    "gemini-3-flash": "haiku",        # tier 2 → tier 1 (budget model)
-    "gemini-3-pro": "sonnet",         # tier 3 → tier 3
+    "gemini-3-flash": "haiku",            # tier 2 → tier 1 (budget model)
+    "gemini-3.1-flash-lite": "sonnet",   # tier 3 → tier 3
     "gemini-3.1-pro": "opus",         # tier 4 → tier 5
 }
 
@@ -166,7 +166,7 @@ def resolve_model_override(agent_default_model: str | None) -> str | None:
 
     spec = MODELS[key]
     if mode == "gemini" and spec.provider == Provider.ANTHROPIC:
-        return _CLAUDE_TO_GEMINI.get(key, "gemini-3-pro")
+        return _CLAUDE_TO_GEMINI.get(key, "gemini-3.1-flash-lite")
     if mode == "claude" and spec.provider == Provider.GOOGLE:
         return _GEMINI_TO_CLAUDE.get(key, "sonnet")
 

@@ -122,12 +122,10 @@ MODELS: dict[str, ModelSpec] = {
         supports_thinking=True,
         max_output_tokens=65536,
     ),
-    # MODEL-FIX: gemini-3-flash-preview doesn't exist on Vertex AI yet.
-    # Use gemini-2.5-flash (best available flash model).
     "gemini-3-flash": ModelSpec(
-        model_id="gemini-2.5-flash",
+        model_id="gemini-3-flash-preview",
         provider=Provider.GOOGLE,
-        display_name="Gemini 2.5 Flash (Mid)",
+        display_name="Gemini 3 Flash Preview",
         cost_tier=2,
         supports_thinking=True,
         max_output_tokens=65536,
@@ -149,22 +147,19 @@ MODELS: dict[str, ModelSpec] = {
         supports_thinking=True,
         max_output_tokens=64000,
     ),
-    # MODEL-FIX: gemini-3-pro-preview and gemini-3.1-pro-preview don't exist
-    # on Vertex AI yet. Use gemini-2.5-pro (the best available Gemini model)
-    # for high/critical complexity tasks until Gemini 3 is released.
-    "gemini-3-pro": ModelSpec(
-        model_id="gemini-2.5-pro",
+    "gemini-3.1-flash-lite": ModelSpec(
+        model_id="gemini-3.1-flash-lite-preview",
         provider=Provider.GOOGLE,
-        display_name="Gemini 2.5 Pro (High)",
+        display_name="Gemini 3.1 Flash Lite Preview",
         cost_tier=3,
         supports_thinking=True,
         max_output_tokens=65536,
     ),
     # ── Tier 4: Advanced reasoning ──
     "gemini-3.1-pro": ModelSpec(
-        model_id="gemini-2.5-pro",
+        model_id="gemini-3.1-pro-preview",
         provider=Provider.GOOGLE,
-        display_name="Gemini 2.5 Pro (Critical)",
+        display_name="Gemini 3.1 Pro Preview",
         cost_tier=4,
         supports_thinking=True,
         max_output_tokens=65536,
@@ -188,7 +183,7 @@ ESCALATION_CHAIN: list[str] = [
     "gemini-3-flash",
     "sonnet-4.5",
     "sonnet",
-    "gemini-3-pro",
+    "gemini-3.1-flash-lite",
     "gemini-3.1-pro",
     "opus",
 ]
@@ -231,7 +226,7 @@ _MODE_COMPLEXITY_MAP: dict[str, dict[TaskComplexity, str]] = {
     "gemini": {
         TaskComplexity.LOW: "gemini-flash",
         TaskComplexity.MEDIUM: "gemini-pro",
-        TaskComplexity.HIGH: "gemini-3-pro",
+        TaskComplexity.HIGH: "gemini-3.1-flash-lite",
         TaskComplexity.CRITICAL: "gemini-3.1-pro",
     },
     "claude": {
@@ -244,13 +239,13 @@ _MODE_COMPLEXITY_MAP: dict[str, dict[TaskComplexity, str]] = {
 
 _MODE_SECURITY_MODEL: dict[str, str] = {
     "mixed": "sonnet",
-    "gemini": "gemini-3-pro",
+    "gemini": "gemini-3.1-flash-lite",
     "claude": "sonnet",
 }
 
 _MODE_GENERATION_MAP: dict[str, dict[str, str]] = {
     "mixed": {"small": "gemini-flash", "medium": "sonnet", "large": "opus"},
-    "gemini": {"small": "gemini-flash", "medium": "gemini-3-pro", "large": "gemini-3.1-pro"},
+    "gemini": {"small": "gemini-flash", "medium": "gemini-3.1-flash-lite", "large": "gemini-3.1-pro"},
     "claude": {"small": "haiku", "medium": "sonnet", "large": "opus"},
 }
 
@@ -1816,7 +1811,7 @@ _COST_PER_1K_TOKENS: dict[str, dict[str, float]] = {
     "gemini-3-flash": {"input": 0.0002, "output": 0.0008},
     "sonnet-4.5": {"input": 0.003, "output": 0.015},
     "sonnet": {"input": 0.003, "output": 0.015},
-    "gemini-3-pro": {"input": 0.00175, "output": 0.007},
+    "gemini-3.1-flash-lite": {"input": 0.0002, "output": 0.0008},
     "gemini-3.1-pro": {"input": 0.00175, "output": 0.007},
     "opus": {"input": 0.015, "output": 0.075},
 }

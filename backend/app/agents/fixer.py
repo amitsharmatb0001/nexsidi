@@ -56,8 +56,8 @@ _ITERATION_MODELS: dict[str, dict[int, tuple[str, bool]]] = {
     "gemini": {
         1: ("gemini-pro", False),
         2: ("gemini-pro", False),
-        3: ("gemini-3-pro", False),
-        4: ("gemini-3-pro", False),
+        3: ("gemini-3.1-flash-lite", False),
+        4: ("gemini-3.1-flash-lite", False),
         5: ("gemini-3.1-pro", True),
     },
     "claude": {

@@ -31,7 +31,7 @@ MODEL_TOKEN_LIMITS: dict[str, int] = {
     "gemini-flash": 128_000,
     "gemini-pro": 128_000,
     "gemini-3-flash": 128_000,
-    "gemini-3-pro": 128_000,
+    "gemini-3.1-flash-lite": 128_000,
     "gemini-3.1-pro": 128_000,
 }
 

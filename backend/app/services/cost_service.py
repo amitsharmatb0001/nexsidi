@@ -14,8 +14,11 @@ _ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     "claude-haiku-4-6": {"input": 0.8, "output": 4.0, "cache_read": 0.08, "cache_write": 1.0},
 }
 _GEMINI_PRICING: dict[str, dict[str, float]] = {
-    "gemini-2.0-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.0, "cache_write": 0.0},
-    "gemini-1.5-pro": {"input": 1.25, "output": 5.0, "cache_read": 0.3125, "cache_write": 0.0},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.0, "cache_write": 0.0},
+    "gemini-2.5-pro": {"input": 1.25, "output": 5.0, "cache_read": 0.3125, "cache_write": 0.0},
+    "gemini-3-flash-preview": {"input": 0.20, "output": 0.8, "cache_read": 0.0, "cache_write": 0.0},
+    "gemini-3.1-flash-lite-preview": {"input": 0.20, "output": 0.8, "cache_read": 0.0, "cache_write": 0.0},
+    "gemini-3.1-pro-preview": {"input": 1.75, "output": 7.0, "cache_read": 0.0, "cache_write": 0.0},
 }
 _ALL_PRICING = {**_ANTHROPIC_PRICING, **_GEMINI_PRICING}
 _USD_TO_INR = 84.0  # approximate
