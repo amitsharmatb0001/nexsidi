@@ -665,6 +665,11 @@ class Karan:
         self._scan_ts_security(all_files, report)
         self._scan_dpdp_compliance(all_files, report)
 
+        # Phase 1b (F15-FIX): AST-based Python analysis
+        # Catches obfuscated patterns that regex misses, like
+        # getattr(os, "system")(...), aliased imports, and indirect calls.
+        self._scan_python_ast(all_files, report)
+
         # Phase 2: AI-powered deep analysis (agentic tool loop — no file cap)
         await self._ai_deep_scan(all_files, context, report, pipeline_run_id=pipeline_run_id)
 
@@ -870,6 +875,127 @@ class Karan:
                 ))
 
     # ── AI-Powered Deep Scan ───────────────────────────────────────
+
+    def _scan_python_ast(
+        self, files: dict[str, str], report: SecurityReport,
+    ) -> None:
+        """F15-FIX: AST-based Python security analysis.
+
+        Catches obfuscated patterns that regex misses:
+        - getattr(os, "system")(cmd)  — indirect dangerous call
+        - aliased imports: from os import system as _s
+        - eval/exec/compile hidden behind variable names
+        - pickle.loads / marshal.loads via attribute chains
+        """
+        import ast
+
+        # Dangerous function names to detect at call sites
+        _DANGEROUS_CALLS: set[str] = {
+            "eval", "exec", "compile", "__import__",
+        }
+        # Dangerous module.function pairs to detect via attribute access
+        _DANGEROUS_ATTRS: dict[str, set[str]] = {
+            "os": {"system", "popen", "exec", "execv", "execve", "execvp"},
+            "subprocess": {"call", "run", "Popen", "check_output", "check_call"},
+            "pickle": {"loads", "load"},
+            "marshal": {"loads", "load"},
+            "yaml": {"load"},
+            "shelve": {"open"},
+        }
+
+        for path, content in files.items():
+            if not path.endswith(".py"):
+                continue
+            try:
+                tree = ast.parse(content, filename=path)
+            except SyntaxError:
+                continue  # Skip unparseable files
+
+            # Track aliased imports: {alias: (module, name)}
+            import_aliases: dict[str, tuple[str, str]] = {}
+
+            for node in ast.walk(tree):
+                # Track "from os import system as _s" style imports
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    mod = node.module.split(".")[0]
+                    if mod in _DANGEROUS_ATTRS:
+                        for alias in node.names:
+                            local_name = alias.asname or alias.name
+                            import_aliases[local_name] = (mod, alias.name)
+
+                # Detect direct dangerous calls: eval(...), exec(...)
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    # Direct name call: eval(...), exec(...)
+                    if isinstance(func, ast.Name) and func.id in _DANGEROUS_CALLS:
+                        report.add(SecurityFinding(
+                            severity=FindingSeverity.CRITICAL,
+                            category=FindingCategory.COMMAND_INJECTION,
+                            file_path=path,
+                            line=node.lineno,
+                            title=f"Dangerous call: {func.id}()",
+                            description=f"AST detected direct call to {func.id}() — arbitrary code execution risk",
+                            fix_hint=f"Remove {func.id}() or use a safe alternative",
+                            cwe_id="CWE-94",
+                        ))
+                    # Aliased call: _s(cmd) where _s = os.system
+                    elif isinstance(func, ast.Name) and func.id in import_aliases:
+                        mod, orig = import_aliases[func.id]
+                        if orig in _DANGEROUS_ATTRS.get(mod, set()):
+                            report.add(SecurityFinding(
+                                severity=FindingSeverity.HIGH,
+                                category=FindingCategory.COMMAND_INJECTION,
+                                file_path=path,
+                                line=node.lineno,
+                                title=f"Aliased dangerous call: {func.id}() (from {mod}.{orig})",
+                                description=f"AST detected aliased import of {mod}.{orig}",
+                                fix_hint=f"Remove aliased import of {mod}.{orig}",
+                                cwe_id="CWE-94",
+                            ))
+                    # Attribute call: os.system(...), pickle.loads(...)
+                    elif isinstance(func, ast.Attribute):
+                        if isinstance(func.value, ast.Name):
+                            mod_name = func.value.id
+                            attr_name = func.attr
+                            if attr_name in _DANGEROUS_ATTRS.get(mod_name, set()):
+                                report.add(SecurityFinding(
+                                    severity=FindingSeverity.HIGH,
+                                    category=FindingCategory.COMMAND_INJECTION,
+                                    file_path=path,
+                                    line=node.lineno,
+                                    title=f"Dangerous call: {mod_name}.{attr_name}()",
+                                    description=f"AST detected call to {mod_name}.{attr_name}()",
+                                    fix_hint=f"Use a safe alternative to {mod_name}.{attr_name}",
+                                    cwe_id="CWE-78" if mod_name == "os" else "CWE-94",
+                                ))
+
+                    # getattr(os, "system")(...) pattern
+                    if (
+                        isinstance(func, ast.Call)
+                        and isinstance(func.func, ast.Name)
+                        and func.func.id == "getattr"
+                        and len(func.args) >= 2
+                    ):
+                        target = func.args[0]
+                        attr_arg = func.args[1]
+                        if (
+                            isinstance(target, ast.Name)
+                            and isinstance(attr_arg, ast.Constant)
+                            and isinstance(attr_arg.value, str)
+                        ):
+                            mod_name = target.id
+                            attr_name = attr_arg.value
+                            if attr_name in _DANGEROUS_ATTRS.get(mod_name, set()):
+                                report.add(SecurityFinding(
+                                    severity=FindingSeverity.CRITICAL,
+                                    category=FindingCategory.COMMAND_INJECTION,
+                                    file_path=path,
+                                    line=node.lineno,
+                                    title=f"Obfuscated dangerous call: getattr({mod_name}, \"{attr_name}\")",
+                                    description="AST detected getattr-based evasion of dangerous function",
+                                    fix_hint="Remove obfuscated call pattern",
+                                    cwe_id="CWE-94",
+                                ))
 
     async def _ai_deep_scan(
         self, files: dict[str, str], context: dict[str, Any], report: SecurityReport,

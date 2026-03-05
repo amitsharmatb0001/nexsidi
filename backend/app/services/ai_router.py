@@ -39,6 +39,27 @@ class PipelineCostLimitError(RuntimeError):
     """Pipeline cost exceeded _HARD_CAP_USD; raised inside ProjectCostTracker.record()."""
 
 
+# F6-FIX: Module-level registry mapping run_id → ProjectCostTracker.
+# Lives here (not pipeline.py) so AIRouter.call() can do pre-flight cost checks
+# without circular imports.
+_ACTIVE_COST_TRACKERS: dict[str, "ProjectCostTracker"] = {}
+
+
+def register_cost_tracker(run_id: str, tracker: "ProjectCostTracker") -> None:
+    """F6-FIX: Register a cost tracker so AIRouter.call() can pre-flight check."""
+    _ACTIVE_COST_TRACKERS[run_id] = tracker
+
+
+def unregister_cost_tracker(run_id: str) -> None:
+    """F6-FIX: Unregister a cost tracker when pipeline completes."""
+    _ACTIVE_COST_TRACKERS.pop(run_id, None)
+
+
+def get_active_cost_tracker(run_id: str) -> "ProjectCostTracker | None":
+    """F6-FIX: Get a registered cost tracker by run_id."""
+    return _ACTIVE_COST_TRACKERS.get(run_id)
+
+
 def _sanitize_error(exc: Exception) -> str:
     """S-4-FIX: Sanitize exception messages to prevent API key leakage.
 
@@ -476,6 +497,7 @@ class AIRequest:
     tools: list[dict[str, Any]] | None = None  # Tool definitions for tool use
     shared_context: SharedContext | None = None  # Cacheable shared project context
     dynamic_system_context: str | None = None  # CACHE-FIX: appended to system AFTER cached blocks
+    pipeline_run_id: str | None = None  # F6-FIX: for pre-flight cost cap check
 
 
 @dataclass(slots=True)
@@ -493,6 +515,7 @@ class AIResponse:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str = "end_turn"  # "end_turn", "max_tokens", "stop_sequence", "STOP", "MAX_TOKENS"
     was_truncated: bool = False  # True when response was cut off by token limit
+    security_downgraded: bool = False  # F7-FIX: True when security task used non-Sonnet model
 
 
 # ── AI Router ───────────────────────────────────────────────────────
@@ -595,6 +618,17 @@ class AIRouter:
         if request.task_type in SECURITY_CRITICAL_TASKS:
             security_key = _MODE_SECURITY_MODEL[mode]
             security_spec = MODELS[security_key]
+            # F7-FIX: Warn when security task uses non-Sonnet model
+            if security_key not in ("sonnet", "sonnet-4.5"):
+                logger.warning(
+                    "security_model_downgrade",
+                    task_type=request.task_type,
+                    model=security_key,
+                    mode=mode,
+                    recommended="sonnet",
+                    msg="Security task routed to non-Sonnet model. "
+                        "Set enable_claude=true for security tasks.",
+                )
             if await self._circuits[security_spec.provider].is_available():
                 logger.info("security_override", task_type=request.task_type, model=security_key, mode=mode)
                 return security_spec
@@ -665,6 +699,19 @@ class AIRouter:
         spec = await self.select_model(request)
         start = time.monotonic()
         request_id = str(uuid.uuid4())
+
+        # F6-FIX: Pre-flight cost cap check BEFORE the AI call.
+        # If the estimated cost would push the pipeline over the hard cap,
+        # raise PipelineCostLimitError immediately (no API call, no billing).
+        if request.pipeline_run_id:
+            tracker = _ACTIVE_COST_TRACKERS.get(request.pipeline_run_id)
+            if tracker is not None:
+                # Estimate input tokens from message content length (rough: 1 token ≈ 4 chars)
+                est_input = max(
+                    sum(len(m.content) for m in request.messages) // 4,
+                    2000,  # minimum estimate
+                )
+                tracker.estimate_and_check(spec.display_name, estimated_input_tokens=est_input)
 
         logger.info(
             "ai_call_start",
@@ -1958,6 +2005,26 @@ class ProjectCostTracker:
         # M5-FIX: log warning when falling back to sonnet pricing
         logger.warning("cost_tracker_unknown_model_id", model_id=model_id)
         return "sonnet"  # Default fallback
+
+    def estimate_and_check(self, model_key: str, estimated_input_tokens: int = 4000) -> None:
+        """F6-FIX: Pre-flight cost check BEFORE making the AI call.
+
+        Estimates cost from model pricing and raises PipelineCostLimitError
+        if the estimated call would push total cost over the hard cap.
+        """
+        costs = _COST_PER_1K_TOKENS.get(model_key)
+        if costs is None:
+            costs = {"input": 0.003, "output": 0.015}
+        # Estimate: assume output ≈ input tokens (conservative)
+        est_input_cost = (estimated_input_tokens / 1000) * costs["input"]
+        est_output_cost = (estimated_input_tokens / 1000) * costs["output"]
+        est_total = est_input_cost + est_output_cost
+        if self._total_cost + est_total > self._HARD_CAP_USD:
+            raise PipelineCostLimitError(
+                f"Pre-flight check: estimated call cost ${est_total:.3f} "
+                f"would push total ${self._total_cost:.2f} over cap "
+                f"${self._HARD_CAP_USD:.2f}. Stopping before API call."
+            )
 
     @property
     def total_input_tokens(self) -> int:

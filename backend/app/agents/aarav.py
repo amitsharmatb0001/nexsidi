@@ -218,6 +218,19 @@ class Aarav:
                 return True
             return False
 
+        # Phase 0 (F11-FIX): Pre-build dependency security scan.
+        # Scan dependency files (requirements.txt, package.json) BEFORE Docker
+        # build. If a known-malicious package is declared, we catch it before
+        # `pip install` or `npm install` executes the package's setup.py.
+        pre_sec = await self._phase_pre_security_scan(context)
+        report.add(pre_sec)
+        # Non-blocking: pre-scan warnings don't stop the build, but they
+        # are recorded in the report for visibility.
+        if _check_timeout("pre_security_scan"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
         # Phase 1: Docker Build
         build_result = await self._phase_docker_build(
             pipeline_run_id, context, contract
@@ -857,6 +870,112 @@ class Aarav:
                     f"{critical_findings} critical/high"
                 ),
             )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            elapsed = (time.monotonic() - phase_start) * 1000
+            return TestPhaseResult(
+                phase=TestPhase.SECURITY_SCAN,
+                status=TestStatus.ERROR,
+                duration_ms=elapsed,
+                errors=[{"type": "exception", "details": _sanitize_error(exc)}],
+            )
+
+    async def _phase_pre_security_scan(
+        self,
+        context: dict[str, Any],
+    ) -> TestPhaseResult:
+        """F11-FIX: Pre-build static scan of dependency files.
+
+        Scans requirements.txt, package.json, etc. BEFORE Docker build to catch
+        known-malicious or suspicious packages before they're installed.
+        """
+        phase_start = time.monotonic()
+
+        try:
+            # Known dangerous/typosquat packages (non-exhaustive baseline)
+            _SUSPICIOUS_PACKAGES: set[str] = {
+                "python-binance",  # common typosquat target
+                "colourama",       # typosquat of colorama
+                "python-mongo",    # typosquat of pymongo
+                "nmap",            # security tool, rarely needed in apps
+                "requests-html",   # uses pyppeteer (headless Chrome)
+            }
+            _DANGEROUS_PATTERNS: list[str] = [
+                "git+http",   # Git dependencies bypass PyPI audit
+                "git+ssh",    # Same
+                "--extra-index-url",  # Third-party index injection
+            ]
+
+            findings: list[dict[str, str]] = []
+
+            # Collect dependency files from generated code
+            shubham = context.get("shubham", {})
+            file_contents: dict[str, str] = {}
+            if isinstance(shubham, dict):
+                file_contents.update(shubham.get("file_contents", {}))
+            aanya = context.get("aanya", {})
+            if isinstance(aanya, dict):
+                file_contents.update(aanya.get("file_contents", {}))
+
+            for path, content in file_contents.items():
+                if not isinstance(content, str):
+                    continue
+
+                # requirements.txt / requirements-dev.txt
+                if "requirements" in path.lower() and path.endswith(".txt"):
+                    for line_num, line in enumerate(content.splitlines(), 1):
+                        line_stripped = line.strip().lower()
+                        if not line_stripped or line_stripped.startswith("#"):
+                            continue
+                        pkg_name = line_stripped.split("==")[0].split(">=")[0].split("<=")[0].split("<")[0].split(">")[0].strip()
+                        if pkg_name in _SUSPICIOUS_PACKAGES:
+                            findings.append({"file": path, "line": str(line_num), "issue": f"Suspicious package: {pkg_name}"})
+                        for pattern in _DANGEROUS_PATTERNS:
+                            if pattern in line_stripped:
+                                findings.append({"file": path, "line": str(line_num), "issue": f"Dangerous pattern: {pattern}"})
+
+                # package.json
+                if path.endswith("package.json"):
+                    try:
+                        import json as _json
+                        pkg = _json.loads(content)
+                        for dep_type in ("dependencies", "devDependencies"):
+                            for dep_name, dep_ver in (pkg.get(dep_type, {}) or {}).items():
+                                if isinstance(dep_ver, str) and (
+                                    dep_ver.startswith("git") or dep_ver.startswith("http")
+                                ):
+                                    findings.append({
+                                        "file": path,
+                                        "line": dep_type,
+                                        "issue": f"Git/HTTP dependency: {dep_name}@{dep_ver}",
+                                    })
+                    except Exception:
+                        pass  # Unparseable package.json — will fail in build anyway
+
+            elapsed = (time.monotonic() - phase_start) * 1000
+
+            if findings:
+                logger.warning("pre_security_scan_findings", count=len(findings), findings=findings[:5])
+                return TestPhaseResult(
+                    phase=TestPhase.SECURITY_SCAN,
+                    status=TestStatus.PASSED if len(findings) < 5 else TestStatus.FAILED,
+                    duration_ms=elapsed,
+                    tests_total=len(file_contents),
+                    tests_passed=len(file_contents) - len(findings),
+                    tests_failed=len(findings),
+                    errors=[{"type": "pre_security", "details": f["issue"]} for f in findings[:10]],
+                    output=f"Pre-build security: {len(findings)} suspicious dependency pattern(s) found",
+                )
+            else:
+                return TestPhaseResult(
+                    phase=TestPhase.SECURITY_SCAN,
+                    status=TestStatus.PASSED,
+                    duration_ms=elapsed,
+                    tests_total=len(file_contents),
+                    tests_passed=len(file_contents),
+                    output=f"Pre-build security: {len(file_contents)} dependency files scanned, clean",
+                )
 
         except Exception as exc:
             from app.services.ai_router import _sanitize_error

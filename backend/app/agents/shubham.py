@@ -1243,10 +1243,16 @@ class Shubham:
             "",
         ])
 
-        # ── 3. Database DDL ──
+        # ── 3. Database DDL (F9-FIX: BINDING CONSTRAINT) ──
         if db_artifacts:
             prompt_parts.extend([
-                "## Database DDL (from Dhruv — use for models/schema generation)",
+                "## Database DDL — BINDING CONSTRAINT (from Dhruv)",
+                "**Your models MUST match this DDL exactly.**",
+                "- Table names, column names, types, and constraints are AUTHORITATIVE.",
+                "- Do NOT rename columns, add extra columns, or change types.",
+                "- If the DDL has `created_at TIMESTAMPTZ`, your model must use `DateTime(timezone=True)`, not `Date`.",
+                "- Foreign keys in the DDL define your ORM relationships.",
+                "",
                 db_artifacts,
                 "",
             ])

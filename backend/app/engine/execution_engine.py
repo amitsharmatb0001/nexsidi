@@ -91,6 +91,57 @@ def _check_docker_available() -> bool:
     return available
 
 
+# F10-FIX: gVisor runtime check
+_GVISOR_CHECKED: bool = False
+
+
+def check_gvisor_runtime() -> bool:
+    """F10-FIX: Check if gVisor (runsc) runtime is available in Docker.
+
+    If gVisor is not installed, Docker silently falls back to runc (the default
+    runtime), which provides NO syscall-level sandboxing. This function logs a
+    WARNING at startup if runsc is missing so operators know the sandbox is
+    running without kernel-level isolation.
+
+    Called once at app startup. Safe to call multiple times (caches result).
+
+    Returns:
+        True if gVisor (runsc) is available, False otherwise.
+    """
+    global _GVISOR_CHECKED
+    if _GVISOR_CHECKED:
+        return True  # Already checked this process
+
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            runtimes_json = result.stdout.strip()
+            has_gvisor = "runsc" in runtimes_json.lower()
+            if has_gvisor:
+                logger.info("gvisor_runtime_available", runtimes=runtimes_json[:200])
+            else:
+                logger.warning(
+                    "gvisor_runtime_missing",
+                    runtimes=runtimes_json[:200],
+                    msg="gVisor (runsc) not found in Docker runtimes. "
+                        "Sandboxes will use runc (default) with NO syscall filtering. "
+                        "Install gVisor: https://gvisor.dev/docs/user_guide/install/",
+                )
+            _GVISOR_CHECKED = True
+            return has_gvisor
+        else:
+            logger.warning("gvisor_check_failed", stderr=result.stderr[:200])
+            return False
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("gvisor_check_skipped", error=str(exc)[:100])
+        return False
+
+
 # ── Approved Docker Base Images (AUDIT FIX #1) ────────────────────
 
 APPROVED_BASE_IMAGES: frozenset[str] = frozenset({

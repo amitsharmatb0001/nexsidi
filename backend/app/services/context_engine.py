@@ -31,7 +31,7 @@ logger = structlog.get_logger(__name__)
 
 # Default chunk size for large context values (bytes)
 _DEFAULT_CHUNK_SIZE = 64 * 1024  # 64 KB
-_DEFAULT_TTL_SECONDS = 86400  # 24 hours
+_DEFAULT_TTL_SECONDS = 604800  # 7 days (F5-FIX: 24h killed long-running pipelines)
 _HASH_CHAIN_SEED = "nexsidi:context:genesis"
 
 
@@ -59,7 +59,7 @@ class ContextQuery:
 
     pipeline_run_id: str
     step_name: str | None = None  # None = get all steps
-    verify_chain: bool = True  # Verify hash chain integrity on read
+    verify_chain: bool = False  # F8-FIX: default False to tolerate Valkey eviction
 
 
 # ── Hash Chain Utilities ────────────────────────────────────────────
@@ -79,6 +79,64 @@ def _chain_hash(content_hash: str, prev_hash: str) -> str:
 def compute_content_hash(content: bytes) -> str:
     """Compute SHA-256 hash of content bytes."""
     return _sha256(content)
+
+
+# ── F17-FIX: Lock Heartbeat ─────────────────────────────────────────
+
+
+class _LockHeartbeat:
+    """F17-FIX: Background task that extends a Valkey lock's TTL periodically.
+
+    Problem: If an object store upload or large pipeline write takes >30s,
+    the Valkey lock expires and another writer corrupts the hash chain.
+
+    Solution: A background asyncio task that calls lock.reacquire() (which
+    extends the TTL) every `interval` seconds. Start on lock acquire, stop
+    on lock release.
+
+    Usage:
+        lock = redis.lock(key, timeout=30)
+        await lock.acquire()
+        heartbeat = _LockHeartbeat(lock, interval=10)
+        heartbeat.start()
+        try:
+            ... # long operation
+        finally:
+            heartbeat.stop()
+            await lock.release()
+    """
+
+    def __init__(self, lock: Any, interval: float = 10.0) -> None:
+        self._lock = lock
+        self._interval = interval
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        """Start the heartbeat background task."""
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._heartbeat_loop())
+
+    def stop(self) -> None:
+        """Stop the heartbeat background task."""
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+            self._task = None
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically extend the lock TTL."""
+        try:
+            while True:
+                await asyncio.sleep(self._interval)
+                try:
+                    await self._lock.reacquire()
+                    logger.debug("lock_heartbeat_extended", lock=str(self._lock.name))
+                except Exception as exc:
+                    # Lock lost (expired, stolen, or Valkey down).
+                    # Stop heartbeat — the caller's finally block will handle cleanup.
+                    logger.warning("lock_heartbeat_failed", error=str(exc)[:100])
+                    break
+        except asyncio.CancelledError:
+            pass  # Normal shutdown via stop()
 
 
 # ── Context Engine ──────────────────────────────────────────────────
@@ -195,6 +253,9 @@ class ContextEngine:
         acquired = await lock.acquire()
         if not acquired:
             raise TimeoutError(f"Cannot acquire context lock for pipeline {pipeline_run_id}")
+        # F17-FIX: Start heartbeat to extend lock TTL during slow writes
+        heartbeat = _LockHeartbeat(lock, interval=10.0)
+        heartbeat.start()
         try:
             # Get previous hash from chain (or genesis seed)
             meta_key = f"ctx:{pipeline_run_id}:meta"
@@ -283,6 +344,8 @@ class ContextEngine:
 
             await pipe.execute()
         finally:
+            # F17-FIX: Stop heartbeat before releasing lock
+            heartbeat.stop()
             try:
                 await lock.release()
             except Exception:
@@ -329,7 +392,7 @@ class ContextEngine:
     async def get_all_steps(
         self,
         pipeline_run_id: str,
-        verify_chain: bool = True,
+        verify_chain: bool = False,  # F8-FIX: default False for resilience
     ) -> list[dict[str, Any]]:
         """Retrieve all step outputs for a pipeline run, in order.
 

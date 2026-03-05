@@ -34,7 +34,12 @@ from typing import Any
 import structlog
 
 from app.agents.base import AgentResult, AgentStatus, get_agent
-from app.services.ai_router import PipelineCostLimitError, ProjectCostTracker  # COST-CAP-FIX
+from app.services.ai_router import (  # COST-CAP-FIX + F6-FIX
+    PipelineCostLimitError,
+    ProjectCostTracker,
+    register_cost_tracker,
+    unregister_cost_tracker,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1255,7 +1260,10 @@ class PipelineOrchestrator:
         # (Shubham, Fixer, Aanya, etc.) contribute to the same cap.
         # Registered in the module-level dict so agents can look it up by run_id
         # without receiving it as a parameter (no signature changes required).
-        _RUN_COST_TRACKERS[run.run_id] = ProjectCostTracker(pipeline_run_id=run.run_id)
+        _cost_tracker = ProjectCostTracker(pipeline_run_id=run.run_id)
+        _RUN_COST_TRACKERS[run.run_id] = _cost_tracker
+        # F6-FIX: Also register in ai_router's registry for pre-flight checks
+        register_cost_tracker(run.run_id, _cost_tracker)
 
         # Persist initial state
         await self._persist_run(run)
@@ -1458,6 +1466,35 @@ class PipelineOrchestrator:
                 await self._persist_run(run)
                 continue
 
+            # F3-FIX: After Fixer stage, merge patched files back into source
+            # agent context. Fixer writes patches to context["fixer"]["patched_files"]
+            # but Aanya/Shubham read from context["shubham/aanya"]["file_contents"].
+            # Without this merge, re-running Aanya after Fixer reads ORIGINAL unfixed code.
+            if (
+                run.current_stage == PipelineStage.FIXING
+                and step_result.result
+                and step_result.result.status == AgentStatus.COMPLETED
+            ):
+                fixer_output = run.context.get("fixer", {})
+                if isinstance(fixer_output, dict):
+                    patched = fixer_output.get("patched_files", {})
+                    if patched and isinstance(patched, dict):
+                        for target in ("shubham", "aanya"):
+                            agent_ctx = run.context.get(target, {})
+                            if isinstance(agent_ctx, dict) and "file_contents" in agent_ctx:
+                                merged = 0
+                                for path, content in patched.items():
+                                    if path in agent_ctx["file_contents"]:
+                                        agent_ctx["file_contents"][path] = content
+                                        merged += 1
+                                if merged:
+                                    logger.info(
+                                        "fixer_context_merge",
+                                        run_id=run.run_id,
+                                        target=target,
+                                        files_merged=merged,
+                                    )
+
             # Fix-retest loop: after FIXING, check if we need to re-run
             if (
                 run.current_stage == PipelineStage.FIXING
@@ -1643,6 +1680,8 @@ class PipelineOrchestrator:
             # Keeping it after the run completes would be a memory leak on long-lived
             # processes with many pipeline runs.
             _RUN_COST_TRACKERS.pop(run.run_id, None)
+            # F6-FIX: Also unregister from ai_router's registry
+            unregister_cost_tracker(run.run_id)
             logger.debug("run_evicted_from_cache", run_id=run.run_id, status=run.status.value)
         elif run.status == PipelineRunStatus.PAUSED:
             # R17-FIX: Track when this run entered PAUSED state for TTL eviction
@@ -2128,18 +2167,37 @@ class PipelineOrchestrator:
         # REFIX: Track which names successfully spawned tasks so zip
         # doesn't mismatch when get_agent() raises for some agents.
         #
-        # R12-FIX: Use deepcopy (upgraded from R11's shallow dict()).
-        # Shallow copy only isolates top-level keys — nested dicts/lists
-        # (e.g., context["saanvi"]["findings"]) are still shared references.
-        # If any parallel agent appends to a nested list from a prior stage,
-        # concurrent mutations corrupt the shared list.  deepcopy prevents this.
+        # F13-FIX: Selective deepcopy — only deep-copy prior agent output dicts
+        # (which might be mutated by parallel agents). Metadata keys (__*__)
+        # and small scalar values are shared by reference. This avoids the
+        # full deepcopy which blocks the GIL for MB-sized contexts.
         import copy
+        from types import MappingProxyType
+
+        def _selective_context_copy(ctx: dict[str, Any]) -> dict[str, Any]:
+            """Deep-copy only mutable agent output dicts; share metadata."""
+            out: dict[str, Any] = {}
+            for key, val in ctx.items():
+                if key.startswith("__"):
+                    # Metadata keys — shared (read-only contract)
+                    out[key] = val
+                elif isinstance(val, dict):
+                    # Agent output — deep-copy to isolate mutations
+                    out[key] = copy.deepcopy(val)
+                elif isinstance(val, (str, int, float, bool, type(None))):
+                    # Immutable scalars — share by reference
+                    out[key] = val
+                else:
+                    # Lists, custom objects — deep-copy for safety
+                    out[key] = copy.deepcopy(val)
+            return out
+
         tasks = []
         loaded_names: list[str] = []
         for name in agent_names:
             try:
                 agent = get_agent(name)
-                tasks.append(agent.run(run.run_id, copy.deepcopy(run.context)))
+                tasks.append(agent.run(run.run_id, _selective_context_copy(run.context)))
                 loaded_names.append(name)
             except KeyError:
                 logger.warning("agent_not_found", agent=name, stage=stage.value)

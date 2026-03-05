@@ -104,7 +104,25 @@ class DeliveryEngine:
 
         Returns:
             DeliveryPackage with ZIP bytes and manifest.
+
+        F4-FIX: Surfaces simulation mode — when Docker was unavailable,
+        tests were SKIPPED but previously appeared as passing. Now the
+        delivery summary explicitly warns the customer.
         """
+        # F4-FIX: Detect simulation mode
+        aarav_output = context.get("aarav", {})
+        is_simulation = (
+            isinstance(aarav_output, dict)
+            and aarav_output.get("is_simulation_sandbox", False)
+        )
+        if is_simulation:
+            context.setdefault("__simulation_mode__", True)
+            logger.warning(
+                "delivery_simulation_mode",
+                pipeline_run_id=pipeline_run_id,
+                msg="Project was NOT tested in a real Docker sandbox",
+            )
+
         contract = context.get("vikram", {}).get("contract", {})
         project_name = contract.get("project_name", "project")
 
@@ -147,6 +165,13 @@ class DeliveryEngine:
                 contract_json = orjson.dumps(contract, option=orjson.OPT_INDENT_2).decode("utf-8")
                 zf.writestr(f"{project_name}/docs/architecture_contract.json", contract_json)
 
+            # F4-FIX: Blocklist scan before packaging
+            blocklist_findings = self._scan_for_dangerous_patterns(context)
+            if blocklist_findings:
+                blocklist_json = orjson.dumps(blocklist_findings, option=orjson.OPT_INDENT_2).decode("utf-8")
+                zf.writestr(f"{project_name}/reports/blocklist_scan.json", blocklist_json)
+                manifest.report_files += 1
+
             # 6. Manifest
             manifest.total_files = (
                 manifest.backend_files + manifest.frontend_files
@@ -166,7 +191,11 @@ class DeliveryEngine:
         zip_bytes = zip_buffer.getvalue()
 
         # Generate human-readable summary
-        summary = self._generate_summary(manifest, reports)
+        summary = self._generate_summary(
+            manifest, reports,
+            is_simulation=is_simulation,
+            blocklist_findings=blocklist_findings,
+        )
 
         logger.info(
             "delivery_package_built",
@@ -263,6 +292,9 @@ class DeliveryEngine:
         self,
         manifest: DeliveryManifest,
         reports: dict[str, dict[str, Any]],
+        *,
+        is_simulation: bool = False,
+        blocklist_findings: list[dict[str, Any]] | None = None,
     ) -> str:
         """Generate a human-readable delivery summary."""
         lines = [
@@ -270,6 +302,29 @@ class DeliveryEngine:
             f"Pipeline Run: {manifest.pipeline_run_id}",
             f"Delivered: {manifest.created_at}",
             "",
+        ]
+
+        # F4-FIX: Simulation mode warning
+        if is_simulation:
+            lines.extend([
+                "## ⚠ SIMULATION MODE",
+                "**This project was NOT tested in a real Docker sandbox.**",
+                "Docker was unavailable during the pipeline run. All sandbox tests",
+                "were SKIPPED. Treat test results as unverified. Deploy to a staging",
+                "environment and run integration tests before going to production.",
+                "",
+            ])
+
+        # F12-FIX: Blocklist findings
+        if blocklist_findings:
+            lines.extend([
+                "## ⚠ BLOCKLIST FINDINGS",
+                f"**{len(blocklist_findings)} dangerous pattern(s) detected in generated code.**",
+                "Review `reports/blocklist_scan.json` before deploying.",
+                "",
+            ])
+
+        lines.extend([
             "## Files",
             f"- Backend: {manifest.backend_files} files",
             f"- Frontend: {manifest.frontend_files} files",
@@ -277,7 +332,7 @@ class DeliveryEngine:
             f"- Deploy Config: {manifest.deploy_files} files",
             f"- Total: {manifest.total_files} files",
             "",
-        ]
+        ])
 
         if manifest.deployment_url:
             lines.extend([
@@ -314,6 +369,68 @@ class DeliveryEngine:
         ])
 
         return "\n".join(lines)
+
+    # ── F12-FIX: Blocklist Scan ──────────────────────────────────
+
+    # Dangerous patterns that should NEVER appear in generated code.
+    _BLOCKLIST_PATTERNS: list[tuple[str, str]] = [
+        (r"\bos\.system\s*\(", "os.system() — use subprocess with shell=False"),
+        (r"\beval\s*\(", "eval() — arbitrary code execution risk"),
+        (r"\bexec\s*\(", "exec() — arbitrary code execution risk"),
+        (r"subprocess\..*shell\s*=\s*True", "subprocess with shell=True — command injection risk"),
+        (r"pickle\.loads?\s*\(", "pickle.load/loads — arbitrary code execution via deserialization"),
+        (r"\b__import__\s*\(", "__import__() — dynamic import, potential RCE"),
+        (r"(?:password|secret|api_key|token)\s*=\s*['\"][^'\"]{8,}['\"]",
+         "Hardcoded credential — use environment variables"),
+        (r"yaml\.load\s*\([^)]*\)", "yaml.load without SafeLoader — arbitrary code execution"),
+        (r"marshal\.loads?\s*\(", "marshal.load/loads — arbitrary code execution"),
+        (r"compile\s*\([^)]*,\s*['\"]exec['\"]", "compile() with exec mode — code injection risk"),
+    ]
+
+    def _scan_for_dangerous_patterns(
+        self, context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """F12-FIX: Scan all generated code for dangerous patterns before packaging.
+
+        Returns a list of findings, each with file path, line number, pattern matched,
+        and the recommendation.
+        """
+        import re
+
+        findings: list[dict[str, Any]] = []
+
+        # Collect all code files
+        all_files: dict[str, str] = {}
+        shubham = context.get("shubham", {})
+        if isinstance(shubham, dict):
+            all_files.update(shubham.get("file_contents", {}))
+        aanya = context.get("aanya", {})
+        if isinstance(aanya, dict):
+            all_files.update(aanya.get("file_contents", {}))
+
+        for file_path, content in all_files.items():
+            if not isinstance(content, str):
+                continue
+            for line_num, line in enumerate(content.splitlines(), 1):
+                for pattern, description in self._BLOCKLIST_PATTERNS:
+                    if re.search(pattern, line):
+                        findings.append({
+                            "file": file_path,
+                            "line": line_num,
+                            "pattern": description,
+                            "snippet": line.strip()[:120],
+                        })
+
+        if findings:
+            logger.warning(
+                "blocklist_scan_findings",
+                total=len(findings),
+                files=list({f["file"] for f in findings}),
+            )
+        else:
+            logger.info("blocklist_scan_clean", files_scanned=len(all_files))
+
+        return findings
 
 
 # ── Singleton ───────────────────────────────────────────────────

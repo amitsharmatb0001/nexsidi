@@ -160,7 +160,13 @@ async def run_migrations() -> None:
 
     This is idempotent — safe to run every time the server starts.
     Already-applied migrations are skipped automatically by Alembic.
+
+    F16-FIX: Uses PostgreSQL advisory lock to prevent concurrent
+    Alembic instances (multiple workers starting simultaneously)
+    from causing DDL deadlocks.
     """
+    # F16-FIX: Advisory lock constant (0x4E455853 = "NEXS" in hex)
+    _MIGRATION_LOCK_ID = 0x4E455853
 
     def _run_alembic_upgrade() -> None:
         from alembic import command
@@ -170,6 +176,27 @@ async def run_migrations() -> None:
         alembic_cfg = Config(str(backend_dir / "alembic.ini"))
         alembic_cfg.set_main_option("script_location", str(backend_dir / "alembic"))
         command.upgrade(alembic_cfg, "head")
+
+    # F16-FIX: Acquire advisory lock before running migrations
+    lock_acquired = False
+    if _engine is not None:
+        try:
+            from sqlalchemy import text
+            async with _engine.connect() as conn:
+                result = await conn.execute(
+                    text(f"SELECT pg_try_advisory_lock({_MIGRATION_LOCK_ID})")
+                )
+                lock_acquired = bool(result.scalar())
+                if not lock_acquired:
+                    logger.info(
+                        "migration_skipped_lock_held",
+                        msg="Another instance is running migrations. Skipping.",
+                    )
+                    return  # Another worker is handling migrations
+        except Exception as exc:
+            logger.warning("advisory_lock_failed", error=str(exc)[:100])
+            # Fall through — run migrations anyway (single-instance fallback)
+            lock_acquired = True  # Treat as acquired for the finally block
 
     # Run in a thread because Alembic's env.py uses asyncio.run() internally
     # which cannot be called from within an already-running event loop
@@ -182,6 +209,17 @@ async def run_migrations() -> None:
         sanitized = _sanitize_error(exc)
         logger.error("alembic_migration_failed", error=sanitized)
         raise RuntimeError(f"Database migration failed: {sanitized}") from None
+    finally:
+        # F16-FIX: Release advisory lock
+        if lock_acquired and _engine is not None:
+            try:
+                from sqlalchemy import text
+                async with _engine.connect() as conn:
+                    await conn.execute(
+                        text(f"SELECT pg_advisory_unlock({_MIGRATION_LOCK_ID})")
+                    )
+            except Exception:
+                pass  # Lock has no TTL — it's released when session ends anyway
     logger.info("Alembic migrations applied (upgrade head)")
 
 

@@ -153,10 +153,31 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
     """Validate an architecture contract against the schema.
 
     Returns a list of validation errors (empty if valid).
-    This is a lightweight check — not a full JSON Schema validator,
-    but catches the most common structural issues.
+
+    F14-FIX: Uses jsonschema.Draft7Validator when available for thorough
+    type validation of nested structures. Falls back to manual validation
+    if jsonschema is not installed.
     """
     errors: list[str] = []
+
+    # F14-FIX: Try jsonschema first for thorough nested validation
+    try:
+        import jsonschema
+        validator = jsonschema.Draft7Validator(CONTRACT_SCHEMA)
+        for error in validator.iter_errors(contract):
+            # Format path as dotted string for readability
+            path = ".".join(str(p) for p in error.absolute_path) or "(root)"
+            errors.append(f"{path}: {error.message}")
+        if errors:
+            return errors  # jsonschema found issues — return them
+        # jsonschema passed; still run manual checks for business rules
+    except ImportError:
+        pass  # jsonschema not installed — fall back to manual validation
+    except Exception as exc:
+        logger.warning("jsonschema_validation_error", error=str(exc)[:200])
+        # Fall through to manual validation
+
+    # Manual validation (fallback or supplementary business rules)
 
     # Required top-level keys
     for key in CONTRACT_SCHEMA["required"]:
@@ -173,9 +194,6 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
         for i, table in enumerate(db["tables"]):
             if "name" not in table:
                 errors.append(f"database.tables[{i}] missing 'name'")
-            # AUDIT-FIX: Validate data types, not just presence.
-            # A contract with "name": 123 or "columns": "not a list"
-            # passes presence checks but crashes downstream agents.
             elif not isinstance(table.get("name"), str):
                 errors.append(f"Table at index {i}: 'name' must be a string, got {type(table.get('name')).__name__}")
             if "columns" not in table:
