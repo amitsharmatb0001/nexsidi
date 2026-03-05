@@ -169,9 +169,17 @@ class Settings(BaseSettings):
     # --- Celery Task Queue ---
     # When use_celery=True, pipeline runs dispatch to Celery workers instead
     # of in-process asyncio.create_task(). Enables horizontal scaling.
-    use_celery: bool = False  # Feature flag â€" False = current behavior
+    use_celery: bool = False  # Feature flag — False = current behavior
     celery_broker_url: str = ""  # Falls back to valkey_url if empty
     celery_result_backend: str = ""  # Falls back to valkey_url if empty
+
+    # I5-FIX: Worker type — "celery" or "async" (native asyncio worker).
+    # "async" uses BLPOP-based Valkey queue (app.workers.async_worker).
+    worker_type: str = "celery"
+
+    # I6-FIX: Executor type — "docker" or "kubernetes".
+    # "kubernetes" uses ephemeral K8s Jobs for sandbox isolation.
+    executor_type: str = "docker"
 
     # --- Object Storage (generated code) ---
     # REVIEW-FIX: Large generated codebases should be stored durably (not in Valkey).

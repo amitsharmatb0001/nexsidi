@@ -1764,3 +1764,21 @@ def get_execution_engine(config: SandboxConfig | None = None) -> ExecutionEngine
     if _engine is None:
         _engine = ExecutionEngine(config)
     return _engine
+
+
+def get_executor(config: SandboxConfig | None = None) -> Any:
+    """Factory: return the configured executor (Docker or Kubernetes).
+
+    I6-FIX: When ``executor_type="kubernetes"`` in settings, returns a
+    ``KubernetesExecutor`` for true process isolation via ephemeral K8s
+    namespaces.  Default ``"docker"`` returns the existing ExecutionEngine.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    executor_type = getattr(settings, "executor_type", "docker")
+    if executor_type == "kubernetes":
+        from app.engine.k8s_executor import KubernetesExecutor
+
+        return KubernetesExecutor()
+    return get_execution_engine(config)

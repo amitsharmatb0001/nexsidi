@@ -33,7 +33,7 @@ from typing import Any
 
 import structlog
 
-from app.agents.base import AgentResult, AgentStatus, get_agent
+from app.agents.base import AgentInterruptRequest, AgentResult, AgentStatus, get_agent
 from app.services.ai_router import (  # COST-CAP-FIX + F6-FIX
     PipelineCostLimitError,
     ProjectCostTracker,
@@ -119,6 +119,44 @@ CHECKPOINT_STAGES: frozenset[PipelineStage] = frozenset({
 
 # Ordered stage list for sequential execution
 STAGE_ORDER: list[PipelineStage] = list(PipelineStage)
+
+# I2-FIX: Agent context dependency map ────────────────────────────
+# Each agent only receives the prior agent outputs it actually reads,
+# plus all metadata keys (__*__).  This eliminates the "context bloat
+# blackhole" where agents received MB-sized dicts they never touched.
+# Unknown agents fall back to full context (safe default).
+_AGENT_CONTEXT_DEPS: dict[str, list[str]] = {
+    "tilotma":    [],                                    # reads __requirements__
+    "saanvi":     ["tilotma"],
+    "vikram":     ["tilotma", "saanvi"],
+    "challenger": ["vikram"],
+    "dhruv":      ["vikram"],
+    "vanya":      ["vikram", "saanvi"],
+    "shubham":    ["vikram", "dhruv"],
+    "aanya":      ["vikram", "shubham", "vanya"],
+    "karan":      ["vikram", "shubham", "aanya"],
+    "navya":      ["vikram", "shubham", "aanya"],
+    "deepika":    ["vikram", "shubham", "aanya"],
+    "aarav":      ["vikram", "shubham", "aanya"],
+    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika"],
+    "pranav":     ["vikram", "shubham", "aanya"],
+}
+
+
+def _build_filtered_context(ctx: dict[str, Any], agent_name: str) -> dict[str, Any]:
+    """Return a context dict containing only the keys *agent_name* needs.
+
+    Metadata keys (``__*__``) are always included.  If *agent_name* is not
+    in ``_AGENT_CONTEXT_DEPS``, the full context is returned (safe default).
+    """
+    deps = _AGENT_CONTEXT_DEPS.get(agent_name)
+    if deps is None:
+        return ctx  # Unknown agent — give everything
+    return {
+        k: v
+        for k, v in ctx.items()
+        if k.startswith("__") or k in deps
+    }
 
 # Redo rewind targets: which stage to jump back to when user says "redo"
 CHECKPOINT_REDO_TARGETS: dict[PipelineStage, PipelineStage] = {
@@ -1504,14 +1542,36 @@ class PipelineOrchestrator:
                 and run.fix_retest_cycle < MAX_FIX_RETEST_CYCLES
             ):
                 run.fix_retest_cycle += 1
-                logger.info(
-                    "fix_retest_loop",
-                    run_id=run.run_id,
-                    cycle=run.fix_retest_cycle,
-                    max_cycles=MAX_FIX_RETEST_CYCLES,
-                )
-                # Rewind to QUALITY_REVIEW to re-run quality gates
-                run.current_stage = PipelineStage.QUALITY_REVIEW
+
+                # I4-FIX: Fast-path — trivial fixes (syntax/import/typo) skip
+                # the full quality review cycle and go directly to TESTING.
+                # Structural/moderate fixes still re-run all quality gates.
+                fix_severity = "STRUCTURAL"
+                if step_result.result.output:
+                    fix_severity = step_result.result.output.get(
+                        "fix_severity", "STRUCTURAL"
+                    )
+
+                if fix_severity == "TRIVIAL":
+                    run.context["__fix_fast_path__"] = True
+                    logger.info(
+                        "fix_retest_fast_path",
+                        run_id=run.run_id,
+                        cycle=run.fix_retest_cycle,
+                        severity=fix_severity,
+                    )
+                    run.current_stage = PipelineStage.TESTING
+                else:
+                    run.context.pop("__fix_fast_path__", None)
+                    logger.info(
+                        "fix_retest_loop",
+                        run_id=run.run_id,
+                        cycle=run.fix_retest_cycle,
+                        max_cycles=MAX_FIX_RETEST_CYCLES,
+                        severity=fix_severity,
+                    )
+                    run.current_stage = PipelineStage.QUALITY_REVIEW
+
                 await self._persist_run(run)
                 continue
 
@@ -2128,11 +2188,22 @@ class PipelineOrchestrator:
             if "__requirements__" in run.context and "user_input" not in run.context:
                 run.context["user_input"] = run.context["__requirements__"]
 
+        # I2-FIX: Pass only the context keys this agent actually needs.
+        # Eliminates the "context bloat blackhole" where every agent received
+        # the full multi-MB accumulated context of all prior agents.
+        filtered_context = _build_filtered_context(run.context, agent_name)
+
         # R11-FIX: Wrap agent.run() so crashed steps still get a StepResult
         # record in the database (for post-mortem diagnostics). Previously,
         # unhandled exceptions propagated up with no DB record for the step.
+        #
+        # I1-FIX: Also catches AgentInterruptRequest for dynamic re-dispatch.
         try:
-            result = await agent.run(run.run_id, run.context)
+            result = await agent.run(run.run_id, filtered_context)
+        except AgentInterruptRequest as interrupt:
+            result = await self._handle_interrupt(
+                run, stage, agent_name, interrupt,
+            )
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
             safe_err = _sanitize_error(exc)
@@ -2197,7 +2268,9 @@ class PipelineOrchestrator:
         for name in agent_names:
             try:
                 agent = get_agent(name)
-                tasks.append(agent.run(run.run_id, _selective_context_copy(run.context)))
+                # I2-FIX: Filter context BEFORE selective deepcopy
+                filtered = _build_filtered_context(run.context, name)
+                tasks.append(agent.run(run.run_id, _selective_context_copy(filtered)))
                 loaded_names.append(name)
             except KeyError:
                 logger.warning("agent_not_found", agent=name, stage=stage.value)
@@ -2238,6 +2311,111 @@ class PipelineOrchestrator:
 
         step.completed_at = datetime.now(timezone.utc)
         return step
+
+    # ── I1-FIX: Agent Interrupt Handling ───────────────────────────
+
+    async def _handle_interrupt(
+        self,
+        run: PipelineRun,
+        current_stage: PipelineStage,
+        requesting_agent_name: str,
+        interrupt: AgentInterruptRequest,
+    ) -> AgentResult:
+        """Handle an agent interrupt by re-running the target agent.
+
+        Flow:
+        1. Increment per-pair interrupt counter (persisted in run.context)
+        2. Inject interrupt context for the target agent
+        3. Re-run target agent → merge its updated output into run.context
+        4. Clean up interrupt context
+        5. Re-run the requesting agent with fresh context
+        6. Return requesting agent's result
+
+        Nested interrupts from the resumed agent are caught and rejected
+        to prevent infinite interrupt chains.
+        """
+        from app.services.ai_router import _sanitize_error
+
+        counter_key = (
+            f"__interrupt_count__{interrupt.requesting_agent}"
+            f"_{interrupt.target_agent}__"
+        )
+        run.context[counter_key] = run.context.get(counter_key, 0) + 1
+
+        logger.info(
+            "agent_interrupt_handling",
+            run_id=run.run_id,
+            from_agent=interrupt.requesting_agent,
+            target_agent=interrupt.target_agent,
+            reason=interrupt.reason[:200],
+            interrupt_count=run.context[counter_key],
+        )
+
+        # Inject interrupt context so the target agent knows what's needed
+        run.context["__interrupt_request__"] = {
+            "from_agent": interrupt.requesting_agent,
+            "reason": interrupt.reason,
+            "required_changes": interrupt.required_changes,
+        }
+
+        # Re-run the target agent
+        try:
+            target_agent = get_agent(interrupt.target_agent)
+            target_result = await target_agent.run(run.run_id, run.context)
+
+            if target_result.status == AgentStatus.COMPLETED and target_result.output:
+                run.context[interrupt.target_agent] = target_result.output
+                logger.info(
+                    "interrupt_target_completed",
+                    run_id=run.run_id,
+                    target_agent=interrupt.target_agent,
+                )
+            else:
+                logger.warning(
+                    "interrupt_target_failed",
+                    run_id=run.run_id,
+                    target_agent=interrupt.target_agent,
+                    error=target_result.error,
+                )
+        except Exception as exc:
+            logger.error(
+                "interrupt_target_crashed",
+                target_agent=interrupt.target_agent,
+                error=_sanitize_error(exc),
+            )
+        finally:
+            run.context.pop("__interrupt_request__", None)
+
+        # Re-run the requesting agent with updated context
+        try:
+            requesting_agent = get_agent(requesting_agent_name)
+            filtered_context = _build_filtered_context(
+                run.context, requesting_agent_name
+            )
+            result = await requesting_agent.run(run.run_id, filtered_context)
+            return result
+        except AgentInterruptRequest:
+            # Prevent infinite interrupt chains — agent tried to interrupt
+            # again immediately after target re-ran.
+            logger.warning(
+                "interrupt_chain_blocked",
+                run_id=run.run_id,
+                agent=requesting_agent_name,
+            )
+            return AgentResult(
+                agent_name=requesting_agent_name,
+                status=AgentStatus.FAILED,
+                error=(
+                    "Interrupt chain detected: agent re-raised interrupt "
+                    "after target re-run. Proceeding with current context."
+                ),
+            )
+        except Exception as exc:
+            return AgentResult(
+                agent_name=requesting_agent_name,
+                status=AgentStatus.FAILED,
+                error=_sanitize_error(exc),
+            )
 
     async def _emit_file_events(self, run: PipelineRun, step_result: StepResult) -> None:
         """Emit file_created WebSocket events for files generated in this stage.

@@ -25,8 +25,10 @@ from typing import Any
 import structlog
 
 from app.agents.base import (
+    AgentInterruptRequest,
     AgentResult,
     AgentStatus,
+    INTERRUPT_TOOL,
     ToolDefinition,
     call_ai_with_tools,
     estimate_file_complexity,
@@ -717,6 +719,38 @@ SHUBHAM_TOOLS: list[ToolDefinition] = [
             "required": ["summary"],
         },
     ),
+    # I3-FIX: Import & type validation during code generation (not just at fix time)
+    ToolDefinition(
+        name="check_imports",
+        description=(
+            "Verify all Python imports resolve to known modules (stdlib, "
+            "third-party, or project). Call after writing a .py file to catch "
+            "import errors early."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path of the Python file to check"},
+            },
+            "required": ["path"],
+        },
+    ),
+    ToolDefinition(
+        name="check_types",
+        description=(
+            "Run type checking on a Python or TypeScript file. Returns warnings "
+            "(non-blocking). Call after writing critical files."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path of the file to type-check"},
+            },
+            "required": ["path"],
+        },
+    ),
+    # I1-FIX: Dynamic agent re-dispatch
+    INTERRUPT_TOOL,
 ]
 
 
@@ -767,6 +801,14 @@ class ShubhamToolHandler:
             return await self._ask_architect(**tool_input)
         elif tool_name == "task_complete":
             return self._task_complete(**tool_input)
+        # I3-FIX: Import & type validation during generation
+        elif tool_name == "check_imports":
+            return self._check_imports(**tool_input)
+        elif tool_name == "check_types":
+            return self._check_types(**tool_input)
+        # I1-FIX: Dynamic agent re-dispatch
+        elif tool_name == "request_agent_rerun":
+            return self._request_agent_rerun(**tool_input)
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -835,6 +877,59 @@ class ShubhamToolHandler:
         self._done = True
         self._summary = summary
         return f"Task marked complete: {summary}"
+
+    # I1-FIX: Dynamic agent re-dispatch ────────────────────────────
+
+    def _request_agent_rerun(
+        self, target_agent: str, reason: str, required_changes: str
+    ) -> str:
+        """Request another agent to re-run with updated requirements.
+
+        Raises AgentInterruptRequest which is caught by the pipeline's
+        _execute_agent() to pause this agent, re-run the target, and
+        then resume this agent with fresh context.
+        """
+        counter_key = f"__interrupt_count__shubham_{target_agent}__"
+        count = self._pipeline_context.get(counter_key, 0)
+        if count >= 2:
+            return (
+                f"Cannot request {target_agent} re-run: max 2 interrupts "
+                f"per agent pair reached ({count}/2). Proceed with best judgment."
+            )
+        raise AgentInterruptRequest(
+            requesting_agent="shubham",
+            target_agent=target_agent,
+            reason=reason,
+            required_changes=required_changes,
+        )
+
+    # I3-FIX: Import & type validation during generation ─────────────
+
+    def _check_imports(self, path: str) -> str:
+        """Verify Python imports resolve using shared code_validator."""
+        code = self._files.get(path, "")
+        if not code:
+            return f"File not found: {path}"
+        from app.agents.tools.code_validator import check_imports, extract_project_files
+
+        project_files = extract_project_files(self._pipeline_context)
+        # Also include files written in the current session
+        for fp in self._files:
+            if fp.endswith(".py"):
+                mod = fp.replace("/", ".").replace("\\", ".")
+                if mod.endswith(".py"):
+                    mod = mod[:-3]
+                project_files.add(mod)
+        return check_imports(path, code, project_files)
+
+    def _check_types(self, path: str) -> str:
+        """Run lightweight type checking via shared code_validator."""
+        code = self._files.get(path, "")
+        if not code:
+            return f"File not found: {path}"
+        from app.agents.tools.code_validator import check_types
+
+        return check_types(path, code)
 
 
 class Shubham:

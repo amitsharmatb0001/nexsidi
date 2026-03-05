@@ -218,7 +218,45 @@ async def start_pipeline(
     # PHASE-4: When use_celery=True, dispatch to Celery worker for
     # horizontal scaling. Otherwise, use in-process asyncio.create_task().
     settings = get_settings()
-    if settings.use_celery:
+
+    # I5-FIX: Native async worker dispatch via Valkey RPUSH
+    if settings.worker_type == "async":
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            import json as _json
+
+            redis = await get_valkey_client()
+            task_payload = _json.dumps({
+                "action": "run",
+                "run_id": run.run_id,
+                "project_id": str(body.project_id),
+                "organization_id": ctx.organization_id,
+                "user_id": ctx.user_id,
+                "execution_mode": mode.value,
+                "requirements": body.requirements or None,
+            })
+            await redis.rpush("nexsidi:pipeline_tasks", task_payload.encode("utf-8"))
+            logger.info("pipeline_dispatched_to_async_worker", run_id=run.run_id)
+        except Exception as dispatch_exc:
+            orch._active_runs.pop(run.run_id, None)
+            try:
+                from app.services.pipeline import PipelineRunStatus
+                run.status = PipelineRunStatus.FAILED
+                run.error = "Async worker dispatch failed"
+                await orch._persist_run(run)
+            except Exception:
+                logger.error("dispatch_cleanup_persist_failed", run_id=run.run_id)
+            logger.error(
+                "async_dispatch_failed",
+                run_id=run.run_id,
+                error=_sanitize_dispatch_error(dispatch_exc),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Pipeline worker unavailable. Please try again later.",
+            )
+
+    elif settings.use_celery:
         from app.tasks.pipeline_tasks import run_pipeline_task
 
         # REVIEW-FIX: Wrap Celery dispatch in try/except. If the broker is

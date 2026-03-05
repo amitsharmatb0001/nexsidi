@@ -155,6 +155,47 @@ class FixerReport:
     errors_remaining: int = 0
     status: FixStatus = FixStatus.FAILED
     files_modified: list[str] = field(default_factory=list)
+    # I4-FIX: Severity classification for fast-path fix routing.
+    # TRIVIAL = syntax/import/typo — pipeline can skip quality review.
+    # MODERATE = logic fixes, type corrections.
+    # STRUCTURAL = new files, API/schema changes — must re-run full quality.
+    fix_severity: str = "STRUCTURAL"
+
+
+def _classify_fix_severity(attempts: list[FixAttempt]) -> str:
+    """Classify overall fix severity from individual attempts.
+
+    I4-FIX: Drives fast-path routing in pipeline fix-retest loop.
+    Conservative: any ambiguity defaults to STRUCTURAL (safe).
+    """
+    if not attempts:
+        return "TRIVIAL"
+
+    _STRUCTURAL = {
+        "new file", "endpoint", "schema", "model change", "migration",
+        "router", "new route", "database", "table",
+    }
+    _TRIVIAL = {
+        "import", "syntax", "typo", "indent", "format", "missing comma",
+        "bracket", "semicolon", "undefined variable", "undefined name",
+        "missing colon", "missing parenthesis", "whitespace",
+    }
+
+    has_structural = False
+    has_non_trivial = False
+
+    for attempt in attempts:
+        desc_lower = (attempt.fix_applied or "").lower()
+        if any(p in desc_lower for p in _STRUCTURAL):
+            has_structural = True
+        elif not any(p in desc_lower for p in _TRIVIAL):
+            has_non_trivial = True
+
+    if has_structural:
+        return "STRUCTURAL"
+    if has_non_trivial:
+        return "MODERATE"
+    return "TRIVIAL"
 
 
 def _sanitize_message(message: str) -> str:
@@ -429,107 +470,26 @@ class FixerToolHandler:
     def _check_imports(self, path: str) -> str:
         """Verify all imports in a Python file resolve to known modules.
 
-        Uses ast.parse() to extract Import/ImportFrom nodes, then checks
-        against stdlib, known third-party packages, and project files.
+        I3-FIX: Delegates to shared code_validator for consistency across
+        Shubham, Aanya, and Fixer agents.
         """
-        import ast
-        import sys
-
         code = self._written_files.get(path, "")
         if not code:
             code = self._read_file(path)
             if code.startswith("File not found"):
                 return code
 
-        if not path.endswith(".py"):
-            return "check_imports only works on Python files"
+        from app.agents.tools.code_validator import check_imports, extract_project_files
 
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as e:
-            return f"Cannot parse {path}: SyntaxError at line {e.lineno}: {e.msg}"
-
-        # Collect all import targets
-        imports: list[dict[str, str]] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.append({
-                        "module": alias.name,
-                        "line": node.lineno,
-                        "type": "import",
-                    })
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.append({
-                        "module": node.module,
-                        "line": node.lineno,
-                        "type": "from_import",
-                    })
-
-        if not imports:
-            return "No imports found in file."
-
-        # Known third-party packages (common ones)
-        _KNOWN_THIRD_PARTY = {
-            "fastapi", "uvicorn", "pydantic", "sqlalchemy", "alembic",
-            "passlib", "jose", "jwt", "bcrypt", "dotenv", "orjson",
-            "httpx", "requests", "celery", "redis", "structlog",
-            "django", "flask", "express", "prisma", "boto3",
-            "pytest", "starlette", "databases", "aiohttp", "asyncpg",
-            "psycopg2", "pymongo", "motor", "stripe", "sendgrid",
-            "pillow", "PIL", "numpy", "pandas",
-        }
-
-        # Project files available in context
-        project_files = set()
-        for agent in ("shubham", "aanya"):
-            agent_out = self._context.get(agent, {})
-            if isinstance(agent_out, dict):
-                for fp in agent_out.get("generated_files", []):
-                    # Convert file path to module path
-                    mod = fp.replace("/", ".").replace("\\", ".").rstrip(".py")
-                    project_files.add(mod)
-                    # Also add parent package
-                    parts = mod.rsplit(".", 1)
-                    if len(parts) > 1:
-                        project_files.add(parts[0])
-
-        unresolved: list[dict[str, Any]] = []
-
-        for imp in imports:
-            module = imp["module"]
-            top_level = module.split(".")[0]
-
-            # Check: stdlib?
-            if top_level in sys.stdlib_module_names:
-                continue
-
-            # Check: known third-party?
-            if top_level in _KNOWN_THIRD_PARTY:
-                continue
-
-            # Check: project module?
-            if any(module.startswith(pf) or pf.startswith(module) for pf in project_files):
-                continue
-
-            # Check: relative import from app/backend?
-            if top_level in ("app", "backend", "core", "config", "src"):
-                continue
-
-            unresolved.append(imp)
-
-        if not unresolved:
-            return f"All {len(imports)} imports in {path} resolved successfully."
-
-        lines = [f"Found {len(unresolved)} unresolved import(s) in {path}:"]
-        for u in unresolved:
-            lines.append(f"  Line {u['line']}: {u['type']} {u['module']}")
-        lines.append("\nPossible fixes:")
-        lines.append("  - Add missing package to requirements.txt")
-        lines.append("  - Fix typo in import path")
-        lines.append("  - Create the missing module file")
-        return "\n".join(lines)
+        project_files = extract_project_files(self._context)
+        # Also include files written in the current fix session
+        for fp in self._written_files:
+            if fp.endswith(".py"):
+                mod = fp.replace("/", ".").replace("\\", ".")
+                if mod.endswith(".py"):
+                    mod = mod[:-3]
+                project_files.add(mod)
+        return check_imports(path, code, project_files)
 
     async def _search_solution(self, error_message: str, context: str = "") -> str:
         """Search web for a solution using the Research Agent.
@@ -844,6 +804,9 @@ class Fixer:
         else:
             report.status = FixStatus.FAILED
 
+        # I4-FIX: Classify fix severity for fast-path routing
+        report.fix_severity = _classify_fix_severity(report.attempts)
+
         output = {
             "status": report.status.value,
             "iterations": report.iterations,
@@ -851,6 +814,7 @@ class Fixer:
             "errors_fixed": report.errors_fixed,
             "errors_remaining": report.errors_remaining,
             "files_modified": report.files_modified,
+            "fix_severity": report.fix_severity,
             "attempts": [
                 {
                     "iteration": a.iteration,

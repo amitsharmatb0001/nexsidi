@@ -37,6 +37,12 @@ jinja2>=3.1.0
 google-cloud-secret-manager>=2.21.0
 google-auth>=2.36.0
 
+# Static analysis (used by build agents for import/type validation)
+pyright>=1.1.390
+
+# Kubernetes executor (optional — only needed when executor_type=kubernetes)
+# kubernetes>=31.0.0
+
 # Utilities
 python-dotenv>=1.0.1
 orjson>=3.10.0

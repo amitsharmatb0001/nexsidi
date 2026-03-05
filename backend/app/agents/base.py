@@ -48,6 +48,37 @@ from app.services.ai_router import (
 logger = structlog.get_logger(__name__)
 
 
+# ── Agent Interrupt ────────────────────────────────────────────────
+
+
+class AgentInterruptRequest(Exception):
+    """Raised by an agent's tool handler to request re-run of another agent.
+
+    I1-FIX: Enables dynamic re-dispatch.  When an agent discovers that a
+    prior agent's output is insufficient (e.g., Aanya needs a new API
+    endpoint from Vikram), the tool handler raises this exception.  The
+    pipeline's ``_execute_agent()`` catches it, re-runs the target agent
+    with interrupt context, then resumes the requesting agent.
+
+    Max 2 interrupts per agent-pair per pipeline run (prevents loops).
+    """
+
+    def __init__(
+        self,
+        requesting_agent: str,
+        target_agent: str,
+        reason: str,
+        required_changes: str,
+    ) -> None:
+        self.requesting_agent = requesting_agent
+        self.target_agent = target_agent
+        self.reason = reason
+        self.required_changes = required_changes
+        super().__init__(
+            f"{requesting_agent} requests {target_agent} re-run: {reason}"
+        )
+
+
 # ── Agent Status ────────────────────────────────────────────────────
 
 
@@ -104,6 +135,41 @@ class ToolDefinition:
             "description": self.description,
             "input_schema": self.parameters,
         }
+
+
+# I1-FIX: Interrupt tool — allows build agents (Shubham, Aanya) to
+# request re-execution of a prior agent when they discover its output
+# is insufficient (e.g., missing API endpoint, wrong schema).
+INTERRUPT_TOOL = ToolDefinition(
+    name="request_agent_rerun",
+    description=(
+        "Request another agent to re-run and produce updated output. "
+        "Use ONLY when you discover that a prior agent's output is "
+        "genuinely insufficient and you need structural changes — e.g., "
+        "a new API endpoint, updated database schema. Do NOT use for "
+        "questions (use ask_architect/ask_backend instead). "
+        "Max 2 requests per agent pair per pipeline run."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target_agent": {
+                "type": "string",
+                "enum": ["vikram", "shubham", "aanya", "dhruv"],
+                "description": "Name of the agent whose output needs updating",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why the re-run is needed (what is missing/wrong)",
+            },
+            "required_changes": {
+                "type": "string",
+                "description": "Specific changes needed in the target agent's output",
+            },
+        },
+        "required": ["target_agent", "reason", "required_changes"],
+    },
+)
 
 
 # ── Model Override Resolution ─────────────────────────────────────
