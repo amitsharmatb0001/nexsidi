@@ -1525,6 +1525,31 @@ class PipelineOrchestrator:
         # F6-FIX: Also register in ai_router's registry for pre-flight checks
         register_cost_tracker(run.run_id, _cost_tracker)
 
+        # ── INPUT SANITIZATION: scan user prompt for injection patterns ──
+        _raw_prompt = run.context.get("__requirements__", "")
+        if _raw_prompt and isinstance(_raw_prompt, str):
+            try:
+                from app.security.platform import InputSanitizer
+                _sanitizer = InputSanitizer()
+                _sanitized, _threats = _sanitizer.sanitize(_raw_prompt)
+                if _threats:
+                    logger.warning(
+                        "pipeline_input_threats_detected",
+                        run_id=run.run_id,
+                        threat_count=len(_threats),
+                        threats=_threats[:5],
+                    )
+                    # Store threats for downstream visibility but do NOT block —
+                    # the user may be building a security-related app.
+                    run.context["__input_threats__"] = _threats
+                if _sanitized != _raw_prompt:
+                    run.context["__requirements__"] = _sanitized
+                    # Also update user_input if already bridged
+                    if "user_input" in run.context:
+                        run.context["user_input"] = _sanitized
+            except Exception:
+                logger.warning("pipeline_input_sanitization_failed", exc_info=True)
+
         # Persist initial state
         await self._persist_run(run)
 
@@ -1566,6 +1591,14 @@ class PipelineOrchestrator:
             )
         except Exception:
             pass
+
+        # Notification: pipeline started
+        await self._write_notification(
+            run,
+            title="Pipeline started",
+            body=f"Building project: {run.context.get('__requirements__', '')[:100]}",
+            notification_type="pipeline_started",
+        )
 
         # CHANGE-13: PlannerAgent is now the default execution mode.
         # It respects the dependency graph, mandatory stages, and falls back
@@ -2104,6 +2137,42 @@ class PipelineOrchestrator:
     # ── CHANGE-28: Build actual code summary for reflect() ─────────────
 
     @staticmethod
+    async def _write_notification(
+        self,
+        run: PipelineRun,
+        title: str,
+        body: str,
+        notification_type: str = "info",
+    ) -> None:
+        """Write a notification to the notify.notifications table.
+
+        The DB table already exists (migration 001). This writes events so users
+        can track pipeline progress. Non-fatal — silently skips on any error.
+        """
+        try:
+            from app.core.database import get_async_session
+
+            async with get_async_session() as session:
+                from sqlalchemy import text as _sa_text
+
+                await session.execute(
+                    _sa_text(
+                        "INSERT INTO notify.notifications "
+                        "(user_id, title, body, notification_type, is_read) "
+                        "VALUES (:uid, :title, :body, :ntype, false)"
+                    ),
+                    {
+                        "uid": run.context.get("__user_id__", "system"),
+                        "title": title[:200],
+                        "body": body[:2000],
+                        "ntype": notification_type,
+                    },
+                )
+                await session.commit()
+        except Exception:
+            pass  # Non-fatal — notification is advisory
+
+    @staticmethod
     def _build_reflection_summary(agent_name: str, output: dict) -> str:
         """CHANGE-28: Build actual code structure for reflect() instead of metadata.
 
@@ -2262,6 +2331,29 @@ class PipelineOrchestrator:
         api_warnings = ctx.get("__api_contract_warnings__", [])
         if api_warnings:
             state["api_contract_issues"] = len(api_warnings)
+
+        # ── Simulation transparency: aggregate simulation flags ──
+        sim_flags: dict[str, Any] = {}
+        aarav_out = ctx.get("aarav", {})
+        if isinstance(aarav_out, dict):
+            sim_flags["testing"] = aarav_out.get("is_simulation_sandbox", False)
+        pranav_out = ctx.get("pranav", {})
+        if isinstance(pranav_out, dict):
+            sim_flags["deployment"] = pranav_out.get("is_simulation_deploy", False)
+        if sim_flags:
+            state["simulation"] = sim_flags
+
+        # ── Completeness data: extract LLM evaluation percentages ──
+        completeness: dict[str, int] = {}
+        for agent_name in ("shubham", "aanya", "dhruv", "karan", "navya",
+                           "deepika", "saanvi", "vanya", "tilotma", "aarav", "pranav"):
+            agent_out = ctx.get(agent_name, {})
+            if isinstance(agent_out, dict):
+                llm_eval = agent_out.get("llm_evaluation", {})
+                if isinstance(llm_eval, dict) and "completeness_pct" in llm_eval:
+                    completeness[agent_name] = llm_eval["completeness_pct"]
+        if completeness:
+            state["completeness"] = completeness
 
         return state
 
@@ -2841,6 +2933,22 @@ class PipelineOrchestrator:
             run.context[agent_name] = result.output
             # C2b-FIX: Compact large values to storage references
             await self._compact_agent_output(run, agent_name)
+
+            # ── Simulation transparency: log whether stage was real or simulated ──
+            sim_sandbox = result.output.get("is_simulation_sandbox")
+            sim_deploy = result.output.get("is_simulation_deploy")
+            if sim_sandbox is True:
+                logger.warning(
+                    "stage_completed_simulated",
+                    stage=stage.value, agent=agent_name,
+                    reason="Docker not available — no real tests ran",
+                )
+            elif sim_deploy is True:
+                logger.warning(
+                    "stage_completed_simulated",
+                    stage=stage.value, agent=agent_name,
+                    reason="No provider token — deployment was simulated",
+                )
 
             # CHANGE-9: Record success in mistake_memory for positive reinforcement.
             # Future runs will see both "what worked" and "what failed" in their prompts.

@@ -429,7 +429,21 @@ class FixerToolHandler:
                     "the structure, then make a targeted fix."
                 )
 
-        return f"Written {path} ({len(content)} chars)"
+        # Manifest injection: show Fixer what files it has patched
+        msg = f"Written {path} ({len(content)} chars)"
+        manifest_lines = ["\n\n📂 PATCHED FILES (check for consistency, avoid re-breaking):"]
+        for fpath in sorted(self._written_files.keys()):
+            fc = self._written_files[fpath]
+            if not fc:
+                continue
+            fline_count = fc.count("\n") + 1
+            was_snapshot = fpath in self._snapshots
+            status = "FIXED" if was_snapshot else "NEW"
+            manifest_lines.append(f"  - `{fpath}` ({fline_count} lines) [{status}]")
+        if len(manifest_lines) > 1:
+            manifest_lines.append("  ⚠ Do NOT re-break files you already fixed!")
+            msg += "\n".join(manifest_lines)
+        return msg
 
     async def _apply_diff(self, path: str, diff_text: str) -> str:
         """Apply a unified diff to an existing file.

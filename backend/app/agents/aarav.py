@@ -318,6 +318,15 @@ class Aarav:
 
         # STORE-FIX: Persist output to context engine for downstream agents
         result = self._build_result(report, sandbox_start)
+
+        # ── AI test analysis: LLM analyzes failures and provides triage ──
+        try:
+            ai_analysis = await self._run_ai_test_analysis(result.output)
+            result.output["ai_analysis"] = ai_analysis
+            result.output["llm_evaluation"] = ai_analysis
+        except Exception:
+            logger.warning("aarav_ai_analysis_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, result.output)
         return result
 
@@ -1087,7 +1096,8 @@ class Aarav:
             )
 
         output = {
-            "all_passed": report.all_passed,
+            # SIM-FIX: When simulated, all_passed is None (unknown), not True
+            "all_passed": None if is_simulation_sandbox else report.all_passed,
             "is_simulation_sandbox": is_simulation_sandbox,
             "total_duration_ms": round(report.total_duration_ms, 1),
             "total_tests": report.total_tests,
@@ -1108,6 +1118,15 @@ class Aarav:
                 for r in report.phase_results
             ],
         }
+
+        # ── Simulation transparency: prominent warning when no real tests ran ──
+        if is_simulation_sandbox:
+            output["simulation_warning"] = (
+                "ALL TEST PHASES SIMULATED — Docker not available. "
+                "0/9 phases ran real tests. Results are UNVERIFIED. "
+                "Install Docker and restart to enable real testing."
+            )
+            output["confidence"] = "NONE"
 
         logger.info(
             "sandbox_test_complete",
@@ -1130,6 +1149,92 @@ class Aarav:
             status=AgentStatus.COMPLETED,
             output=output,
         )
+
+    # ── AI-driven test analysis ─────────────────────────────────────
+
+    async def _run_ai_test_analysis(
+        self,
+        test_output: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM analyzes test results to provide root cause analysis.
+
+        Instead of raw 'FAIL: test_login returned 500', produces:
+        - Root cause per failure
+        - Severity ranking (critical/major/minor)
+        - Fix suggestions for the Fixer agent
+        - Prioritized fix order
+        Uses cheapest model (~$0.002/call).
+        """
+        import json as json_mod
+
+        is_sim = test_output.get("is_simulation_sandbox", False)
+        total = test_output.get("total_tests", 0)
+        passed = test_output.get("total_passed", 0)
+        failed = test_output.get("total_failed", 0)
+
+        # If simulation or no failures, return quick summary
+        if is_sim:
+            return {
+                "verdict": "SIMULATED",
+                "completeness_pct": 0,
+                "reasoning": "All tests were SIMULATED — Docker not available. No real test results to analyze.",
+                "failures": [],
+            }
+
+        if failed == 0:
+            return {
+                "verdict": "PASS",
+                "completeness_pct": 100,
+                "reasoning": f"All {total} tests passed.",
+                "failures": [],
+            }
+
+        # Collect failure details
+        failure_details = []
+        for phase in test_output.get("phase_results", []):
+            if phase.get("tests_failed", 0) > 0:
+                for err in phase.get("errors", [])[:5]:
+                    failure_details.append(f"  [{phase['phase']}] {err}")
+
+        failures_text = "\n".join(failure_details[:20]) if failure_details else "  (no error details captured)"
+
+        eval_prompt = (
+            "You are analyzing test results to help the Fixer agent. Be specific and actionable.\n\n"
+            f"## Test Summary: {passed}/{total} passed, {failed} failed\n\n"
+            f"## Failure Details\n{failures_text}\n\n"
+            "## Your Task\n"
+            "For each failure, provide:\n"
+            "1. Root cause — WHY did it fail? (missing model, wrong import, missing endpoint, etc.)\n"
+            "2. Severity — CRITICAL (blocks core functionality), MAJOR (blocks feature), MINOR (cosmetic)\n"
+            "3. Fix suggestion — specific code change needed\n"
+            "4. Priority order — fix critical issues first\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "failures": [\n'
+            '    {"phase": "api_test", "root_cause": "User model missing", "severity": "critical",\n'
+            '     "fix_suggestion": "Add User SQLAlchemy model to models/user.py", "priority": 1}\n'
+            "  ],\n"
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief summary"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1200,
+            agent_name=f"{self.name}_test_analysis",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
 
 # Register the agent

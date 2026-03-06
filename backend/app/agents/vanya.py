@@ -403,6 +403,15 @@ class Vanya:
             },
         }
 
+        # ── LLM self-evaluation: design completeness ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                design_spec, pages, context,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("vanya_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
@@ -413,6 +422,78 @@ class Vanya:
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
         )
+
+    # ── LLM-driven self-evaluation ──────────────────────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        design_spec: Any,
+        contract_pages: list[dict[str, Any]],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM reviews its own design specs for completeness.
+
+        Checks: all contract pages have design specs, design tokens consistent,
+        responsive breakpoints defined, accessibility requirements, interactive elements.
+        Uses cheapest model (~$0.002/call).
+        """
+        import json as json_mod
+
+        # Summarize what was designed
+        if isinstance(design_spec, dict):
+            spec_text = json_mod.dumps(design_spec, indent=2, default=str)[:3000]
+        else:
+            spec_text = str(design_spec)[:3000]
+
+        # Contract pages
+        page_lines = []
+        for p in contract_pages[:15]:
+            name = p.get("name", p.get("title", "unknown"))
+            components = p.get("components", [])
+            comp_str = f" — {len(components)} components" if components else ""
+            page_lines.append(f"  {name}{comp_str}")
+        pages_text = "\n".join(page_lines) if page_lines else "  (no pages in contract)"
+
+        eval_prompt = (
+            "You are reviewing UI/UX design specs YOU just produced. Be brutally honest.\n\n"
+            f"## Contract Pages Required ({len(contract_pages)} total)\n{pages_text}\n\n"
+            f"## Your Design Spec\n{spec_text}\n\n"
+            "## Your Task\n"
+            "Compare what the contract REQUIRES vs what you DESIGNED:\n"
+            "1. Did you design ALL pages from the contract? List any missing.\n"
+            "2. Are design tokens consistent across pages (colors, fonts, spacing)?\n"
+            "3. Did you define responsive breakpoints (mobile, tablet, desktop)?\n"
+            "4. Did you specify accessibility (WCAG) requirements per component?\n"
+            "5. Did you define all interactive elements (buttons, forms, modals)?\n"
+            "6. Did you define navigation flow between pages?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missing_pages": ["page1", "page2"],\n'
+            '  "missing_components": [{"page": "name", "component": "missing"}],\n'
+            '  "token_issues": ["inconsistent colors", ...],\n'
+            '  "accessibility_gaps": ["no contrast ratio defined", ...],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        from app.agents.base import TaskComplexity
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
 
 # Register the agent

@@ -266,6 +266,15 @@ class Tilotma:
             },
         }
 
+        # ── LLM self-evaluation: requirements completeness ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation_requirements(
+                ai_analysis, user_input,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("tilotma_req_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
@@ -463,6 +472,15 @@ class Tilotma:
                 "failed": tests_failed,
             },
         }
+
+        # ── LLM self-evaluation: review completeness ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation_review(
+                output, context,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("tilotma_review_self_eval_failed", exc_info=True)
 
         await store_output(self, pipeline_run_id, output)
 
@@ -936,6 +954,118 @@ class Tilotma:
             "interventions_made": len(memory_data.get("intervention_history", [])) if memory_data else 0,
             "monitoring_entries": len(memory_data.get("monitoring_log", [])) if memory_data else 0,
         }
+
+    # ── LLM-driven self-evaluation methods ──────────────────────────
+
+    async def _run_llm_self_evaluation_requirements(
+        self,
+        ai_analysis: str,
+        user_input: str,
+    ) -> dict[str, Any]:
+        """LLM reviews its own requirements extraction for completeness.
+
+        Checks: all user features captured, integrations identified,
+        edge cases considered, ambiguous items flagged.
+        Uses cheapest model (~$0.002/call).
+        """
+        eval_prompt = (
+            "You are reviewing requirements YOU just extracted. Be brutally honest.\n\n"
+            f"## Original User Request\n{user_input[:2000]}\n\n"
+            f"## Your Requirements Analysis\n{ai_analysis[:3000]}\n\n"
+            "## Your Task\n"
+            "Compare what the user ASKED FOR vs what you EXTRACTED:\n"
+            "1. Did you capture ALL features the user mentioned?\n"
+            "2. Did you identify implicit requirements (auth, error handling, validation)?\n"
+            "3. Are there ambiguous items that need clarification?\n"
+            "4. Did you miss any edge cases or non-functional requirements?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missed_features": ["feature1", "feature2"],\n'
+            '  "ambiguous_items": ["item1"],\n'
+            '  "implicit_requirements_found": ["auth", "validation"],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=800,
+            agent_name=f"{self.name}_req_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
+
+    async def _run_llm_self_evaluation_review(
+        self,
+        review_output: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM reviews its own GO/NO-GO decision for thoroughness.
+
+        Checks: did it consider all quality reports, was the decision justified,
+        were simulation limitations factored in.
+        Uses cheapest model (~$0.002/call).
+        """
+        import json as json_mod
+
+        decision = review_output.get("decision", "unknown")
+        reasoning = str(review_output.get("reasoning", ""))[:2000]
+        is_sim = review_output.get("is_simulation", False)
+
+        # List which agents' reports were available
+        available_reports = [
+            name for name in ("aarav", "karan", "navya", "deepika", "fixer")
+            if name in context
+        ]
+
+        eval_prompt = (
+            "You are reviewing your own GO/NO-GO decision. Be brutally honest.\n\n"
+            f"## Your Decision: {decision.upper()}\n"
+            f"## Simulation Mode: {'YES' if is_sim else 'NO'}\n"
+            f"## Reports Available: {', '.join(available_reports)}\n"
+            f"## Your Reasoning\n{reasoning}\n\n"
+            "## Your Task\n"
+            "Check your review for thoroughness:\n"
+            "1. Did you consider ALL available quality reports?\n"
+            "2. If in simulation mode, did you factor in that tests weren't real?\n"
+            "3. Was your decision justified by the evidence?\n"
+            "4. Did you consider the overall project risk level?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "reports_reviewed": ["aarav", "karan", ...],\n'
+            '  "reports_missed": ["deepika"],\n'
+            '  "simulation_considered": true/false,\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=800,
+            agent_name=f"{self.name}_review_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
 
 # Register the agent

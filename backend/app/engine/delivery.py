@@ -165,6 +165,20 @@ class DeliveryEngine:
                 contract_json = orjson.dumps(contract, option=orjson.OPT_INDENT_2).decode("utf-8")
                 zf.writestr(f"{project_name}/docs/architecture_contract.json", contract_json)
 
+            # 5b. Docs agent output (README, API docs, user guide)
+            docs_output = context.get("docs_agent", {})
+            if isinstance(docs_output, dict):
+                readme = docs_output.get("readme") or docs_output.get("README")
+                if readme:
+                    zf.writestr(f"{project_name}/README.md", readme)
+                    manifest.total_files = getattr(manifest, "total_files", 0)  # will be set later
+                api_docs = docs_output.get("api_docs") or docs_output.get("api_documentation")
+                if api_docs:
+                    zf.writestr(f"{project_name}/docs/api.md", api_docs)
+                user_guide = docs_output.get("user_guide")
+                if user_guide:
+                    zf.writestr(f"{project_name}/docs/user_guide.md", user_guide)
+
             # F4-FIX: Blocklist scan before packaging
             blocklist_findings = self._scan_for_dangerous_patterns(context)
             if blocklist_findings:

@@ -94,7 +94,9 @@ def _extract_relevant(
 ) -> str:
     """Extract the most relevant portion of an agent's output for a question.
 
-    Uses simple keyword matching to select the best section.
+    Uses STRUCTURED FIELD EXTRACTION (dict key lookups and file path patterns)
+    instead of keyword matching. This is more reliable — "schema" won't match
+    the wrong section, and file lookups use path patterns not content keywords.
     """
     question_lower = question.lower()
 
@@ -104,101 +106,116 @@ def _extract_relevant(
         if not contract:
             return _truncate(json.dumps(output, indent=2))
 
-        # Determine which section the question is about
-        if any(w in question_lower for w in ("table", "database", "column", "schema", "db")):
-            section = contract.get("database", {})
-            return _truncate(f"Database schema:\n{json.dumps(section, indent=2)}")
+        # Structured field mapping: question topic → contract key
+        _TOPIC_TO_KEY: dict[str, tuple[str, str]] = {
+            "database": ("database", "Database schema"),
+            "table": ("database", "Database schema"),
+            "column": ("database", "Database schema"),
+            "schema": ("database", "Database schema"),
+            "db": ("database", "Database schema"),
+            "endpoint": ("api", "API contract"),
+            "api": ("api", "API contract"),
+            "route": ("api", "API contract"),
+            "rest": ("api", "API contract"),
+            "page": ("frontend", "Frontend contract"),
+            "frontend": ("frontend", "Frontend contract"),
+            "component": ("frontend", "Frontend contract"),
+            "ui": ("frontend", "Frontend contract"),
+            "tech": ("tech_stack", "Tech stack"),
+            "stack": ("tech_stack", "Tech stack"),
+            "framework": ("tech_stack", "Tech stack"),
+            "security": ("security", "Security contract"),
+            "auth": ("security", "Security contract"),
+            "cors": ("security", "Security contract"),
+        }
 
-        if any(w in question_lower for w in ("endpoint", "api", "route", "rest", "auth")):
-            section = contract.get("api", {})
-            return _truncate(f"API contract:\n{json.dumps(section, indent=2)}")
+        # Find the first matching topic
+        for word, (key, label) in _TOPIC_TO_KEY.items():
+            if word in question_lower:
+                section = contract.get(key, {})
+                if section:
+                    return _truncate(f"{label}:\n{json.dumps(section, indent=2)}")
 
-        if any(w in question_lower for w in ("page", "frontend", "component", "ui")):
-            section = contract.get("frontend", {})
-            return _truncate(f"Frontend contract:\n{json.dumps(section, indent=2)}")
-
-        if any(w in question_lower for w in ("tech", "stack", "framework")):
-            section = contract.get("tech_stack", {})
-            return _truncate(f"Tech stack:\n{json.dumps(section, indent=2)}")
-
-        if any(w in question_lower for w in ("security", "auth_method", "cors", "rate")):
-            section = contract.get("security", {})
-            return _truncate(f"Security contract:\n{json.dumps(section, indent=2)}")
-
-        # Default: return a summary (not the full contract which may be huge)
+        # Default: structured summary with actual counts
         summary = {
             "project_name": contract.get("project_name"),
             "tech_stack": contract.get("tech_stack"),
-            "table_count": len(contract.get("database", {}).get("tables", [])),
+            "tables": [t.get("name") for t in contract.get("database", {}).get("tables", [])],
             "endpoint_count": len(contract.get("api", {}).get("endpoints", [])),
-            "page_count": len(contract.get("frontend", {}).get("pages", [])),
+            "pages": [p.get("name", p.get("title")) for p in contract.get("frontend", {}).get("pages", [])],
         }
         return _truncate(
             f"Architecture contract summary:\n{json.dumps(summary, indent=2)}\n\n"
-            f"Ask a more specific question about tables, endpoints, pages, or tech stack "
-            f"to get detailed contract sections."
+            f"Available sections: database, api, frontend, tech_stack, security"
         )
 
-    # ── Shubham (backend) ───────────────────────────────────────────
-    if agent_name == "shubham":
+    # ── Shubham / Aanya (code generators) ──────────────────────────
+    if agent_name in ("shubham", "aanya"):
         file_contents = output.get("file_contents", {})
+        label = "Backend" if agent_name == "shubham" else "Frontend"
         if not file_contents:
-            return "Shubham has not yet generated backend files."
+            return f"{label} files not yet generated."
 
         files_list = list(file_contents.keys())
 
-        # Try to find a specific file mentioned in the question
+        # 1. Exact file path match: if the question mentions a specific file
         for path in files_list:
-            filename = path.split("/")[-1]
-            if filename.lower() in question_lower or path.lower() in question_lower:
+            filename = path.split("/")[-1].lower()
+            if filename in question_lower or path.lower() in question_lower:
                 content = file_contents[path]
-                return _truncate(f"File {path}:\n```\n{content}\n```")
+                exports = _extract_exports(path, content)
+                export_str = f"\nExports: {', '.join(exports)}" if exports else ""
+                return _truncate(f"File {path}:{export_str}\n```\n{content}\n```")
 
-        # Topic-based file selection
-        if any(w in question_lower for w in ("model", "schema", "database", "orm")):
-            for path in files_list:
-                if "model" in path.lower():
-                    return _truncate(f"File {path}:\n```\n{file_contents[path]}\n```")
+        # 2. Path pattern matching: use directory/filename structure, not content keywords
+        _PATH_PATTERNS: dict[str, list[str]] = {
+            "model": ["/models/", "models.py", "/schemas/", "schemas.py"],
+            "schema": ["/models/", "models.py", "/schemas/", "schemas.py"],
+            "route": ["/routers/", "/routes/", "router.py", "routes.py", "urls.py"],
+            "endpoint": ["/routers/", "/routes/", "router.py", "routes.py"],
+            "api": ["/routers/", "/api/", "api.py", "service.py", "services/"],
+            "auth": ["/auth", "auth.py", "security.py", "jwt"],
+            "component": ["/components/", "Component", ".tsx", ".jsx"],
+            "page": ["/pages/", "/views/", "Page", "View"],
+            "config": ["config.py", "settings.py", ".env", "config/"],
+            "test": ["/tests/", "test_", "_test.py", ".test."],
+            "middleware": ["/middleware", "middleware.py"],
+            "database": ["/db/", "database.py", "db.py", "connection"],
+        }
 
-        if any(w in question_lower for w in ("endpoint", "route", "api")):
-            for path in files_list:
-                if "router" in path.lower() or "route" in path.lower():
-                    return _truncate(f"File {path}:\n```\n{file_contents[path]}\n```")
+        for topic, patterns in _PATH_PATTERNS.items():
+            if topic in question_lower:
+                matched = [p for p in files_list if any(pat in p.lower() for pat in patterns)]
+                if matched:
+                    results = []
+                    for mp in matched[:3]:  # Max 3 files
+                        exports = _extract_exports(mp, file_contents[mp])
+                        export_str = f" — exports: {', '.join(exports[:8])}" if exports else ""
+                        results.append(f"  {mp} ({file_contents[mp].count(chr(10))+1} lines){export_str}")
+                    file_detail = "\n".join(results)
+                    # Return content of first match
+                    return _truncate(
+                        f"{label} files matching '{topic}':\n{file_detail}\n\n"
+                        f"Content of {matched[0]}:\n```\n{file_contents[matched[0]]}\n```"
+                    )
 
-        if any(w in question_lower for w in ("auth", "security", "jwt")):
-            for path in files_list:
-                if "auth" in path.lower() or "security" in path.lower():
-                    return _truncate(f"File {path}:\n```\n{file_contents[path]}\n```")
-
-        # Default: return file list
-        return f"Backend files generated by Shubham:\n" + "\n".join(f"  - {p}" for p in files_list)
-
-    # ── Aanya (frontend) ───────────────────────────────────────────
-    if agent_name == "aanya":
-        file_contents = output.get("file_contents", {})
-        if not file_contents:
-            return "Aanya has not yet generated frontend files."
-
-        files_list = list(file_contents.keys())
-
-        # Topic-based file selection
-        if any(w in question_lower for w in ("component", "page", "ui")):
-            for path in files_list:
-                if "component" in path.lower() or "page" in path.lower():
-                    return _truncate(f"File {path}:\n```\n{file_contents[path]}\n```")
-
-        if any(w in question_lower for w in ("api", "endpoint", "fetch", "axios")):
-            for path in files_list:
-                if "api" in path.lower() or "service" in path.lower():
-                    return _truncate(f"File {path}:\n```\n{file_contents[path]}\n```")
-
-        return f"Frontend files generated by Aanya:\n" + "\n".join(f"  - {p}" for p in files_list)
+        # 3. Default: file list with exports
+        lines = [f"{label} files ({len(files_list)} total):"]
+        for p in files_list:
+            exports = _extract_exports(p, file_contents[p])
+            export_str = f" — {', '.join(exports[:5])}" if exports else ""
+            lines.append(f"  {p}{export_str}")
+        return _truncate("\n".join(lines))
 
     # ── Aarav (test results) ────────────────────────────────────────
     if agent_name == "aarav":
+        is_sim = output.get("is_simulation_sandbox", False)
         summary = {
-            "passed": output.get("passed"),
-            "failed": output.get("failed"),
+            "all_passed": output.get("all_passed"),
+            "is_simulation": is_sim,
+            "total_tests": output.get("total_tests", 0),
+            "total_passed": output.get("total_passed", 0),
+            "total_failed": output.get("total_failed", 0),
             "phase_results": [
                 {
                     "phase": p.get("phase"),
@@ -208,11 +225,64 @@ def _extract_relevant(
                 for p in output.get("phase_results", [])
             ],
         }
-        return _truncate(f"Test results:\n{json.dumps(summary, indent=2)}")
+        # Include AI analysis if available
+        ai_analysis = output.get("ai_analysis", {})
+        if ai_analysis:
+            summary["ai_analysis"] = ai_analysis
+        sim_note = " (SIMULATED — no real tests ran)" if is_sim else ""
+        return _truncate(f"Test results{sim_note}:\n{json.dumps(summary, indent=2)}")
+
+    # ── Dhruv (database artifacts) ─────────────────────────────────
+    if agent_name == "dhruv":
+        written = output.get("written_files", {})
+        if written:
+            lines = [f"Database artifacts ({len(written)} files):"]
+            for path in sorted(written.keys()):
+                lc = written[path].count("\n") + 1 if written[path] else 0
+                lines.append(f"  {path} ({lc} lines)")
+            return _truncate("\n".join(lines))
+        return _truncate(json.dumps(output, indent=2))
+
+    # ── Karan (security findings) ──────────────────────────────────
+    if agent_name == "karan":
+        findings = output.get("findings", [])
+        return _truncate(
+            f"Security scan: {output.get('files_scanned', 0)} files scanned, "
+            f"{len(findings)} findings, "
+            f"{output.get('critical_count', 0)} critical, "
+            f"{output.get('high_count', 0)} high\n"
+            f"Passed: {output.get('passed', 'unknown')}\n"
+            f"Findings:\n{json.dumps(findings[:10], indent=2)}"
+        )
 
     # ── Generic fallback ────────────────────────────────────────────
-    # Return the output dict, truncated if too large
     return _truncate(json.dumps(output, indent=2))
+
+
+def _extract_exports(path: str, content: str) -> list[str]:
+    """Extract top-level class/function names from Python/TS files."""
+    if not content:
+        return []
+    if path.endswith(".py"):
+        try:
+            import ast
+            tree = ast.parse(content)
+            names: list[str] = []
+            for node in ast.iter_child_nodes(tree):
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.append(node.name)
+            return names
+        except SyntaxError:
+            return []
+    if path.endswith((".ts", ".tsx", ".js", ".jsx")):
+        # Simple regex extraction for JS/TS exports
+        import re
+        exports = re.findall(
+            r'export\s+(?:default\s+)?(?:class|function|const|let|var)\s+(\w+)',
+            content,
+        )
+        return exports[:10]
+    return []
 
 
 def _truncate(text: str, max_chars: int = _MAX_ORACLE_CHARS) -> str:

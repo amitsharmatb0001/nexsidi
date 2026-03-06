@@ -396,6 +396,15 @@ class Deepika:
             "total_findings": len(report.findings),
         }
 
+        # ── LLM self-evaluation: performance analysis completeness ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                findings_output, all_files, context,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("deepika_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         logger.info(
@@ -412,6 +421,75 @@ class Deepika:
             status=AgentStatus.COMPLETED,
             output=output,
         )
+
+    # ── LLM-driven self-evaluation ──────────────────────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        findings: list[dict[str, Any]],
+        analyzed_files: dict[str, str],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM reviews its own performance analysis for completeness.
+
+        Checks: N+1 queries, async patterns, pagination, memory leaks,
+        unbounded loops, missing indexes.
+        Uses cheapest model (~$0.002/call).
+        """
+        finding_summary = []
+        for f in findings[:25]:
+            finding_summary.append(
+                f"  [{f.get('severity', '?')}] {f.get('category', '?')}: "
+                f"{f.get('title', '?')} in {f.get('file_path', '?')}"
+            )
+        findings_text = "\n".join(finding_summary) if finding_summary else "  (no findings)"
+
+        file_list = ", ".join(sorted(analyzed_files.keys())[:30])
+
+        # Check if database is involved
+        has_db = bool(context.get("dhruv", {}).get("written_files"))
+
+        eval_prompt = (
+            "You are reviewing performance analysis results YOU just produced. Be brutally honest.\n\n"
+            f"## Files Analyzed ({len(analyzed_files)} total)\n{file_list}\n"
+            f"## Database Present: {'Yes' if has_db else 'No'}\n\n"
+            f"## Findings You Reported\n{findings_text}\n\n"
+            "## Your Task\n"
+            "Check your performance analysis coverage:\n"
+            "1. N+1 query detection — did you check ALL database access patterns?\n"
+            "2. Missing async/await — did you check for sync calls in async context?\n"
+            "3. Unbounded queries — did you check for SELECT without LIMIT?\n"
+            "4. Memory leaks — unbounded caches, growing lists without cleanup?\n"
+            "5. Missing pagination — list endpoints returning all records?\n"
+            "6. Missing indexes — queries on columns without indexes?\n"
+            "7. Frontend bundle size — large imports, missing code splitting?\n"
+            "8. Did you analyze ALL generated files?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "categories_checked": ["n_plus_1", "async_patterns", ...],\n'
+            '  "categories_missed": ["memory_leaks", ...],\n'
+            '  "files_not_analyzed": ["path1", ...],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
     # ── File Collection ────────────────────────────────────────────
 

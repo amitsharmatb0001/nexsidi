@@ -381,6 +381,16 @@ class Navya:
             "total_findings": len(report.findings),
         }
 
+        # ── LLM self-evaluation: logic analysis completeness ──
+        try:
+            contract = context.get("vikram", {}).get("contract", {})
+            llm_eval = await self._run_llm_self_evaluation(
+                findings_output, all_files, contract,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("navya_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         logger.info(
@@ -397,6 +407,76 @@ class Navya:
             status=AgentStatus.COMPLETED,
             output=output,
         )
+
+    # ── LLM-driven self-evaluation ──────────────────────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        findings: list[dict[str, Any]],
+        analyzed_files: dict[str, str],
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM reviews its own logic analysis for completeness.
+
+        Checks: all files analyzed, error handling paths, dead code,
+        business logic vs contract, unreachable branches.
+        Uses cheapest model (~$0.002/call).
+        """
+        finding_summary = []
+        for f in findings[:25]:
+            finding_summary.append(
+                f"  [{f.get('severity', '?')}] {f.get('category', '?')}: "
+                f"{f.get('title', '?')} in {f.get('file_path', '?')}"
+            )
+        findings_text = "\n".join(finding_summary) if finding_summary else "  (no findings)"
+
+        file_list = ", ".join(sorted(analyzed_files.keys())[:30])
+
+        # Extract contract endpoints for business logic verification
+        endpoints = contract.get("endpoints", contract.get("api", {}).get("endpoints", []))
+        endpoint_text = ""
+        if endpoints:
+            ep_lines = [f"  {e.get('method', 'GET')} {e.get('path', '?')}" for e in endpoints[:15]]
+            endpoint_text = f"\n## Contract Endpoints\n" + "\n".join(ep_lines)
+
+        eval_prompt = (
+            "You are reviewing logic analysis results YOU just produced. Be brutally honest.\n\n"
+            f"## Files Analyzed ({len(analyzed_files)} total)\n{file_list}\n"
+            f"{endpoint_text}\n\n"
+            f"## Findings You Reported\n{findings_text}\n\n"
+            "## Your Task\n"
+            "Check your analysis coverage:\n"
+            "1. Did you analyze ALL generated files? List any you skipped.\n"
+            "2. Did you check error handling paths (try/except, error responses)?\n"
+            "3. Did you check for dead code / unreachable branches?\n"
+            "4. Did you verify business logic matches contract endpoints?\n"
+            "5. Did you check for race conditions or state management issues?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "files_not_analyzed": ["path1", "path2"],\n'
+            '  "categories_checked": ["error_handling", "dead_code", ...],\n'
+            '  "categories_missed": ["race_conditions", ...],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
     # ── File Collection ────────────────────────────────────────────
 

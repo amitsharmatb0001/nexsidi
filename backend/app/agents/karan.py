@@ -754,6 +754,15 @@ class Karan:
             "total_findings": len(report.findings),
         }
 
+        # ── LLM self-evaluation: OWASP coverage check ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                findings_output, all_files, context,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("karan_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         logger.info(
@@ -770,6 +779,80 @@ class Karan:
             status=AgentStatus.COMPLETED,
             output=output,
         )
+
+    # ── LLM-driven self-evaluation ──────────────────────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        findings: list[dict[str, Any]],
+        scanned_files: dict[str, str],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM reviews its own security findings for completeness.
+
+        Checks OWASP Top 10 coverage, whether all files were scanned,
+        and whether critical categories (auth, injection, XSS) were checked.
+        Uses cheapest model (~$0.002/call).
+        """
+        # Summarize what was found
+        finding_summary = []
+        for f in findings[:30]:
+            finding_summary.append(
+                f"  [{f.get('severity', '?')}] {f.get('category', '?')}: "
+                f"{f.get('title', '?')} in {f.get('file_path', '?')}"
+            )
+        findings_text = "\n".join(finding_summary) if finding_summary else "  (no findings)"
+
+        # List files that were scanned
+        file_list = ", ".join(sorted(scanned_files.keys())[:30])
+
+        eval_prompt = (
+            "You are reviewing security scan results YOU just produced. Be brutally honest.\n\n"
+            f"## Files Scanned ({len(scanned_files)} total)\n{file_list}\n\n"
+            f"## Findings You Reported\n{findings_text}\n\n"
+            "## Your Task\n"
+            "Check your coverage against the OWASP Top 10 2021:\n"
+            "A01: Broken Access Control\n"
+            "A02: Cryptographic Failures\n"
+            "A03: Injection (SQL, NoSQL, Command, XSS)\n"
+            "A04: Insecure Design\n"
+            "A05: Security Misconfiguration\n"
+            "A06: Vulnerable Components\n"
+            "A07: Auth Failures\n"
+            "A08: Data Integrity Failures\n"
+            "A09: Logging/Monitoring Failures\n"
+            "A10: SSRF\n\n"
+            "For each category, did you CHECK it? Report:\n"
+            "1. Which OWASP categories you actually scanned for\n"
+            "2. Which categories you MISSED entirely\n"
+            "3. Which files you did NOT analyze\n"
+            "4. Overall coverage percentage\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "owasp_covered": ["A01", "A03", ...],\n'
+            '  "owasp_missed": ["A04", "A08", ...],\n'
+            '  "files_not_scanned": ["path1", "path2"],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
     # ── Static Scanners ────────────────────────────────────────────
 

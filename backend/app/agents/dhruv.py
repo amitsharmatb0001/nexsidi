@@ -80,7 +80,23 @@ class DhruvToolHandler:
         if len(content) < 5:
             return "Error: content too short — must contain actual schema definitions"
         self._written_files[path] = content
-        return f"Written {path} ({len(content)} chars)"
+
+        # Manifest injection: show Dhruv what DDL files it has generated
+        msg = f"Written {path} ({len(content)} chars)"
+        manifest_lines = ["\n\n📂 GENERATED DDL FILES (avoid duplicates, ensure completeness):"]
+        for fpath in sorted(self._written_files.keys()):
+            fc = self._written_files[fpath]
+            if not fc:
+                continue
+            fline_count = fc.count("\n") + 1
+            # Extract table names from SQL CREATE TABLE statements
+            import re
+            tables = re.findall(r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?(\w+)', fc, re.IGNORECASE)
+            table_str = f" — tables: {', '.join(tables)}" if tables else ""
+            manifest_lines.append(f"  - `{fpath}` ({fline_count} lines){table_str}")
+        if len(manifest_lines) > 1:
+            msg += "\n".join(manifest_lines)
+        return msg
 
     def _generate_migration(self, tool_input: dict) -> str:
         migration = {
@@ -521,6 +537,15 @@ class Dhruv:
             },
         }
 
+        # ── LLM self-evaluation: check completeness against contract ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                handler._written_files, tables, db_config,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("dhruv_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
@@ -531,6 +556,88 @@ class Dhruv:
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
         )
+
+    # ── LLM-driven self-evaluation ──────────────────────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        written_files: dict[str, str],
+        contract_tables: list[dict[str, Any]],
+        db_config: DatabaseConfig,
+    ) -> dict[str, Any]:
+        """LLM reviews its own DDL/migrations against the contract tables.
+
+        Checks: all tables generated, all columns present, foreign keys correct,
+        indexes for query patterns, migration files for each table.
+        Uses cheapest model (~$0.002/call).
+        """
+        # Build file summary
+        file_lines: list[str] = []
+        for path, content in sorted(written_files.items()):
+            if not content:
+                continue
+            lc = content.count("\n") + 1
+            # Show first few CREATE/table lines
+            key_lines = [
+                ln.strip() for ln in content.split("\n")
+                if any(kw in ln.upper() for kw in ("CREATE", "TABLE", "INDEX", "FOREIGN KEY", "REFERENCES"))
+            ][:5]
+            key_str = "; ".join(key_lines) if key_lines else ""
+            file_lines.append(f"  {path} ({lc} lines) — {key_str}")
+
+        files_text = "\n".join(file_lines) if file_lines else "  (no files written)"
+
+        # Build contract summary
+        table_lines: list[str] = []
+        for tbl in contract_tables[:20]:
+            name = tbl.get("name", "unknown")
+            cols = [c.get("name", "?") for c in tbl.get("columns", tbl.get("fields", []))]
+            rels = tbl.get("relationships", [])
+            rel_str = f" | rels: {', '.join(str(r) for r in rels[:3])}" if rels else ""
+            table_lines.append(f"  {name}: {', '.join(cols[:12])}{rel_str}")
+        tables_text = "\n".join(table_lines)
+
+        eval_prompt = (
+            "You are reviewing database artifacts YOU just generated. Be brutally honest.\n\n"
+            f"## Database: {db_config.display_name} ({db_config.category})\n\n"
+            f"## Contract Tables Required\n{tables_text}\n\n"
+            f"## Files You Generated\n{files_text}\n\n"
+            "## Your Task\n"
+            "Compare what the contract REQUIRES vs what you ACTUALLY generated.\n"
+            "Find:\n"
+            "1. Missing tables — tables in contract but NOT in any generated file\n"
+            "2. Missing columns — columns listed in contract but NOT in the DDL\n"
+            "3. Missing foreign keys/relationships — declared in contract but NOT implemented\n"
+            "4. Missing indexes — columns that will be queried but have no index\n"
+            "5. Missing migrations — tables without migration files\n"
+            "6. Completeness — what percentage of the contract is implemented?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missing_tables": [{"name": "table_name", "reason": "not generated"}],\n'
+            '  "missing_columns": [{"table": "name", "column": "col_name"}],\n'
+            '  "missing_relationships": [{"from": "t1", "to": "t2", "type": "FK"}],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+            "If everything is complete, return empty arrays and PASS."
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
 
 # Register the agent

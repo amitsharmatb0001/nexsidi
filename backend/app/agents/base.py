@@ -917,6 +917,29 @@ async def call_ai_with_tools(
 # ── Context Helpers ─────────────────────────────────────────────────
 
 
+def _sanitize_inter_agent_value(value: Any, _depth: int = 0) -> Any:
+    """Sanitize output values to prevent inter-agent prompt injection.
+
+    Strips potential prompt injection markers from string values that will
+    become another agent's input. Same neutralization as prompt_engine.py.
+    Max recursion depth of 3 to avoid performance issues on deep dicts.
+    """
+    if _depth > 3:
+        return value
+    if isinstance(value, str):
+        # Neutralize fake role markers and conversation turn indicators
+        for marker in ("[SYSTEM]", "[INST]", "[END]", "[STOP]", "System:", "Human:", "User:", "Assistant:"):
+            if marker in value:
+                safe = marker.replace("[", "(").replace("]", ")").replace(":", " -")
+                value = value.replace(marker, safe)
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_inter_agent_value(v, _depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_inter_agent_value(v, _depth + 1) for v in value]
+    return value
+
+
 async def store_output(
     agent: Any,
     pipeline_run_id: str,
@@ -926,7 +949,13 @@ async def store_output(
 
     ``agent`` must have ``.name`` attribute.
     Gracefully skips if the context engine is not initialized (e.g. in tests).
+
+    Inter-agent sanitization: neutralizes prompt injection markers in output
+    values so a compromised agent can't inject instructions into downstream agents.
     """
+    # Sanitize output before storing (inter-agent prompt injection defense)
+    output = _sanitize_inter_agent_value(output)
+
     from app.services.context_engine import get_context_engine
 
     try:

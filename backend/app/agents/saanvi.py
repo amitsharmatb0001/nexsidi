@@ -386,6 +386,16 @@ class Saanvi:
             },
         }
 
+        # ── LLM self-evaluation: requirements completeness ──
+        try:
+            raw_input = context.get("tilotma", {}).get("raw_requirements", "")
+            llm_eval = await self._run_llm_self_evaluation(
+                analysis_data, raw_input,
+            )
+            output["llm_evaluation"] = llm_eval
+        except Exception:
+            logger.warning("saanvi_self_eval_failed", exc_info=True)
+
         await store_output(self, pipeline_run_id, output)
 
         return AgentResult(
@@ -396,6 +406,68 @@ class Saanvi:
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
         )
+
+    # ── LLM-driven self-evaluation ──────────────────────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        analysis_data: Any,
+        raw_user_input: str,
+    ) -> dict[str, Any]:
+        """LLM reviews its own requirements analysis for completeness.
+
+        Checks: all user-mentioned features captured, integrations identified,
+        requirements specific enough for architecture, ambiguous items flagged.
+        Uses cheapest model (~$0.002/call).
+        """
+        import json as json_mod
+
+        # Truncate analysis for prompt
+        if isinstance(analysis_data, dict):
+            analysis_text = json_mod.dumps(analysis_data, indent=2, default=str)[:3000]
+        else:
+            analysis_text = str(analysis_data)[:3000]
+
+        user_text = str(raw_user_input)[:2000]
+
+        eval_prompt = (
+            "You are reviewing requirements analysis YOU just produced. Be brutally honest.\n\n"
+            f"## Original User Input\n{user_text}\n\n"
+            f"## Your Analysis\n{analysis_text}\n\n"
+            "## Your Task\n"
+            "Compare what the user ASKED FOR vs what you ANALYZED:\n"
+            "1. Did you capture ALL features the user mentioned?\n"
+            "2. Did you identify all integrations (auth, payments, email, file storage, etc.)?\n"
+            "3. Are your requirements specific enough for an architect to design a system?\n"
+            "4. Did you flag any ambiguous or incomplete requirements?\n"
+            "5. Did you identify non-functional requirements (performance, security, scalability)?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missed_features": ["feature1", "feature2"],\n'
+            '  "missed_integrations": ["auth", "payment"],\n'
+            '  "ambiguous_items": ["item1"],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        from app.agents.base import TaskComplexity
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
 
 
 # Register the agent

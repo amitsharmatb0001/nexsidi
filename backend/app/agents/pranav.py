@@ -245,11 +245,35 @@ class Pranav:
             region=config.region,
         )
 
+        # ── AI deployment analysis: LLM evaluates project needs ──
+        try:
+            ai_deploy_guidance = await self._run_ai_deployment_analysis(
+                contract, resolved_name, cloud_config,
+            )
+            # LLM may recommend a different provider — log but don't auto-switch
+            if ai_deploy_guidance.get("recommended_provider"):
+                rec = ai_deploy_guidance["recommended_provider"]
+                if rec.lower() != resolved_name.lower():
+                    logger.info(
+                        "ai_deploy_recommendation_differs",
+                        configured=resolved_name,
+                        recommended=rec,
+                        reason=ai_deploy_guidance.get("reasoning", ""),
+                    )
+        except Exception:
+            logger.warning("pranav_ai_analysis_failed", exc_info=True)
+            ai_deploy_guidance = {}
+
         # Generate provider-specific config files
         config_files = self._generate_config_files(config)
 
         # D5-FIX: Generate Terraform IaC files alongside existing configs
         terraform_files = self._generate_terraform_files(config)
+
+        # Generate CI/CD pipeline (GitHub Actions)
+        ci_workflow = self._generate_ci_cd_workflow(config, contract)
+        if ci_workflow:
+            config_files[".github/workflows/ci.yml"] = ci_workflow
 
         # Execute the deployment
         result = await self._deploy(config, context)
@@ -293,6 +317,16 @@ class Pranav:
                 from app.services.ai_router import _sanitize_error
                 logger.warning("smoke_tests_error", url=result.deployment_url, error=_sanitize_error(exc)[:200])
                 output["smoke_tests"] = {"error": _sanitize_error(exc)[:200], "passed": 0, "failed": 0, "checks": []}
+
+        # ── LLM self-evaluation: deployment config completeness ──
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                output, contract,
+            )
+            output["llm_evaluation"] = llm_eval
+            output["ai_deploy_guidance"] = ai_deploy_guidance
+        except Exception:
+            logger.warning("pranav_self_eval_failed", exc_info=True)
 
         await store_output(self, pipeline_run_id, output)
 
@@ -733,6 +767,231 @@ class Pranav:
             duration_seconds=elapsed,
             is_simulation=(deploy_mode == "simulation"),
         )
+
+    # ── AI-driven deployment analysis ───────────────────────────────
+
+    async def _run_ai_deployment_analysis(
+        self,
+        contract: dict[str, Any],
+        provider_name: str,
+        cloud_config: CloudConfig,
+    ) -> dict[str, Any]:
+        """LLM analyzes project needs and recommends deployment strategy.
+
+        Evaluates: WebSocket support, background jobs, database needs,
+        file storage, expected traffic, and whether the selected provider fits.
+        Uses cheapest model (~$0.002/call).
+        """
+        tech_stack = contract.get("tech_stack", {})
+        features = contract.get("features", [])
+        database = contract.get("database", {})
+        deployment = contract.get("deployment", {})
+
+        eval_prompt = (
+            "You are analyzing a project's deployment needs. Be specific.\n\n"
+            f"## Selected Provider: {cloud_config.display_name} ({cloud_config.category})\n"
+            f"## Tech Stack: {tech_stack}\n"
+            f"## Features: {features[:10]}\n"
+            f"## Database: {database.get('name', 'none')}\n"
+            f"## Deployment Config: {deployment}\n\n"
+            "## Your Task\n"
+            "Analyze whether the selected provider is RIGHT for this project:\n"
+            "1. Does the project need WebSockets? (If so, serverless won't work)\n"
+            "2. Does it need background jobs? (Need worker processes)\n"
+            "3. Does it need file storage? (Need S3/GCS integration)\n"
+            "4. Database requirements match provider's offerings?\n"
+            "5. Any provider-specific limitations that affect this project?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "recommended_provider": "railway" or "vercel" or same,\n'
+            '  "provider_fit_score": 0-100,\n'
+            '  "concerns": ["WebSocket support limited", ...],\n'
+            '  "missing_configs": ["Redis worker", "file storage bucket"],\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=800,
+            agent_name=f"{self.name}_deploy_analysis",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
+
+    async def _run_llm_self_evaluation(
+        self,
+        output: dict[str, Any],
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLM reviews its own deployment config for completeness.
+
+        Checks: env vars present, resource limits appropriate, health check configured,
+        CI/CD integration, database connection, scaling settings.
+        Uses cheapest model (~$0.002/call).
+        """
+        import json as json_mod
+
+        config_files = output.get("config_files", {})
+        config_list = ", ".join(config_files.keys()) if config_files else "(none)"
+        is_sim = output.get("is_simulation_deploy", False)
+        provider = output.get("provider", "unknown")
+
+        eval_prompt = (
+            "You are reviewing deployment config YOU just generated. Be brutally honest.\n\n"
+            f"## Provider: {provider}\n"
+            f"## Simulation: {'YES' if is_sim else 'NO'}\n"
+            f"## Config Files Generated: {config_list}\n"
+            f"## Health Check Passed: {output.get('health_check_passed', 'N/A')}\n\n"
+            "## Your Task\n"
+            "Check your deployment config for completeness:\n"
+            "1. Are all required env vars documented? (DATABASE_URL, SECRET_KEY, etc.)\n"
+            "2. Are resource limits appropriate for the project?\n"
+            "3. Is a health check endpoint configured?\n"
+            "4. Is HTTPS/SSL configured?\n"
+            "5. Is the database connection configured?\n"
+            "6. Are scaling settings appropriate?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missing_env_vars": ["DATABASE_URL", ...],\n'
+            '  "missing_configs": ["health_check", "ssl"],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+
+        router = get_ai_router()
+        resp = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=800,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(resp.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
+
+    def _generate_ci_cd_workflow(
+        self,
+        config: DeployConfig,
+        contract: dict[str, Any],
+    ) -> str:
+        """Generate GitHub Actions CI/CD workflow for the project.
+
+        Template based on tech stack: Python → pytest + ruff; Node → jest + eslint.
+        Includes lint, test, build, and deploy steps.
+        """
+        tech_stack = contract.get("tech_stack", {})
+        backend_fw = tech_stack.get("backend", "").lower() if isinstance(tech_stack, dict) else ""
+        frontend_fw = tech_stack.get("frontend", "").lower() if isinstance(tech_stack, dict) else ""
+
+        # Determine language
+        is_python = any(fw in backend_fw for fw in ("fastapi", "django", "flask", "python"))
+        is_node = any(fw in frontend_fw for fw in ("react", "next", "vue", "angular", "svelte", "node"))
+
+        lines = [
+            "name: CI/CD Pipeline",
+            "",
+            "on:",
+            "  push:",
+            "    branches: [main]",
+            "  pull_request:",
+            "    branches: [main]",
+            "",
+            "jobs:",
+        ]
+
+        if is_python:
+            lines.extend([
+                "  backend:",
+                "    runs-on: ubuntu-latest",
+                "    steps:",
+                "      - uses: actions/checkout@v4",
+                "      - uses: actions/setup-python@v5",
+                "        with:",
+                "          python-version: '3.12'",
+                "      - name: Install dependencies",
+                "        run: pip install -r backend/requirements.txt",
+                "      - name: Lint",
+                "        run: cd backend && ruff check .",
+                "      - name: Type check",
+                "        run: cd backend && pyright .",
+                "        continue-on-error: true",
+                "      - name: Test",
+                "        run: cd backend && pytest -x -q",
+                "",
+            ])
+
+        if is_node:
+            lines.extend([
+                "  frontend:",
+                "    runs-on: ubuntu-latest",
+                "    steps:",
+                "      - uses: actions/checkout@v4",
+                "      - uses: actions/setup-node@v4",
+                "        with:",
+                "          node-version: '20'",
+                "      - name: Install dependencies",
+                "        run: cd frontend && npm ci",
+                "      - name: Lint",
+                "        run: cd frontend && npm run lint",
+                "        continue-on-error: true",
+                "      - name: Type check",
+                "        run: cd frontend && npx tsc --noEmit",
+                "        continue-on-error: true",
+                "      - name: Build",
+                "        run: cd frontend && npm run build",
+                "",
+            ])
+
+        # Deploy step (only for providers we support)
+        provider = config.provider_name
+        if provider == "railway":
+            lines.extend([
+                "  deploy:",
+                f"    needs: [{', '.join(n for n in ['backend', 'frontend'] if (n == 'backend' and is_python) or (n == 'frontend' and is_node))}]",
+                "    runs-on: ubuntu-latest",
+                "    if: github.ref == 'refs/heads/main'",
+                "    steps:",
+                "      - uses: actions/checkout@v4",
+                "      - name: Deploy to Railway",
+                "        uses: bervProject/railway-deploy@main",
+                "        with:",
+                "          railway_token: ${{ secrets.RAILWAY_TOKEN }}",
+                f"          service: {config.service_name}",
+            ])
+        elif provider == "vercel":
+            lines.extend([
+                "  deploy:",
+                "    needs: [frontend]" if is_node else "    needs: [backend]",
+                "    runs-on: ubuntu-latest",
+                "    if: github.ref == 'refs/heads/main'",
+                "    steps:",
+                "      - uses: actions/checkout@v4",
+                "      - name: Deploy to Vercel",
+                "        uses: amondnet/vercel-action@v25",
+                "        with:",
+                "          vercel-token: ${{ secrets.VERCEL_TOKEN }}",
+                "          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}",
+                "          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}",
+                "          vercel-args: '--prod'",
+            ])
+
+        return "\n".join(lines) + "\n"
 
 
 # -- Smoke Tests ---------------------------------------------------------------
