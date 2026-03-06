@@ -564,6 +564,20 @@ class AanyaToolHandler:
         return f"Agent {agent_name} not available. Proceed with best judgment."
 
     def _task_complete(self, summary: str) -> str:
+        # CHANGE-14: Completion gate — verify all required files before
+        # allowing the LLM to declare "done". Prevents premature completion.
+        goal_tracker = getattr(self, "_goal_tracker", None)
+        if goal_tracker and not goal_tracker.is_all_done():
+            missing = [
+                g.file_path for g in goal_tracker.goals
+                if not g.completed and not g.failed
+            ]
+            if missing:
+                return (
+                    f"NOT READY: {len(missing)} file(s) still need to be generated:\n"
+                    + "\n".join(f"  - {f}" for f in missing[:10])
+                    + "\nWrite these files first, then call task_complete again."
+                )
         self._done = True
         self._summary = summary
         return f"Task marked complete: {summary}"
@@ -879,6 +893,7 @@ class Aanya:
         # Wire into tool handler so observe() can update on pass/fail.
         adaptive = AdaptiveComplexity()
         tool_handler._adaptive = adaptive
+        tool_handler._goal_tracker = goal_tracker  # CHANGE-14: Wire for completion gate
 
         logger.info(
             "agentic_phase_start",
@@ -969,6 +984,34 @@ class Aanya:
                 "Fix each error by calling write_file with corrected content. "
                 "Then call task_complete when all errors are resolved."
             )
+
+            # CHANGE-21: Adaptive prompt revision on 2nd+ cycle
+            if _self_fix_cycles >= 2:
+                chronic = {
+                    p: r for p, r in getattr(tool_handler, "_unresolved", {}).items()
+                    if getattr(tool_handler, "_rejection_counts", {}).get(p, 0) >= 3
+                }
+                if chronic:
+                    guidance_parts = [
+                        "\n## TARGETED GUIDANCE (based on repeated failures):"
+                    ]
+                    for _path, _reasons in list(chronic.items())[:3]:
+                        guidance_parts.append(
+                            f"- {_path}: keeps failing because: "
+                            f"{_reasons[0] if _reasons else 'unknown'}"
+                        )
+                    try:
+                        from app.services.mistake_memory import mistake_memory
+                        _lessons = mistake_memory.build_lessons_prompt(
+                            self.name, "frontend_generation",
+                            f"errors: {error_summary[:300]}",
+                        )
+                        if _lessons:
+                            guidance_parts.append(_lessons[:500])
+                    except Exception:
+                        pass
+                    system_prompt = system_prompt + "\n".join(guidance_parts)
+
             logger.warning(
                 "self_check_fix_cycle",
                 cycle=_self_fix_cycles,
@@ -1275,6 +1318,20 @@ class Aanya:
             )
             if lessons:
                 prompt_parts.append(lessons)
+
+            # CHANGE-25: Proactive error prevention
+            patterns = mistake_memory.analyze_error_patterns(self.name)
+            if patterns:
+                warning_parts = ["\n## PROACTIVE WARNINGS (your top error types):"]
+                for p in patterns[:3]:
+                    warning_parts.append(
+                        f"- {p['type']} ({p['pct']:.0%} of past errors): "
+                        f"{p['example'][:100]}"
+                    )
+                warning_parts.append(
+                    "Pay EXTRA attention to avoiding these error types."
+                )
+                prompt_parts.append("\n".join(warning_parts))
         except Exception:
             pass  # Non-fatal — proceed without lessons
 

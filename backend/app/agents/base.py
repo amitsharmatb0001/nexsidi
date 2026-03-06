@@ -310,6 +310,8 @@ async def run_agent(
             error=safe_error,
             pipeline_run_id=pipeline_run_id,
         )
+        # CHANGE-20: Build structured failure report instead of opaque error.
+        failure_report = _build_failure_report(agent.name, exc)
         return AgentResult(
             agent_name=agent.name,
             status=AgentStatus.FAILED,
@@ -317,7 +319,63 @@ async def run_agent(
             execution_id=execution_id,
             started_at=started_at,
             completed_at=completed_at,
+            output={"failure_report": failure_report},
         )
+
+
+def _build_failure_report(agent_name: str, exc: Exception) -> dict[str, Any]:
+    """CHANGE-20: Structured failure report with diagnostics and suggestions.
+
+    Instead of returning an opaque error string when an agent crashes, this
+    extracts the error type, relevant stack frames, heuristic suggestions,
+    and whether a retry is viable. Pipeline and users get actionable info.
+    """
+    import traceback
+
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    # Only keep frames from our app code (most relevant)
+    relevant_frames = [line.strip() for line in tb_lines if "app/" in line][-3:]
+
+    report: dict[str, Any] = {
+        "agent": agent_name,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc)[:500],
+        "relevant_frames": relevant_frames,
+        "retry_viable": True,
+    }
+
+    # Heuristic suggestions based on error type
+    msg = str(exc).lower()
+    exc_type = type(exc).__name__
+
+    if "nonetype" in msg and ("get" in msg or "attribute" in msg):
+        report["suggestion"] = (
+            "Upstream agent likely returned None instead of a dict. "
+            "Check input context from prior stage."
+        )
+        report["root_cause_hint"] = "upstream"
+    elif "429" in msg or "rate" in msg:
+        report["suggestion"] = "API rate limit hit. Retry is likely to succeed."
+        report["retry_viable"] = True
+    elif exc_type == "KeyError":
+        report["suggestion"] = (
+            f"Missing key in input data: {exc}. "
+            "Verify upstream agent output schema matches expectations."
+        )
+        report["root_cause_hint"] = "upstream"
+    elif exc_type == "TypeError" and "argument" in msg:
+        report["suggestion"] = (
+            "Function call with wrong argument types. "
+            "Check if upstream contract schema changed."
+        )
+        report["root_cause_hint"] = "upstream"
+    elif "timeout" in msg or "timed out" in msg:
+        report["suggestion"] = "Request timed out. Retry with longer timeout or simpler input."
+    else:
+        report["suggestion"] = f"Unexpected {exc_type}. Check agent logs for details."
+        report["retry_viable"] = not isinstance(exc, (KeyError, AttributeError))
+
+    return report
 
 
 # ── File Complexity Estimation ─────────────────────────────────────
@@ -628,6 +686,14 @@ async def call_ai_with_tools(
     _KEEP_ROUNDS = 6  # 6 rounds = 12 messages
 
     rounds = 0
+    # CHANGE-16: Stall detection — track tool call fingerprints to detect
+    # when the LLM is stuck calling the same tool with identical arguments.
+    # Saves 5-15 wasted rounds ($0.10-0.50) per stuck agent.
+    import hashlib as _hashlib_stall
+    _tool_fingerprints: list[str] = []
+    _stall_warnings = 0
+    _MAX_STALL_WARNINGS = 2  # Force-break after 2 stall warnings
+
     while response.tool_calls and rounds < max_tool_rounds:
         rounds += 1
 
@@ -658,6 +724,48 @@ async def call_ai_with_tools(
                     is_error=True,
                 ))
                 continue
+
+            # CHANGE-17: Pre-validate tool arguments against JSON Schema.
+            # Catches invalid types and missing required fields instantly
+            # (zero latency, zero tokens) instead of burning a round on
+            # runtime exceptions.
+            _schema = None
+            for _td in (tool_defs or []):
+                if _td.get("name") == tc["name"]:
+                    _schema = _td.get("input_schema", {})
+                    break
+            if _schema:
+                _TYPE_MAP = {
+                    "string": str, "integer": int, "number": (int, float),
+                    "boolean": bool, "array": list, "object": dict,
+                }
+                _val_errors: list[str] = []
+                _props = _schema.get("properties", {})
+                _required = _schema.get("required", [])
+                _tool_input = tc.get("input", {})
+                if isinstance(_tool_input, dict):
+                    for _rf in _required:
+                        if _rf not in _tool_input:
+                            _val_errors.append(f"'{_rf}' is required but missing")
+                    for _k, _v in _tool_input.items():
+                        if _k in _props:
+                            _expected = _props[_k].get("type")
+                            if _expected and _expected in _TYPE_MAP:
+                                if not isinstance(_v, _TYPE_MAP[_expected]):
+                                    _val_errors.append(
+                                        f"'{_k}' must be {_expected}, "
+                                        f"got {type(_v).__name__}"
+                                    )
+                if _val_errors:
+                    result_blocks.append(ToolResultBlock(
+                        tool_use_id=tc["id"],
+                        content=(
+                            f"Tool argument error for '{tc['name']}': "
+                            + "; ".join(_val_errors)
+                        ),
+                        is_error=True,
+                    ))
+                    continue
 
             try:
                 tool_result = await tool_handler(tc["name"], tc["input"])
@@ -722,6 +830,46 @@ async def call_ai_with_tools(
             or getattr(tool_handler, '_done', False)
         ):
             break
+
+        # CHANGE-16: Stall detection — check if agent is stuck in a loop
+        for tc in response.tool_calls:
+            _inp = tc.get("input", {})
+            _keys = sorted(_inp.keys()) if isinstance(_inp, dict) else []
+            _fp = _hashlib_stall.md5(
+                f"{tc['name']}:{_keys}".encode()
+            ).hexdigest()[:12]
+            _tool_fingerprints.append(_fp)
+
+        if len(_tool_fingerprints) >= 3:
+            from collections import Counter as _Counter
+            _top_fp, _top_count = _Counter(_tool_fingerprints[-5:]).most_common(1)[0]
+            if _top_count >= 3:
+                _stall_warnings += 1
+                _stall_tool = response.tool_calls[0]["name"] if response.tool_calls else "unknown"
+                if _stall_warnings >= _MAX_STALL_WARNINGS:
+                    logger.warning(
+                        "tool_loop_force_break",
+                        rounds=rounds,
+                        stall_tool=_stall_tool,
+                        warnings=_stall_warnings,
+                    )
+                    break
+                # Inject stall warning into the next round's messages
+                logger.warning(
+                    "tool_loop_stall_detected",
+                    rounds=rounds,
+                    stall_tool=_stall_tool,
+                    warning_num=_stall_warnings,
+                )
+                ai_messages.append(AIMessage(
+                    role="user",
+                    content=(
+                        f"STALL DETECTED: You have called '{_stall_tool}' with "
+                        f"similar arguments {_top_count} times in the last 5 rounds. "
+                        "You MUST take a DIFFERENT action — change your approach, "
+                        "try a different file, or call task_complete if done."
+                    ),
+                ))
 
         # DEFERRED-FIX-2: Sliding window to prevent unbounded message history.
         # Each round adds 2 messages (assistant tool_use + user tool_result).
@@ -1295,8 +1443,8 @@ async def reflect(
     )
 
     try:
-        from app.services.ai_router import AIRouter, AIRequest, AIMessage
-        router = AIRouter()
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        router = get_ai_router()  # CHANGE-11: Use singleton, not new instance
         response = await router.call(AIRequest(
             messages=[AIMessage(role="user", content=critique_prompt)],
             complexity=TaskComplexity.LOW,  # Cheapest model

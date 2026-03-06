@@ -1112,6 +1112,47 @@ class PipelineOrchestrator:
                         run.error = failed_result.error
                         return step
 
+        # CHANGE-19: API contract validation before frontend build.
+        # Extracts actual endpoints from Shubham's generated code, compares
+        # to Vikram's contract, injects warnings + actual endpoints into
+        # context so Aanya sees the REAL endpoints (not the contract's
+        # interpretation which Shubham may have handled differently).
+        if stage == PipelineStage.FRONTEND_BUILD:
+            shubham_output = run.context.get("shubham", {})
+            if isinstance(shubham_output, dict):
+                file_contents = shubham_output.get("file_contents", {})
+                framework = shubham_output.get("backend_framework", "fastapi")
+                contract = run.context.get("vikram", {})
+                if isinstance(contract, dict):
+                    contract = contract.get("contract", contract)
+                contract_eps = []
+                if isinstance(contract, dict):
+                    contract_eps = contract.get("api", {}).get("endpoints", [])
+                if file_contents and isinstance(file_contents, dict):
+                    try:
+                        from app.services.contract_validator import (
+                            extract_api_endpoints_from_code,
+                            validate_api_contract,
+                        )
+                        actual = extract_api_endpoints_from_code(
+                            file_contents, framework or "fastapi"
+                        )
+                        if actual:
+                            run.context["__actual_api_endpoints__"] = actual
+                            if contract_eps:
+                                api_warnings = validate_api_contract(
+                                    contract_eps, actual
+                                )
+                                if api_warnings:
+                                    run.context["__api_contract_warnings__"] = api_warnings
+                                    logger.warning(
+                                        "api_contract_pre_frontend",
+                                        run_id=run.run_id,
+                                        warnings=len(api_warnings),
+                                    )
+                    except Exception:
+                        pass  # Non-fatal
+
         # Execute single agent
         return await self._execute_agent(run, stage, agent_name)
 
@@ -1526,9 +1567,13 @@ class PipelineOrchestrator:
         except Exception:
             pass
 
-        # 2.2-FIX: Branch on pipeline_mode — "agentic" uses PlannerAgent.
+        # CHANGE-13: PlannerAgent is now the default execution mode.
+        # It respects the dependency graph, mandatory stages, and falls back
+        # to sequential on failure.  Sequential mode is still available as
+        # an explicit opt-in for debugging/testing.
         settings = get_settings()
-        if settings.pipeline_mode == "agentic":
+        use_planner = settings.pipeline_mode != "sequential"
+        if use_planner:
             return await self._run_pipeline_agentic(run, _cost_tracker, step_count)
 
         while run.current_stage != PipelineStage.COMPLETED:
@@ -2009,7 +2054,11 @@ class PipelineOrchestrator:
     # ── 2.2-FIX: Agentic Pipeline Mode ─────────────────────────────────
 
     def _summarize_state(self, run: PipelineRun) -> dict[str, Any]:
-        """2.3-FIX: Build compact state dict (<2000 tokens) for planner."""
+        """2.3-FIX: Build compact state dict (<2000 tokens) for planner.
+
+        CHANGE-23: Enhanced with reflection data, telemetry, and API contract
+        warnings so the planner can make informed re-planning decisions.
+        """
         completed = []
         failed = []
         for step in run.step_results:
@@ -2019,7 +2068,8 @@ class PipelineOrchestrator:
                 failed.append(step.stage.value)
 
         ctx = run.context or {}
-        return {
+
+        state: dict[str, Any] = {
             "project_type": ctx.get("project_type", "unknown"),
             "backend_framework": ctx.get("backend_framework", "unknown"),
             "has_frontend": not ctx.get("__skip_frontend__"),
@@ -2029,6 +2079,32 @@ class PipelineOrchestrator:
             "file_count": len(ctx.get("file_contents", {})),
             "fix_cycles": ctx.get("__fix_cycle__", 0),
         }
+
+        # CHANGE-23: Include quality signals for re-planning
+        reflections = ctx.get("__reflections__", {})
+        if reflections:
+            # Compact: just agent + issue count + confidence
+            state["quality_signals"] = {
+                agent: {
+                    "issues": len(r.get("issues", [])),
+                    "confidence": r.get("confidence", 1.0),
+                }
+                for agent, r in reflections.items()
+            }
+
+        telemetry = ctx.get("__telemetry__", {})
+        if telemetry:
+            # Compact: just success rate per agent
+            state["agent_health"] = {
+                agent: round(t["successes"] / max(t["runs"], 1), 2)
+                for agent, t in telemetry.items()
+            }
+
+        api_warnings = ctx.get("__api_contract_warnings__", [])
+        if api_warnings:
+            state["api_contract_issues"] = len(api_warnings)
+
+        return state
 
     async def _run_pipeline_agentic(
         self,
@@ -2602,6 +2678,64 @@ class PipelineOrchestrator:
                 )
             except Exception:
                 pass  # Non-fatal
+
+            # CHANGE-11: Post-execution reflection for build agents.
+            # Cost: ~$0.001 per reflection (cheapest model). An independent
+            # model critiques the output for completeness, consistency, and
+            # quality BEFORE downstream quality gates run. Results are stored
+            # in context so Tilotma/Fixer can see early warnings.
+            _REFLECTION_AGENTS = {"shubham", "aanya", "vikram", "dhruv"}
+            if agent_name in _REFLECTION_AGENTS:
+                try:
+                    from app.agents.base import reflect
+                    output_keys = list((result.output or {}).keys())[:20]
+                    file_count = (result.output or {}).get("file_count", 0)
+                    output_summary = (
+                        f"Agent {agent_name} produced keys: {output_keys}, "
+                        f"{file_count} files"
+                    )
+                    ctx = run.context or {}
+                    context_summary = (
+                        f"Framework: {ctx.get('__tech_stack__', ctx.get('backend_framework', 'unknown'))}"
+                    )
+                    reflection = await reflect(
+                        agent_name=agent_name,
+                        output_summary=output_summary,
+                        context_summary=context_summary,
+                    )
+                    if reflection and reflection.get("issues"):
+                        reflections = run.context.setdefault("__reflections__", {})
+                        reflections[agent_name] = reflection
+                        logger.info(
+                            "reflection_flagged",
+                            agent=agent_name,
+                            issues=len(reflection.get("issues", [])),
+                            confidence=reflection.get("confidence", 0),
+                        )
+                except Exception:
+                    pass  # Non-fatal — reflection is advisory
+
+        # CHANGE-22: Per-agent performance telemetry — accumulate metrics
+        # in context for bottleneck detection and pattern analysis.
+        telemetry = run.context.setdefault("__telemetry__", {})
+        agent_tel = telemetry.setdefault(agent_name, {
+            "runs": 0, "successes": 0, "failures": 0,
+            "total_tokens": 0, "total_duration_ms": 0,
+            "error_types": {},
+        })
+        agent_tel["runs"] += 1
+        if result.status == AgentStatus.COMPLETED:
+            agent_tel["successes"] += 1
+        else:
+            agent_tel["failures"] += 1
+            err_type = (result.error or "unknown").split(":")[0][:50]
+            agent_tel["error_types"][err_type] = (
+                agent_tel["error_types"].get(err_type, 0) + 1
+            )
+        agent_tel["total_tokens"] += (
+            getattr(result, "input_tokens", 0) + getattr(result, "output_tokens", 0)
+        )
+        agent_tel["total_duration_ms"] += getattr(result, "duration_ms", 0)
 
         return step
 

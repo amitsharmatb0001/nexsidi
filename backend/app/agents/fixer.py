@@ -316,6 +316,9 @@ class FixerToolHandler:
         self._validation_passed = False
         self._complete = False
         self._used_diff = False  # Track if apply_diff was used (for telemetry)
+        # CHANGE-18: Pre-fix snapshots for rollback on regression.
+        # If a fix introduces MORE errors than the original, we revert.
+        self._snapshots: dict[str, str] = {}
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "read_file":
@@ -384,7 +387,48 @@ class FixerToolHandler:
     def _write_file(self, path: str, content: str) -> str:
         if len(content) < 10:
             return "Error: content too short — must be a complete file"
+
+        # CHANGE-18: Snapshot before overwriting for rollback on regression.
+        if path in self._written_files:
+            self._snapshots[path] = self._written_files[path]
+        elif path not in self._snapshots:
+            # Try to snapshot from context (original code before any fix)
+            for _agent in ("shubham", "aanya"):
+                _agent_out = self._context.get(_agent, {})
+                if isinstance(_agent_out, dict):
+                    _fc = _agent_out.get("file_contents", {})
+                    if isinstance(_fc, dict) and path in _fc:
+                        self._snapshots[path] = _fc[path]
+                        break
+
         self._written_files[path] = content
+
+        # CHANGE-18: Regression check — verify the fix didn't make things worse.
+        if path.endswith(".py") and path in self._snapshots:
+            import ast as _ast_rollback
+            # Count syntax errors in new vs old
+            new_has_syntax_error = False
+            old_has_syntax_error = False
+            try:
+                _ast_rollback.parse(content)
+            except SyntaxError:
+                new_has_syntax_error = True
+            try:
+                _ast_rollback.parse(self._snapshots[path])
+            except SyntaxError:
+                old_has_syntax_error = True
+
+            if new_has_syntax_error and not old_has_syntax_error:
+                # Fix introduced a NEW syntax error — rollback
+                self._written_files[path] = self._snapshots[path]
+                logger.warning("fixer_rollback", path=path, reason="new_syntax_error")
+                return (
+                    f"ROLLBACK: Your fix introduced a NEW syntax error in {path} "
+                    "that wasn't there before. Reverted to pre-fix state. "
+                    "Try a DIFFERENT approach — read the file first, understand "
+                    "the structure, then make a targeted fix."
+                )
+
         return f"Written {path} ({len(content)} chars)"
 
     async def _apply_diff(self, path: str, diff_text: str) -> str:
@@ -1066,6 +1110,15 @@ class Fixer:
         # I4-FIX: Classify fix severity for fast-path routing
         report.fix_severity = _classify_fix_severity(report.attempts)
 
+        # CHANGE-12: Build patched_files dict so pipeline fix-retest merge
+        # works. Pipeline line 1717 reads fixer_output.get("patched_files")
+        # to merge fixed code back into shubham/aanya context.  Without this,
+        # the merge always gets {} and re-runs quality gates on ORIGINAL code.
+        patched_files: dict[str, str] = {}
+        for a in report.attempts:
+            if a.success and a.file_path and a.file_content_after:
+                patched_files[a.file_path] = a.file_content_after
+
         output = {
             "status": report.status.value,
             "iterations": report.iterations,
@@ -1074,6 +1127,7 @@ class Fixer:
             "errors_remaining": report.errors_remaining,
             "files_modified": report.files_modified,
             "fix_severity": report.fix_severity,
+            "patched_files": patched_files,  # CHANGE-12
             "attempts": [
                 {
                     "iteration": a.iteration,

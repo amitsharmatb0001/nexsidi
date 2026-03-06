@@ -175,6 +175,24 @@ class PlannerAgent:
             errors = last_result.get("errors", 0)
             state_summary += f"Last stage errors: {errors}\n"
 
+        # CHANGE-23: Include quality signals for informed re-planning
+        quality = project_state.get("quality_signals", {})
+        if quality:
+            state_summary += "Quality signals:\n"
+            for agent, info in quality.items():
+                state_summary += (
+                    f"  {agent}: {info['issues']} issues, "
+                    f"confidence={info['confidence']}\n"
+                )
+        health = project_state.get("agent_health", {})
+        if health:
+            state_summary += "Agent health: " + ", ".join(
+                f"{a}={r}" for a, r in health.items()
+            ) + "\n"
+        api_issues = project_state.get("api_contract_issues", 0)
+        if api_issues:
+            state_summary += f"API contract mismatches: {api_issues}\n"
+
         prompt = (
             "You are a pipeline planner for a code generation system.\n"
             f"{state_summary}\n"
@@ -188,8 +206,8 @@ class PlannerAgent:
         )
 
         try:
-            from app.services.ai_router import AIRouter, AIRequest, AIMessage
-            router = AIRouter()
+            from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+            router = get_ai_router()  # CHANGE-13: Use singleton
             response = await router.call(AIRequest(
                 messages=[AIMessage(role="user", content=prompt)],
                 complexity=TaskComplexity.LOW,  # Cheapest model
