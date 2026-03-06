@@ -1003,6 +1003,24 @@ class ShubhamToolHandler:
         msg = f"Written {path} ({len(content)} chars)"
         if result.warnings:
             msg += "\n⚠ Warnings:\n" + "\n".join(f"  • {w}" for w in result.warnings[:3])
+
+        # CHANGE-30: Auto-inject file manifest after every successful write.
+        # The LLM MUST know what it has generated — path + exports — so it
+        # uses correct import names. This is what "agent awareness" means:
+        # the agent PERCEIVES its own prior output.
+        manifest_lines = ["\n\n📂 FILES YOU HAVE GENERATED (use exact names for imports):"]
+        for fpath in sorted(self._files.keys()):
+            fcontent = self._files[fpath]
+            if not fcontent:
+                continue
+            fline_count = fcontent.count("\n") + 1
+            fexports = self._export_registry.get(fpath, set())
+            fexport_str = f" — exports: {', '.join(sorted(fexports)[:10])}" if fexports else ""
+            manifest_lines.append(f"  - `{fpath}` ({fline_count} lines){fexport_str}")
+        if len(manifest_lines) > 1:  # More than just the header
+            manifest_lines.append("  ⚠ USE EXACT NAMES ABOVE for import statements!")
+            msg += "\n".join(manifest_lines)
+
         return msg
 
     async def _read_file(self, path: str) -> str:
@@ -1599,13 +1617,53 @@ class Shubham:
         logger.info("goal_tracking_complete", **goal_tracker.summary())
 
         # ── Layer 1: Builder Self-Check (1.3-FIX: BLOCKING) ──
-        # Validate own output before handing off. If errors found, build a fix
-        # prompt and re-run the tool loop. Max 2 self-fix cycles to prevent
-        # infinite loops while still catching obvious issues.
+        # Two-layer validation:
+        #   Layer 1a: Deterministic checks (syntax, fences, empty files)
+        #   Layer 1b: CHANGE-26: LLM-driven semantic evaluation — the LLM reads
+        #             its own generated code, compares to the contract, and judges
+        #             completeness. This is what makes the agent SELF-AWARE: it
+        #             doesn't just check "does this parse?" but "did I implement
+        #             all the endpoints? Do my model fields match the contract?"
         self_check = self._run_self_check(generated_files, contract, backend_framework)
+
+        # CHANGE-26: LLM semantic self-evaluation — the agent evaluates its OWN
+        # output against the contract. This is the shift from "pipeline decides
+        # quality" to "agent decides quality."
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                generated_files, contract, cost_tracker,
+            )
+            # Merge LLM-found issues into self_check so the fix loop handles them
+            if llm_eval.get("missing_implementations"):
+                for issue in llm_eval["missing_implementations"]:
+                    self_check.setdefault("error_details", []).append({
+                        "file": issue.get("file", "(missing)"),
+                        "issue": issue.get("issue", "LLM-detected gap"),
+                    })
+                    self_check["errors"] = self_check.get("errors", 0) + 1
+                self_check["passed"] = False
+            if llm_eval.get("wrong_imports"):
+                for issue in llm_eval["wrong_imports"]:
+                    self_check.setdefault("error_details", []).append({
+                        "file": issue.get("file", "unknown"),
+                        "issue": issue.get("issue", "wrong import"),
+                    })
+                    self_check["errors"] = self_check.get("errors", 0) + 1
+                self_check["passed"] = False
+            self_check["llm_evaluation"] = llm_eval
+            logger.info(
+                "llm_self_evaluation_complete",
+                missing=len(llm_eval.get("missing_implementations", [])),
+                wrong_imports=len(llm_eval.get("wrong_imports", [])),
+                completeness_pct=llm_eval.get("completeness_pct", -1),
+            )
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            logger.warning("llm_self_evaluation_failed", error=_sanitize_error(exc))
+
         _self_fix_cycles = 0
 
-        while self_check.get("errors", 0) > 0 and _self_fix_cycles < 2:
+        while self_check.get("errors", 0) > 0 and _self_fix_cycles < 3:
             _self_fix_cycles += 1
             error_details = self_check.get("error_details", [])
             error_summary = "\n".join(
@@ -1816,6 +1874,113 @@ class Shubham:
             "warning_details": warnings[:20],
             "passed": len(errors) == 0,
         }
+
+    # ── CHANGE-26: LLM-driven semantic self-evaluation ────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        generated_files: dict[str, str],
+        contract: dict[str, Any],
+        cost_tracker: Any = None,
+    ) -> dict[str, Any]:
+        """CHANGE-26: The agent evaluates its OWN output against the contract.
+
+        THIS is what makes the system agentic: the LLM — not Python code —
+        decides whether the output is complete and correct. It reads its own
+        generated code, compares it to the architecture contract, and reports:
+        - Missing implementations (endpoints, models, fields)
+        - Wrong import names
+        - Completeness percentage
+
+        Uses the CHEAPEST model (LOW complexity) to keep costs minimal (~$0.002).
+        Returns structured JSON with actionable issues.
+        """
+        import orjson
+
+        # Build a compact representation of what was generated
+        file_summaries: list[str] = []
+        for path, content in sorted(generated_files.items()):
+            if not content:
+                continue
+            line_count = content.count("\n") + 1
+            # Extract top-level names for the summary
+            exports = self._extract_exports(path, content)
+            export_str = f" — defines: {', '.join(exports[:8])}" if exports else ""
+            # Include first few import lines so LLM can spot wrong imports
+            import_lines = [
+                ln.strip() for ln in content.split("\n")
+                if ln.strip().startswith(("from ", "import "))
+            ][:5]
+            import_str = ""
+            if import_lines:
+                import_str = "\n    Imports: " + "; ".join(import_lines)
+            file_summaries.append(f"  {path} ({line_count} lines){export_str}{import_str}")
+
+        files_text = "\n".join(file_summaries)
+
+        # Extract contract requirements
+        endpoints = contract.get("endpoints", [])
+        tables = contract.get("tables", []) or contract.get("database", {}).get("tables", [])
+        endpoint_summary = ""
+        if endpoints:
+            ep_lines = []
+            for ep in endpoints[:20]:
+                method = ep.get("method", "GET")
+                path_str = ep.get("path", ep.get("url", "unknown"))
+                ep_lines.append(f"  {method} {path_str}")
+            endpoint_summary = "Required endpoints:\n" + "\n".join(ep_lines)
+
+        table_summary = ""
+        if tables:
+            tbl_lines = []
+            for tbl in tables[:15]:
+                name = tbl.get("name", "unknown")
+                cols = [c.get("name", "?") for c in tbl.get("columns", tbl.get("fields", []))]
+                tbl_lines.append(f"  {name}: {', '.join(cols[:10])}")
+            table_summary = "Required tables/models:\n" + "\n".join(tbl_lines)
+
+        eval_prompt = (
+            "You are reviewing backend code YOU just generated. Be brutally honest.\n\n"
+            f"## Architecture Contract Requirements\n{endpoint_summary}\n{table_summary}\n\n"
+            f"## Files You Generated\n{files_text}\n\n"
+            "## Your Task\n"
+            "Compare what the contract REQUIRES vs what you ACTUALLY generated.\n"
+            "Find:\n"
+            "1. Missing implementations — endpoints/tables/fields required by contract but NOT in any generated file\n"
+            "2. Wrong imports — files importing names that don't exist in the target module\n"
+            "3. Completeness — what percentage of the contract is actually implemented?\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missing_implementations": [{"file": "path or (missing)", "issue": "description"}],\n'
+            '  "wrong_imports": [{"file": "path", "issue": "description"}],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+            "If everything is complete and correct, return empty arrays and PASS."
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        from app.agents.base import TaskComplexity
+
+        router = get_ai_router()
+        response = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,  # Cheapest model
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        if cost_tracker is not None:
+            await cost_tracker.record(response, agent_name=self.name, model_key="low")
+
+        # Parse JSON response
+        from app.utils.json_parser import parse_json
+        result = parse_json(response.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+
+        return result
 
     # ── C3-FIX: File manifest (compact representation for prompt) ────
 

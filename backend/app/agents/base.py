@@ -1086,8 +1086,12 @@ class VerificationGate:
                 if alt_path not in all_files and alt_init not in all_files:
                     warnings.append(f"Import '{mod}' may not resolve (no matching file generated yet)")
 
-        # 4b. CHANGE-3: Cross-file import NAME validation (WARNING)
+        # 4b. CHANGE-3 + CHANGE-30: Cross-file import NAME validation (HARD FAIL)
         # Check that imported names actually exist in the target module.
+        # CHANGE-30: Upgraded from WARNING to FAILURE. When the LLM writes
+        # `from app.models import UserCreate` but models.py exports `UserSchema`,
+        # the file is REJECTED. The LLM MUST fix the import to use the correct
+        # name. This forces the agent to be AWARE of its own generated exports.
         name_imports = re.findall(
             r"^from\s+(app\.\S+)\s+import\s+(.+)$", content, re.MULTILINE
         )
@@ -1112,9 +1116,12 @@ class VerificationGate:
                     for imp_name in imported:
                         if imp_name and imp_name not in available_names and imp_name != "*":
                             avail_sorted = sorted(available_names)[:5]
-                            warnings.append(
-                                f"Import '{imp_name}' from '{mod}' — name not found in that file. "
-                                f"Available: {avail_sorted}"
+                            # CHANGE-30: HARD FAIL — file is rejected, LLM must
+                            # fix the import to use correct export names.
+                            failures.append(
+                                f"WRONG IMPORT: '{imp_name}' from '{mod}' does NOT exist. "
+                                f"Available exports: {avail_sorted}. "
+                                f"Use one of these exact names."
                             )
                 except SyntaxError:
                     pass  # Source file has syntax errors — can't parse

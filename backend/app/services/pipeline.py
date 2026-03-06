@@ -1693,16 +1693,66 @@ class PipelineOrchestrator:
             if run.status == PipelineRunStatus.PAUSED:
                 break
 
-            # Check for failure — current_stage still points to the failed
-            # stage so resume_run() will re-execute this exact stage.
+            # CHANGE-29: LLM-driven failure recovery — instead of immediately
+            # crashing the pipeline, ask the LLM what to do. The LLM may decide
+            # to retry with a different model, skip this stage, or go back.
+            # This shifts the recovery decision FROM hard-coded Python TO the LLM.
             if step_result.result and step_result.result.status == AgentStatus.FAILED:
-                run.status = PipelineRunStatus.FAILED
-                run.error = (
-                    f"Stage {run.current_stage.value} ({step_result.agent_name}) failed: "
-                    f"{step_result.result.error or 'unknown error'}"
-                )
-                await self._persist_run(run)
-                break
+                retry_counts = run.context.setdefault("__stage_retry_counts__", {})
+                stage_key = run.current_stage.value
+                retry_counts[stage_key] = retry_counts.get(stage_key, 0) + 1
+
+                if retry_counts[stage_key] <= 1:
+                    # First failure: ask LLM whether to retry or abort
+                    try:
+                        recovery_decision = await self._llm_failure_recovery(
+                            run, step_result,
+                        )
+                        if recovery_decision == "retry":
+                            logger.info(
+                                "llm_decided_retry",
+                                stage=stage_key,
+                                retry=retry_counts[stage_key],
+                            )
+                            # Escalate model complexity for retry
+                            run.context["__model_escalation__"] = True
+                            await self._persist_run(run)
+                            continue  # Re-execute this stage
+                        elif recovery_decision == "skip":
+                            logger.warning(
+                                "llm_decided_skip",
+                                stage=stage_key,
+                            )
+                            # Fall through to advance
+                        else:
+                            # LLM said abort or unknown — crash as before
+                            run.status = PipelineRunStatus.FAILED
+                            run.error = (
+                                f"Stage {run.current_stage.value} ({step_result.agent_name}) failed: "
+                                f"{step_result.result.error or 'unknown error'}"
+                            )
+                            await self._persist_run(run)
+                            break
+                    except Exception as recovery_exc:
+                        logger.warning("llm_recovery_failed", error=str(recovery_exc)[:200])
+                        # Fallback: crash as before
+                        run.status = PipelineRunStatus.FAILED
+                        run.error = (
+                            f"Stage {run.current_stage.value} ({step_result.agent_name}) failed: "
+                            f"{step_result.result.error or 'unknown error'}"
+                        )
+                        await self._persist_run(run)
+                        break
+                else:
+                    # Second+ failure: give up
+                    run.status = PipelineRunStatus.FAILED
+                    run.error = (
+                        f"Stage {run.current_stage.value} ({step_result.agent_name}) failed "
+                        f"after {retry_counts[stage_key]} attempts: "
+                        f"{step_result.result.error or 'unknown error'}"
+                    )
+                    await self._persist_run(run)
+                    break
 
             # R28-FIX-2: Check quality loops BEFORE step-by-step pause.
             # Previously, step-by-step mode immediately advanced + paused,
@@ -2051,6 +2101,115 @@ class PipelineOrchestrator:
 
         return run
 
+    # ── CHANGE-28: Build actual code summary for reflect() ─────────────
+
+    @staticmethod
+    def _build_reflection_summary(agent_name: str, output: dict) -> str:
+        """CHANGE-28: Build actual code structure for reflect() instead of metadata.
+
+        Instead of 'Agent shubham produced keys: [file_contents], 8 files',
+        this builds: 'models.py (145 lines) — defines: User, Post, Comment'
+        plus import lines, so reflect() can actually spot issues.
+        """
+        import ast as _ast
+
+        file_contents = output.get("file_contents", {})
+        if not isinstance(file_contents, dict) or not file_contents:
+            # Fallback to old metadata format
+            output_keys = list(output.keys())[:20]
+            file_count = output.get("file_count", 0)
+            return f"Agent {agent_name} produced keys: {output_keys}, {file_count} files"
+
+        parts: list[str] = [f"Agent {agent_name} generated {len(file_contents)} files:\n"]
+        char_budget = 2800  # Stay under 3000 total for reflect()
+
+        for path, content in sorted(file_contents.items()):
+            if char_budget <= 0:
+                parts.append("... (more files, budget exceeded)")
+                break
+            if not content or not isinstance(content, str):
+                continue
+
+            line_count = content.count("\n") + 1
+            # Extract top-level names
+            exports: list[str] = []
+            if path.endswith(".py"):
+                try:
+                    tree = _ast.parse(content)
+                    for node in _ast.iter_child_nodes(tree):
+                        if isinstance(node, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)):
+                            exports.append(node.name)
+                except SyntaxError:
+                    exports.append("(SYNTAX ERROR)")
+
+            # Extract first few imports
+            import_lines = [
+                ln.strip() for ln in content.split("\n")
+                if ln.strip().startswith(("from ", "import "))
+            ][:3]
+
+            export_str = f" — defines: {', '.join(exports[:6])}" if exports else ""
+            entry = f"  {path} ({line_count} lines){export_str}"
+            if import_lines:
+                entry += f"\n    imports: {'; '.join(import_lines)}"
+
+            parts.append(entry)
+            char_budget -= len(entry)
+
+        return "\n".join(parts)
+
+    # ── CHANGE-29: LLM-driven failure recovery ──────────────────────────
+
+    async def _llm_failure_recovery(
+        self, run: "PipelineRun", step_result: "StepResult",
+    ) -> str:
+        """CHANGE-29: Ask the LLM what to do when a stage fails.
+
+        Instead of hard-coded 'break' (crash pipeline), the LLM evaluates
+        the failure and decides: retry, skip, or abort. This shifts the
+        recovery decision FROM Python if-statements TO LLM reasoning.
+
+        Returns: 'retry', 'skip', or 'abort'
+        """
+        stage = run.current_stage.value
+        agent = step_result.agent_name
+        error = step_result.result.error if step_result.result else "unknown"
+
+        # Build context about what has completed so far
+        completed = [s.stage.value for s in run.step_results
+                     if s.result and s.result.status == AgentStatus.COMPLETED]
+
+        prompt = (
+            f"Pipeline stage '{stage}' (agent: {agent}) has FAILED.\n"
+            f"Error: {str(error)[:500]}\n\n"
+            f"Completed stages so far: {completed}\n"
+            f"Remaining stages: (pipeline will continue from next stage)\n\n"
+            "What should we do?\n"
+            "- 'retry': Try this stage again with a more capable model\n"
+            "- 'skip': Skip this stage and continue (if non-critical)\n"
+            "- 'abort': Stop the pipeline entirely\n\n"
+            "Consider: Is this stage critical? Can downstream stages work without it? "
+            "Is the error transient (timeout, token limit) or fundamental (bad contract)?\n\n"
+            "Respond with EXACTLY one word: retry, skip, or abort"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        from app.agents.base import TaskComplexity
+
+        router = get_ai_router()
+        response = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=10,
+            agent_name="pipeline_recovery",
+        ))
+
+        decision = response.content.strip().lower()
+        if decision in ("retry", "skip", "abort"):
+            return decision
+        # Default to abort if LLM response is unclear
+        return "abort"
+
     # ── 2.2-FIX: Agentic Pipeline Mode ─────────────────────────────────
 
     def _summarize_state(self, run: PipelineRun) -> dict[str, Any]:
@@ -2129,15 +2288,27 @@ class PipelineOrchestrator:
             state = self._summarize_state(run)
 
             try:
+                # CHANGE-27: Feed ACTUAL output summary to planner — not just
+                # metadata. The planner sees what each agent actually produced
+                # so it can make informed decisions about what to do next.
+                last_output = None
+                if run.step_results and run.step_results[-1].result:
+                    last_res = run.step_results[-1].result
+                    last_output = last_res.output
+                    # Build actual summary for the planner
+                    if isinstance(last_output, dict) and last_output.get("file_contents"):
+                        last_output = {
+                            **{k: v for k, v in last_output.items() if k != "file_contents"},
+                            "file_summary": self._build_reflection_summary(
+                                run.step_results[-1].agent_name, last_output,
+                            ),
+                        }
+
                 decision = await planner.plan_next(
                     project_state=state,
                     completed_stages=state["completed_stages"],
                     failed_stages=state["failed_stages"],
-                    last_result=(
-                        run.step_results[-1].result.output
-                        if run.step_results and run.step_results[-1].result
-                        else None
-                    ),
+                    last_result=last_output,
                 )
             except Exception as exc:
                 logger.warning("planner_failed_fallback_sequential", error=str(exc)[:200])
@@ -2165,8 +2336,17 @@ class PipelineOrchestrator:
                     await self._persist_step(run, step_result, step_count)
 
                     if step_result.result and step_result.result.status == AgentStatus.FAILED:
+                        # CHANGE-27: Feed failure info into state so the planner
+                        # can adjust its NEXT decision based on what went wrong.
+                        # This is LLM-driven re-planning: the planner SEES the
+                        # failure and DECIDES what to do, not hard-coded logic.
+                        run.context.setdefault("__stage_failures__", []).append({
+                            "stage": action.stage,
+                            "agent": step_result.agent_name,
+                            "error": str(step_result.result.error or "")[:300],
+                        })
                         logger.warning(
-                            "agentic_stage_failed",
+                            "agentic_stage_failed_feeding_planner",
                             stage=action.stage,
                             agent=step_result.agent_name,
                         )
@@ -2688,11 +2868,11 @@ class PipelineOrchestrator:
             if agent_name in _REFLECTION_AGENTS:
                 try:
                     from app.agents.base import reflect
-                    output_keys = list((result.output or {}).keys())[:20]
-                    file_count = (result.output or {}).get("file_count", 0)
-                    output_summary = (
-                        f"Agent {agent_name} produced keys: {output_keys}, "
-                        f"{file_count} files"
+                    # CHANGE-28: Feed ACTUAL code structure to reflect(), not metadata.
+                    # The LLM can't critique "produced keys: ['file_contents'], 8 files".
+                    # It CAN critique: "models.py (145 lines, exports: User, Post)"
+                    output_summary = self._build_reflection_summary(
+                        agent_name, result.output or {},
                     )
                     ctx = run.context or {}
                     context_summary = (

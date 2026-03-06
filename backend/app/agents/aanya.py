@@ -410,6 +410,21 @@ class AanyaToolHandler:
         msg = f"Written {path} ({len(content)} chars)"
         if result.warnings:
             msg += "\n⚠ Warnings:\n" + "\n".join(f"  • {w}" for w in result.warnings[:3])
+
+        # CHANGE-30: Auto-inject file manifest — agent PERCEIVES its own output
+        manifest_lines = ["\n\n📂 FILES YOU HAVE GENERATED (use exact names for imports):"]
+        for fpath in sorted(self._files.keys()):
+            fcontent = self._files[fpath]
+            if not fcontent:
+                continue
+            fline_count = fcontent.count("\n") + 1
+            fexports = self._export_registry.get(fpath, set())
+            fexport_str = f" — exports: {', '.join(sorted(fexports)[:10])}" if fexports else ""
+            manifest_lines.append(f"  - `{fpath}` ({fline_count} lines){fexport_str}")
+        if len(manifest_lines) > 1:
+            manifest_lines.append("  ⚠ USE EXACT NAMES ABOVE for import statements!")
+            msg += "\n".join(manifest_lines)
+
         return msg
 
     async def _read_file(self, path: str) -> str:
@@ -876,6 +891,9 @@ class Aanya:
         # For 100-file projects, eager loading wastes several MB of memory when
         # Aanya only reads 3-5 backend files via the read_file tool.
         backend_file_contents: dict[str, str] = shubham_output.get("file_contents", {})
+        # CHANGE-28: Store reference so _build_agentic_system_prompt can access
+        # actual file contents to extract exports for real context sharing.
+        self._backend_file_contents_ref = backend_file_contents
 
         # ── Phase 2: Agentic AI generation (tool loop) ──
         tool_handler = AanyaToolHandler(
@@ -967,12 +985,47 @@ class Aanya:
         frontend_files = [p for p in generated_files if "frontend/" in p or "mobile/" in p or "desktop/" in p]
 
         # ── Layer 1: Builder Self-Check (1.4-FIX: BLOCKING) ──
-        # Validate own output before downstream handoff. If errors found, build a
-        # fix prompt and re-run the tool loop. Max 2 self-fix cycles.
+        # Two-layer validation:
+        #   Layer 1a: Deterministic checks (syntax, brackets, empty files)
+        #   Layer 1b: CHANGE-26: LLM-driven semantic evaluation
         self_check = self._run_self_check(generated_files, contract, framework_display)
+
+        # CHANGE-26: LLM semantic self-evaluation — the agent evaluates its OWN
+        # output against the contract. This shifts agency FROM pipeline TO the LLM.
+        try:
+            llm_eval = await self._run_llm_self_evaluation(
+                generated_files, contract, pipeline_run_id,
+            )
+            if llm_eval.get("missing_implementations"):
+                for issue in llm_eval["missing_implementations"]:
+                    self_check.setdefault("error_details", []).append({
+                        "file": issue.get("file", "(missing)"),
+                        "issue": issue.get("issue", "LLM-detected gap"),
+                    })
+                    self_check["errors"] = self_check.get("errors", 0) + 1
+                self_check["passed"] = False
+            if llm_eval.get("wrong_imports"):
+                for issue in llm_eval["wrong_imports"]:
+                    self_check.setdefault("error_details", []).append({
+                        "file": issue.get("file", "unknown"),
+                        "issue": issue.get("issue", "wrong import"),
+                    })
+                    self_check["errors"] = self_check.get("errors", 0) + 1
+                self_check["passed"] = False
+            self_check["llm_evaluation"] = llm_eval
+            logger.info(
+                "llm_self_evaluation_complete",
+                missing=len(llm_eval.get("missing_implementations", [])),
+                wrong_imports=len(llm_eval.get("wrong_imports", [])),
+                completeness_pct=llm_eval.get("completeness_pct", -1),
+            )
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            logger.warning("llm_self_evaluation_failed", error=_sanitize_error(exc))
+
         _self_fix_cycles = 0
 
-        while self_check.get("errors", 0) > 0 and _self_fix_cycles < 2:
+        while self_check.get("errors", 0) > 0 and _self_fix_cycles < 3:
             _self_fix_cycles += 1
             error_details = self_check.get("error_details", [])
             error_summary = "\n".join(
@@ -1152,6 +1205,111 @@ class Aanya:
             "passed": len(errors) == 0,
         }
 
+    # ── CHANGE-26: LLM-driven semantic self-evaluation ────────────────
+
+    async def _run_llm_self_evaluation(
+        self,
+        generated_files: dict[str, str],
+        contract: dict[str, Any],
+        pipeline_run_id: str,
+    ) -> dict[str, Any]:
+        """CHANGE-26: The agent evaluates its OWN output against the contract.
+
+        The LLM reads its own generated frontend files, compares to the contract's
+        page/component requirements, and reports what's missing. This is the
+        agent exercising JUDGMENT, not just running bracket checks.
+        """
+        # Build compact summary of generated files
+        file_summaries: list[str] = []
+        for path, content in sorted(generated_files.items()):
+            if not content:
+                continue
+            line_count = content.count("\n") + 1
+            # Extract exported names for TS/TSX/JS files
+            exports: list[str] = []
+            if path.endswith((".ts", ".tsx", ".js", ".jsx")):
+                import re as _re
+                for m in _re.finditer(
+                    r"export\s+(?:default\s+)?(?:function|class|const|let|var|type|interface|enum)\s+(\w+)",
+                    content,
+                ):
+                    exports.append(m.group(1))
+            export_str = f" — exports: {', '.join(exports[:8])}" if exports else ""
+            file_summaries.append(f"  {path} ({line_count} lines){export_str}")
+
+        files_text = "\n".join(file_summaries)
+
+        # Extract contract frontend requirements
+        pages = contract.get("frontend", {}).get("pages", [])
+        page_summary = ""
+        if pages:
+            pg_lines = []
+            for pg in pages[:15]:
+                if isinstance(pg, dict):
+                    pg_lines.append(f"  - {pg.get('name', pg.get('title', 'unknown'))}: {pg.get('description', '')[:80]}")
+                elif isinstance(pg, str):
+                    pg_lines.append(f"  - {pg}")
+            page_summary = "Required pages:\n" + "\n".join(pg_lines)
+
+        eval_prompt = (
+            "You are reviewing frontend code YOU just generated. Be brutally honest.\n\n"
+            f"## Contract Requirements\n{page_summary}\n\n"
+            f"## Files You Generated\n{files_text}\n\n"
+            "## Your Task\n"
+            "Compare what the contract REQUIRES vs what you ACTUALLY generated.\n"
+            "Find:\n"
+            "1. Missing implementations — pages/components required but NOT generated\n"
+            "2. Wrong imports — files importing components/hooks that don't exist\n"
+            "3. Completeness percentage\n\n"
+            "Respond in JSON:\n"
+            "{\n"
+            '  "missing_implementations": [{"file": "path or (missing)", "issue": "description"}],\n'
+            '  "wrong_imports": [{"file": "path", "issue": "description"}],\n'
+            '  "completeness_pct": 0-100,\n'
+            '  "verdict": "PASS" or "FAIL",\n'
+            '  "reasoning": "brief explanation"\n'
+            "}\n"
+        )
+
+        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        from app.agents.base import TaskComplexity
+
+        router = get_ai_router()
+        response = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=eval_prompt)],
+            complexity=TaskComplexity.LOW,
+            max_tokens=1000,
+            agent_name=f"{self.name}_self_eval",
+        ))
+
+        try:
+            from app.services.pipeline import get_run_cost_tracker
+            tracker = get_run_cost_tracker(pipeline_run_id)
+            if tracker is not None:
+                await tracker.record(response, agent_name=self.name, model_key="low")
+        except Exception:
+            pass
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(response.content, fallback={})
+        if not isinstance(result, dict):
+            result = {}
+        return result
+
+    @staticmethod
+    def _extract_python_exports(content: str) -> list[str]:
+        """CHANGE-28: Extract top-level class/function names from Python code."""
+        import ast as _ast
+        try:
+            tree = _ast.parse(content)
+            names: list[str] = []
+            for node in _ast.iter_child_nodes(tree):
+                if isinstance(node, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    names.append(node.name)
+            return names
+        except SyntaxError:
+            return []
+
     def _build_agentic_system_prompt(
         self,
         contract: dict[str, Any],
@@ -1220,16 +1378,29 @@ class Aanya:
             "",
         ])
 
-        # ── 3. Backend files available ──
+        # ── 3. Backend files available (CHANGE-28: include exports) ──
+        # Show Aanya the actual exports from Shubham's backend files so she
+        # can use correct names for API types, schemas, etc. This is REAL
+        # context sharing: the agent SEES what the other agent produced.
         if backend_files:
             prompt_parts.extend([
                 "## Backend Files Available (from Shubham)",
-                "Use read_file to inspect these before writing frontend types/interfaces:",
+                "These are the ACTUAL backend files with their exports.",
+                "Use read_file to inspect full content. Use EXACT export names for types.",
             ])
-            for bf in backend_files[:20]:  # cap to avoid huge prompts
-                prompt_parts.append(f"- `{bf}`")
-            if len(backend_files) > 20:
-                prompt_parts.append(f"  ... and {len(backend_files) - 20} more")
+            # Get actual file contents if available to extract exports
+            _backend_contents = getattr(self, "_backend_file_contents_ref", {}) or {}
+            for bf in backend_files[:25]:
+                bf_content = _backend_contents.get(bf, "")
+                if bf_content and bf.endswith(".py"):
+                    bf_exports = self._extract_python_exports(bf_content)
+                    export_str = f" — exports: **{', '.join(bf_exports[:8])}**" if bf_exports else ""
+                    prompt_parts.append(f"- `{bf}`{export_str}")
+                else:
+                    prompt_parts.append(f"- `{bf}`")
+            if len(backend_files) > 25:
+                prompt_parts.append(f"  ... and {len(backend_files) - 25} more")
+            prompt_parts.append("⚠ When creating TypeScript types, match the EXACT names above!")
             prompt_parts.append("")
 
         # ── 4. Files to generate ──
