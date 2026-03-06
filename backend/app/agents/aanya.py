@@ -291,6 +291,15 @@ class AanyaToolHandler:
         except Exception:
             pass
 
+        # CHANGE-2: Persistent gate instance (loop detection history preserved)
+        # + rejection counter for max-rejection cap.
+        from app.agents.base import VerificationGate
+        self._gate = VerificationGate(extra_rules=self._verification_rules)
+        self._rejection_counts: dict[str, int] = {}
+        self._unresolved: dict[str, list[str]] = {}
+        # CHANGE-4: Export registry for hallucination detection
+        self._export_registry: dict[str, set[str]] = {}
+
     def observe(self, tool_name: str, result: str) -> "Observation":
         """PHASE-G: System evaluates tool result autonomously.
 
@@ -364,13 +373,40 @@ class AanyaToolHandler:
     async def _write_file(self, path: str, content: str) -> str:
         if len(content) > self._MAX_FILE_SIZE:
             return f"Error: file too large ({len(content)} bytes, max {self._MAX_FILE_SIZE})"
-        # PHASE-E: Verification gate — reject bad code at write time.
-        from app.agents.base import VerificationGate
-        gate = VerificationGate(extra_rules=self._verification_rules)
-        result = gate.verify(path, content, self._files)
+        # CHANGE-2: Use persistent gate (loop detection history preserved).
+        result = self._gate.verify(path, content, self._files)
         if not result.passed:
+            # CHANGE-2: Max rejection cap — after 5 rejections, accept with warnings.
+            self._rejection_counts[path] = self._rejection_counts.get(path, 0) + 1
+            if self._rejection_counts[path] >= 5:
+                self._files[path] = content
+                self._unresolved[path] = result.failures[:3]
+                logger.warning(
+                    "max_rejections_reached",
+                    path=path,
+                    rejections=self._rejection_counts[path],
+                    unresolved=len(result.failures),
+                )
+                return (
+                    f"ACCEPTED WITH WARNINGS (max rejections reached for {path}). "
+                    f"Unresolved issues: {'; '.join(result.failures[:3])}. "
+                    "Proceeding — downstream quality gates will catch these. Continue with other files."
+                )
             return result.rejection_message()
+
+        self._rejection_counts.pop(path, None)
         self._files[path] = content
+
+        # CHANGE-4: Build export registry for TS/JS hallucination detection
+        if path.endswith((".ts", ".tsx", ".js", ".jsx")):
+            import re as _re
+            names = set()
+            # Extract exported names from TS/JS
+            for m in _re.finditer(r"export\s+(?:default\s+)?(?:function|class|const|let|var|type|interface|enum)\s+(\w+)", content):
+                names.add(m.group(1))
+            if names:
+                self._export_registry[path] = names
+
         msg = f"Written {path} ({len(content)} chars)"
         if result.warnings:
             msg += "\n⚠ Warnings:\n" + "\n".join(f"  • {w}" for w in result.warnings[:3])
@@ -564,7 +600,10 @@ class AanyaToolHandler:
     # I3-FIX: Import & type validation during generation ─────────────
 
     def _check_imports(self, path: str) -> str:
-        """Verify Python imports resolve using shared code_validator."""
+        """Verify imports resolve using shared code_validator.
+
+        CHANGE-4: Also checks imported NAMES against the export registry.
+        """
         code = self._files.get(path, "")
         if not code:
             return f"File not found: {path}"
@@ -578,7 +617,31 @@ class AanyaToolHandler:
                 if mod.endswith(".py"):
                     mod = mod[:-3]
                 project_files.add(mod)
-        return check_imports(path, code, project_files)
+        base_result = check_imports(path, code, project_files)
+
+        # CHANGE-4: Check imported names against export registry (TS/JS)
+        import re as _re
+        name_issues: list[str] = []
+        # For TS/JS files, check named imports: import { X, Y } from './path'
+        named_imports = _re.findall(r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]", code)
+        for names_str, import_path in named_imports:
+            # Find matching file in registry
+            for reg_path, reg_names in self._export_registry.items():
+                # Match by filename stem
+                import_stem = import_path.rstrip("/").split("/")[-1].replace("@/", "")
+                reg_stem = reg_path.split("/")[-1].rsplit(".", 1)[0]
+                if import_stem == reg_stem or import_path.endswith(reg_stem):
+                    imported = [n.strip() for n in names_str.split(",")]
+                    for imp in imported:
+                        if imp and imp not in reg_names:
+                            name_issues.append(
+                                f"'{imp}' not exported by '{import_path}'. "
+                                f"Available: {sorted(reg_names)[:5]}"
+                            )
+                    break
+        if name_issues:
+            base_result += "\n\n⚠ Export validation:\n" + "\n".join(f"  • {i}" for i in name_issues)
+        return base_result
 
     def _check_types(self, path: str) -> str:
         """Run lightweight type checking via shared code_validator."""

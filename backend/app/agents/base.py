@@ -891,10 +891,16 @@ class VerificationGate:
 
     This is the single most impactful change: bad code is caught at WRITE
     TIME, not after all files are generated.
+
+    CHANGE-1: Loop detection — hashes rejected content and detects when
+    the LLM resubmits identical code that was already rejected. Forces
+    the LLM to change approach instead of wasting rounds.
     """
 
     def __init__(self, extra_rules: list[Any] | None = None):
         self._extra_rules = extra_rules or []
+        # CHANGE-1: Track rejected content hashes per path → previous failure reasons
+        self._rejection_hashes: dict[str, dict[str, list[str]]] = {}  # {path: {hash: [reasons]}}
 
     def verify_python(self, path: str, content: str, all_files: dict[str, str]) -> VerificationResult:
         """Verify a Python file before accepting the write."""
@@ -931,6 +937,39 @@ class VerificationGate:
                 alt_init = "backend/" + mod_init
                 if alt_path not in all_files and alt_init not in all_files:
                     warnings.append(f"Import '{mod}' may not resolve (no matching file generated yet)")
+
+        # 4b. CHANGE-3: Cross-file import NAME validation (WARNING)
+        # Check that imported names actually exist in the target module.
+        name_imports = re.findall(
+            r"^from\s+(app\.\S+)\s+import\s+(.+)$", content, re.MULTILINE
+        )
+        for mod, names_str in name_imports:
+            # Find the matching file in all_files
+            mod_file = mod.replace(".", "/") + ".py"
+            alt_file = "backend/" + mod_file
+            source_content = all_files.get(mod_file) or all_files.get(alt_file)
+            if source_content:
+                try:
+                    source_tree = ast.parse(source_content)
+                    available_names: set[str] = set()
+                    for node in ast.iter_child_nodes(source_tree):
+                        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                            available_names.add(node.name)
+                        elif isinstance(node, ast.Assign):
+                            for tgt in node.targets:
+                                if isinstance(tgt, ast.Name):
+                                    available_names.add(tgt.id)
+                    # Parse imported names (handle "import A, B, C")
+                    imported = [n.strip().split(" as ")[0].strip() for n in names_str.split(",")]
+                    for imp_name in imported:
+                        if imp_name and imp_name not in available_names and imp_name != "*":
+                            avail_sorted = sorted(available_names)[:5]
+                            warnings.append(
+                                f"Import '{imp_name}' from '{mod}' — name not found in that file. "
+                                f"Available: {avail_sorted}"
+                            )
+                except SyntaxError:
+                    pass  # Source file has syntax errors — can't parse
 
         # 5. Package __init__.py check (WARNING)
         dir_path = "/".join(path.split("/")[:-1])
@@ -1001,17 +1040,42 @@ class VerificationGate:
         )
 
     def verify(self, path: str, content: str, all_files: dict[str, str]) -> VerificationResult:
-        """Auto-dispatch to the right verifier based on file extension."""
+        """Auto-dispatch to the right verifier based on file extension.
+
+        CHANGE-1: After verification, checks if this exact content was
+        previously rejected for the same path. If so, adds a HARD failure
+        forcing the LLM to change its approach.
+        """
+        import hashlib as _hashlib
+
         if path.endswith(".py"):
-            return self.verify_python(path, content, all_files)
+            result = self.verify_python(path, content, all_files)
         elif path.endswith((".ts", ".tsx", ".js", ".jsx")):
-            return self.verify_typescript(path, content, all_files)
+            result = self.verify_typescript(path, content, all_files)
         else:
             # Non-code files (JSON, YAML, HTML, CSS) — basic checks only
             failures = []
             if "```" in content and (content.startswith("```") or "\n```" in content[:50]):
                 failures.append("Contains markdown code fences.")
-            return VerificationResult(passed=len(failures) == 0, failures=failures, warnings=[])
+            result = VerificationResult(passed=len(failures) == 0, failures=failures, warnings=[])
+
+        # CHANGE-1: Loop detection — if this content was already rejected,
+        # the LLM is stuck in a loop. Add a HARD failure with prior reasons.
+        if not result.passed:
+            content_hash = _hashlib.md5((path + content[:500]).encode()).hexdigest()
+            path_hashes = self._rejection_hashes.setdefault(path, {})
+            if content_hash in path_hashes:
+                prior_reasons = path_hashes[content_hash]
+                result.failures.insert(0, (
+                    "LOOP DETECTED: You submitted code identical to a previous rejection. "
+                    f"Previous rejection reasons: {'; '.join(prior_reasons[:3])}. "
+                    "You MUST take a DIFFERENT approach — do not repeat the same code."
+                ))
+                logger.warning("verification_loop_detected", path=path, hash=content_hash)
+            # Store this rejection for future loop detection
+            path_hashes[content_hash] = result.failures[:3]
+
+        return result
 
 
 # ── PHASE-H: Goal Decomposition ──────────────────────────────────────
@@ -1136,15 +1200,23 @@ class AdaptiveComplexity:
     def __init__(self, initial: TaskComplexity = TaskComplexity.LOW) -> None:
         self.current = initial
         self.consecutive_failures = 0
+        self._consecutive_successes = 0  # CHANGE-10: Track for de-escalation
         self._escalation_count = 0
+        self._de_escalation_count = 0  # CHANGE-10
 
     def on_verification_pass(self) -> None:
-        """Reset failure counter on success."""
+        """Reset failure counter on success, track for de-escalation."""
         self.consecutive_failures = 0
+        self._consecutive_successes += 1
+        # CHANGE-10: De-escalate after sustained success at higher tier
+        if self._consecutive_successes >= 3 and self.current != TaskComplexity.LOW:
+            self.de_escalate()
+            self._consecutive_successes = 0
 
     def on_verification_fail(self) -> None:
         """Track failures and escalate after threshold."""
         self.consecutive_failures += 1
+        self._consecutive_successes = 0  # CHANGE-10: Reset on failure
         if self.consecutive_failures >= 2:
             self.escalate()
             self.consecutive_failures = 0
@@ -1161,15 +1233,25 @@ class AdaptiveComplexity:
             logger.info("adaptive_complexity_escalated", to="HIGH")
 
     def de_escalate(self) -> None:
-        """After 3 consecutive successes at higher tier, try cheaper model."""
-        if self.consecutive_failures == 0 and self.current != TaskComplexity.LOW:
-            # Only de-escalate after sustained success
-            pass  # Future: implement de-escalation after N successes
+        """CHANGE-10: After 3 consecutive successes at higher tier, drop down.
+
+        Saves money: if models.py needed MEDIUM but schemas.py is simple,
+        drop back to LOW for schemas.py instead of staying at MEDIUM.
+        """
+        if self.current == TaskComplexity.HIGH:
+            self.current = TaskComplexity.MEDIUM
+            self._de_escalation_count += 1
+            logger.info("adaptive_complexity_de_escalated", to="MEDIUM")
+        elif self.current == TaskComplexity.MEDIUM:
+            self.current = TaskComplexity.LOW
+            self._de_escalation_count += 1
+            logger.info("adaptive_complexity_de_escalated", to="LOW")
 
     def summary(self) -> dict[str, Any]:
         return {
             "current": self.current.value if hasattr(self.current, 'value') else str(self.current),
             "escalation_count": self._escalation_count,
+            "de_escalation_count": self._de_escalation_count,  # CHANGE-10
         }
 
 

@@ -945,6 +945,9 @@ class Fixer:
         # Fix loop: one error per iteration, max MAX_FIX_ITERATIONS
         remaining_errors = list(errors)
         iteration = 0
+        # CHANGE-6: Track fix hashes to detect duplicate (identical) fixes
+        import hashlib as _hashlib_fixer
+        seen_fix_hashes: set[str] = set()
 
         while remaining_errors and iteration < MAX_FIX_ITERATIONS:
             iteration += 1
@@ -954,6 +957,23 @@ class Fixer:
             model_override, enable_thinking = _get_iteration_model_map().get(
                 iteration, ("sonnet", False)
             )
+
+            # CHANGE-6: Build summary of previous failed attempts for same file
+            # so the fixer knows what NOT to try again.
+            prior_attempts_for_file = [
+                a for a in report.attempts
+                if a.error.file_path == current_error.file_path and not a.success
+            ]
+            prior_summary = ""
+            if prior_attempts_for_file:
+                prior_lines = [
+                    f"  - Iteration {a.iteration}: {a.fix_applied or 'unknown fix'}"
+                    for a in prior_attempts_for_file[-3:]
+                ]
+                prior_summary = (
+                    "\nPrevious FAILED fixes for this file (try a DIFFERENT approach):\n"
+                    + "\n".join(prior_lines)
+                )
 
             logger.info(
                 "fixer_iteration",
@@ -972,9 +992,26 @@ class Fixer:
                 model_override=model_override,
                 enable_thinking=enable_thinking,
                 pipeline_run_id=pipeline_run_id,
+                prior_attempts_summary=prior_summary,  # CHANGE-6
             )
 
             report.attempts.append(attempt)
+
+            # CHANGE-6: Detect duplicate fixes — same file + same output = stuck
+            if not attempt.success:
+                content_after = (attempt.file_content_after or "")[:200]
+                fix_hash = _hashlib_fixer.md5(
+                    (current_error.file_path + content_after).encode()
+                ).hexdigest()
+                if fix_hash in seen_fix_hashes:
+                    logger.warning(
+                        "duplicate_fix_detected",
+                        file=current_error.file_path,
+                        iteration=iteration,
+                    )
+                    remaining_errors.pop(0)  # Remove permanently — can't fix this one
+                    continue
+                seen_fix_hashes.add(fix_hash)
 
             if attempt.success:
                 report.errors_fixed += 1
@@ -1086,6 +1123,7 @@ class Fixer:
         model_override: str,
         enable_thinking: bool,
         pipeline_run_id: str = "",
+        prior_attempts_summary: str = "",  # CHANGE-6: previous failed fix summaries
     ) -> FixAttempt:
         """Attempt to fix a single error using the agentic tool loop."""
         # Build error report for read_error_report tool
@@ -1166,9 +1204,50 @@ class Fixer:
             "- For unknown errors: use search_solution before guessing",
         ])
 
+        # CHANGE-5: Root-cause backtracking for import/name errors.
+        # If the error is in file B but caused by missing export in file A,
+        # tell the fixer to fix A (root cause) instead of patching B (symptom).
+        root_cause_hint = ""
+        if any(kw in (error.error_type or "").lower() for kw in ("importerror", "modulenotfounderror", "namenotfound")):
+            import re as _re_fixer
+            # Extract module reference from error message
+            mod_match = _re_fixer.search(
+                r"(?:from|import)\s+(app\.\S+)|cannot import name '(\w+)' from '([\w.]+)'",
+                error.error_message or "",
+            )
+            if mod_match:
+                source_mod = mod_match.group(1) or mod_match.group(3) or ""
+                missing_name = mod_match.group(2) or ""
+                if source_mod:
+                    source_path = source_mod.replace(".", "/") + ".py"
+                    alt_path = "backend/" + source_path
+                    source_content = handler._read_file(source_path)
+                    if source_content.startswith("File not found"):
+                        source_content = handler._read_file(alt_path)
+                    if not source_content.startswith("File not found"):
+                        # Parse to find available exports
+                        try:
+                            import ast as _fixer_ast
+                            tree = _fixer_ast.parse(source_content)
+                            available = sorted(
+                                node.name for node in _fixer_ast.iter_child_nodes(tree)
+                                if isinstance(node, (_fixer_ast.ClassDef, _fixer_ast.FunctionDef, _fixer_ast.AsyncFunctionDef))
+                            )
+                            root_cause_hint = (
+                                f"\n\nROOT CAUSE ANALYSIS: This error likely originates in "
+                                f"{source_path} which does NOT export '{missing_name}'. "
+                                f"Available exports: {available[:10]}. "
+                                f"You may modify BOTH {error.file_path} AND {source_path}. "
+                                f"Fix the ROOT CAUSE first — add the missing class/function to the source file."
+                            )
+                        except SyntaxError:
+                            pass
+
         user_message = (
             f"Fix this error in {error.file_path}: {error.error_type}\n"
             f"Call read_error_report first, then read_file, then write_file with the fix."
+            f"{root_cause_hint}"
+            f"{prior_attempts_summary}"
         )
 
         # AUDIT-FIX: Use a lightweight proxy instead of mutating self.default_model.

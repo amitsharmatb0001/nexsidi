@@ -136,6 +136,91 @@ class MistakeMemory:
         if len(_FALLBACK_STORE[agent_name]) > 200:
             _FALLBACK_STORE[agent_name] = _FALLBACK_STORE[agent_name][-200:]
 
+    def record_success(
+        self,
+        agent_name: str,
+        task_type: str,
+        output_summary: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """CHANGE-9: Store a successful outcome for positive reinforcement.
+
+        Unlike record_failure() which stores errors, this stores what WORKED.
+        build_lessons_prompt() will include both DO (successes) and AVOID (failures).
+        """
+        doc_id = hashlib.md5(
+            f"success:{agent_name}:{task_type}:{output_summary[:200]}".encode()
+        ).hexdigest()
+
+        doc_text = f"SUCCESS: {output_summary}"
+        metadata = {
+            "agent_name": agent_name,
+            "task_type": task_type,
+            "type": "success",
+            "summary": output_summary[:500],
+            "timestamp": time.time(),
+        }
+        if context:
+            for k, v in context.items():
+                if isinstance(v, (str, int, float, bool)):
+                    metadata[f"ctx_{k}"] = v
+
+        chroma = _get_chroma()
+        if chroma:
+            try:
+                coll_name = _collection_name(agent_name) + "_successes"
+                collection = chroma.get_or_create_collection(coll_name)
+                collection.upsert(
+                    ids=[doc_id],
+                    documents=[doc_text],
+                    metadatas=[metadata],
+                )
+                logger.debug("success_recorded", agent=agent_name, task_type=task_type)
+                return
+            except Exception as exc:
+                logger.warning("success_record_chromadb_failed", error=str(exc)[:200])
+
+        # Fallback: in-memory
+        key = f"{agent_name}_successes"
+        if key not in _FALLBACK_STORE:
+            _FALLBACK_STORE[key] = []
+        _FALLBACK_STORE[key].append(metadata)
+        if len(_FALLBACK_STORE[key]) > 100:
+            _FALLBACK_STORE[key] = _FALLBACK_STORE[key][-100:]
+
+    def _query_successes(
+        self,
+        agent_name: str,
+        task_type: str,
+        input_context: str,
+        n_results: int = 3,
+    ) -> list[dict[str, Any]]:
+        """CHANGE-9: Query past successes for positive reinforcement."""
+        chroma = _get_chroma()
+        if chroma:
+            try:
+                coll_name = _collection_name(agent_name) + "_successes"
+                collection = chroma.get_or_create_collection(coll_name)
+                results = collection.query(
+                    query_texts=[f"{task_type}: {input_context[:500]}"],
+                    n_results=n_results,
+                )
+                if results and results.get("metadatas"):
+                    successes = []
+                    for meta_list in results["metadatas"]:
+                        if isinstance(meta_list, list):
+                            successes.extend(meta_list)
+                        else:
+                            successes.append(meta_list)
+                    return successes[:n_results]
+            except Exception:
+                pass
+
+        # Fallback
+        key = f"{agent_name}_successes"
+        entries = _FALLBACK_STORE.get(key, [])
+        return [e for e in entries if e.get("task_type") == task_type][-n_results:]
+
     def query_similar_mistakes(
         self,
         agent_name: str,
@@ -181,23 +266,35 @@ class MistakeMemory:
     ) -> str:
         """Build a prompt section with past lessons, or empty string.
 
-        Returns a section like:
-            LEARN FROM PAST MISTAKES:
-            1. Error: ... → Fix: ...
-            2. Error: ... → Fix: ...
+        CHANGE-9: Now includes BOTH positive and negative lessons:
+        - DO THIS: patterns that worked in similar projects
+        - AVOID THIS: past mistakes and their fixes
         """
         mistakes = self.query_similar_mistakes(agent_name, task_type, context)
-        if not mistakes:
+        successes = self._query_successes(agent_name, task_type, context)
+
+        if not mistakes and not successes:
             return ""
 
-        lines = ["\n\n**LEARN FROM PAST MISTAKES (DO NOT REPEAT):**"]
-        for i, mistake in enumerate(mistakes[:5], 1):
-            error = mistake.get("error", "Unknown")[:200]
-            fix = mistake.get("fix", "No fix recorded")[:200]
-            lines.append(f"{i}. **Error**: {error}")
-            lines.append(f"   **Fix**: {fix}")
-        lines.append("")
+        lines = ["\n\n**LESSONS FROM PAST PROJECTS:**"]
 
+        # Positive lessons (what worked)
+        if successes:
+            lines.append("\n**DO THIS (proven patterns):**")
+            for i, success in enumerate(successes[:3], 1):
+                summary = success.get("summary", "")[:200]
+                lines.append(f"{i}. {summary}")
+
+        # Negative lessons (what to avoid)
+        if mistakes:
+            lines.append("\n**AVOID THIS (past mistakes — DO NOT REPEAT):**")
+            for i, mistake in enumerate(mistakes[:5], 1):
+                error = mistake.get("error", "Unknown")[:200]
+                fix = mistake.get("fix", "No fix recorded")[:200]
+                lines.append(f"{i}. **Error**: {error}")
+                lines.append(f"   **Fix**: {fix}")
+
+        lines.append("")
         return "\n".join(lines)
 
     def build_validation_rules(

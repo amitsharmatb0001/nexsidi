@@ -861,6 +861,15 @@ class ShubhamToolHandler:
         except Exception:
             pass  # Non-fatal — proceed without extra rules
 
+        # CHANGE-2: Persistent gate instance (loop detection history preserved)
+        # + rejection counter for max-rejection cap.
+        from app.agents.base import VerificationGate
+        self._gate = VerificationGate(extra_rules=self._verification_rules)
+        self._rejection_counts: dict[str, int] = {}  # path → rejection count
+        self._unresolved: dict[str, list[str]] = {}  # path → unresolved failures
+        # CHANGE-4: Export registry for hallucination detection
+        self._export_registry: dict[str, set[str]] = {}
+
     @property
     def done(self) -> bool:
         """True after the LLM calls task_complete."""
@@ -948,14 +957,49 @@ class ShubhamToolHandler:
             return f"Unknown tool: {tool_name}"
 
     async def _write_file(self, path: str, content: str) -> str:
-        # PHASE-E: Verification gate — reject bad code at write time.
-        # The LLM gets a REJECTED message and MUST fix before file is accepted.
-        from app.agents.base import VerificationGate
-        gate = VerificationGate(extra_rules=self._verification_rules)
-        result = gate.verify(path, content, self._files)
+        # CHANGE-2: Use persistent gate (loop detection history preserved).
+        result = self._gate.verify(path, content, self._files)
         if not result.passed:
+            # CHANGE-2: Max rejection cap — after 5 rejections, accept with warnings.
+            self._rejection_counts[path] = self._rejection_counts.get(path, 0) + 1
+            if self._rejection_counts[path] >= 5:
+                # Accept the file despite failures — downstream gates will catch.
+                self._files[path] = content
+                self._unresolved[path] = result.failures[:3]
+                logger.warning(
+                    "max_rejections_reached",
+                    path=path,
+                    rejections=self._rejection_counts[path],
+                    unresolved=len(result.failures),
+                )
+                return (
+                    f"ACCEPTED WITH WARNINGS (max rejections reached for {path}). "
+                    f"Unresolved issues: {'; '.join(result.failures[:3])}. "
+                    "Proceeding — downstream quality gates will catch these. Continue with other files."
+                )
             return result.rejection_message()
+
+        # Reset rejection count on success
+        self._rejection_counts.pop(path, None)
         self._files[path] = content
+
+        # CHANGE-4: Build export registry for hallucination detection
+        if path.endswith(".py"):
+            try:
+                import ast as _ast
+                tree = _ast.parse(content)
+                names = set()
+                for node in _ast.iter_child_nodes(tree):
+                    if isinstance(node, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)):
+                        names.add(node.name)
+                    elif isinstance(node, _ast.Assign):
+                        for target in node.targets:
+                            if isinstance(target, _ast.Name):
+                                names.add(target.id)
+                self._export_registry[path] = names
+            except SyntaxError:
+                pass  # Already validated by gate — shouldn't happen
+
         msg = f"Written {path} ({len(content)} chars)"
         if result.warnings:
             msg += "\n⚠ Warnings:\n" + "\n".join(f"  • {w}" for w in result.warnings[:3])
@@ -1268,7 +1312,12 @@ class ShubhamToolHandler:
     # I3-FIX: Import & type validation during generation ─────────────
 
     def _check_imports(self, path: str) -> str:
-        """Verify Python imports resolve using shared code_validator."""
+        """Verify Python imports resolve using shared code_validator.
+
+        CHANGE-4: Also checks imported NAMES against the export registry.
+        If a name doesn't exist in the target module, returns a specific
+        error with closest-match suggestion.
+        """
         code = self._files.get(path, "")
         if not code:
             return f"File not found: {path}"
@@ -1282,7 +1331,31 @@ class ShubhamToolHandler:
                 if mod.endswith(".py"):
                     mod = mod[:-3]
                 project_files.add(mod)
-        return check_imports(path, code, project_files)
+        base_result = check_imports(path, code, project_files)
+
+        # CHANGE-4: Check imported names against export registry
+        import re as _re
+        import difflib
+        name_issues: list[str] = []
+        name_imports = _re.findall(r"^from\s+(app\.\S+)\s+import\s+(.+)$", code, _re.MULTILINE)
+        for mod, names_str in name_imports:
+            mod_file = mod.replace(".", "/") + ".py"
+            alt_file = "backend/" + mod_file
+            registry_key = mod_file if mod_file in self._export_registry else alt_file
+            if registry_key in self._export_registry:
+                available = self._export_registry[registry_key]
+                imported = [n.strip().split(" as ")[0].strip() for n in names_str.split(",")]
+                for imp_name in imported:
+                    if imp_name and imp_name not in available and imp_name != "*":
+                        matches = difflib.get_close_matches(imp_name, sorted(available), n=2, cutoff=0.5)
+                        suggestion = f" Did you mean: {matches}?" if matches else ""
+                        name_issues.append(
+                            f"'{imp_name}' not exported by '{mod}'. "
+                            f"Available: {sorted(available)[:5]}.{suggestion}"
+                        )
+        if name_issues:
+            base_result += "\n\n⚠ Export validation:\n" + "\n".join(f"  • {i}" for i in name_issues)
+        return base_result
 
     def _check_types(self, path: str) -> str:
         """Run lightweight type checking via shared code_validator."""

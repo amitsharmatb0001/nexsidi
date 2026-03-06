@@ -1945,6 +1945,8 @@ class ProjectCostTracker:
     _MAX_ENTRIES: int = 10_000  # Safety cap for in-memory entries
     # COST-CAP-FIX: Hard cost cap in USD; override via PIPELINE_COST_CAP_USD env var.
     _HARD_CAP_USD: float = float(os.environ.get("PIPELINE_COST_CAP_USD", "50.0"))  # COST-CAP-FIX
+    # CHANGE-7: Soft cap ratio for graceful degradation
+    _SOFT_CAP_RATIO: float = 0.75  # 75% of hard cap → constrained mode
 
     def __init__(self, pipeline_run_id: str = "") -> None:
         from collections import deque
@@ -2107,6 +2109,37 @@ class ProjectCostTracker:
     def call_count(self) -> int:
         # R25-FIX-6: Use incremental counter instead of len(deque)
         return self._total_call_count
+
+    # ── CHANGE-7: Budget awareness for graceful degradation ──
+
+    def get_budget_state(self) -> str:
+        """Return budget state for pipeline decision-making.
+
+        CHANGE-7: Enables graceful degradation instead of hard crash.
+        - "normal": < 75% of cap used — operate normally
+        - "constrained": 75-90% — use cheaper models, simplify
+        - "critical": 90-100% — skip optional stages, cheapest model only
+        """
+        if self._HARD_CAP_USD <= 0:
+            return "normal"
+        ratio = self._total_cost / self._HARD_CAP_USD
+        if ratio >= 0.90:
+            return "critical"
+        elif ratio >= self._SOFT_CAP_RATIO:
+            return "constrained"
+        return "normal"
+
+    @property
+    def remaining_budget_usd(self) -> float:
+        """USD remaining before hard cap."""
+        return max(0.0, self._HARD_CAP_USD - self._total_cost)
+
+    @property
+    def budget_ratio(self) -> float:
+        """Fraction of budget consumed (0.0 → 1.0+)."""
+        if self._HARD_CAP_USD <= 0:
+            return 0.0
+        return self._total_cost / self._HARD_CAP_USD
 
     def per_model_breakdown(self) -> dict[str, dict[str, Any]]:
         """Get cost breakdown per model.

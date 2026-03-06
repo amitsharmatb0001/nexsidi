@@ -1740,56 +1740,90 @@ class PipelineOrchestrator:
                 and self._has_errors_to_fix(step_result)
                 and run.fix_retest_cycle < MAX_FIX_RETEST_CYCLES
             ):
-                run.fix_retest_cycle += 1
+                # CHANGE-8: Diminishing returns detection — if fix rate is
+                # too low on cycle 2+, stop wasting budget on hopeless fixes.
+                fixer_output = step_result.result.output or {}
+                _fixed = fixer_output.get("errors_fixed", 0)
+                _remaining = fixer_output.get("errors_remaining", 0)
+                _fix_rate = _fixed / max(_fixed + _remaining, 1)
 
-                # I4-FIX: Fast-path — trivial fixes (syntax/import/typo) skip
-                # the full quality review cycle and go directly to TESTING.
-                # Structural/moderate fixes still re-run all quality gates.
-                fix_severity = "STRUCTURAL"
-                if step_result.result.output:
-                    fix_severity = step_result.result.output.get(
-                        "fix_severity", "STRUCTURAL"
-                    )
-
-                if fix_severity == "TRIVIAL":
-                    run.context["__fix_fast_path__"] = True
-                    logger.info(
-                        "fix_retest_fast_path",
+                if _fix_rate < 0.2 and run.fix_retest_cycle >= 2:
+                    logger.warning(
+                        "fix_retest_diminishing_returns",
                         run_id=run.run_id,
                         cycle=run.fix_retest_cycle,
-                        severity=fix_severity,
+                        fix_rate=round(_fix_rate, 2),
+                        errors_remaining=_remaining,
                     )
-                    run.current_stage = PipelineStage.TESTING
-                elif fix_severity == "MODERATE":
-                    # V4-FIX: MODERATE fast-path — skip security+compliance
-                    # but keep quality review, testing, tilotma for functional
-                    # validation.  Skip flags are cleared after loop exit.
-                    run.context["__fix_fast_path__"] = True
-                    run.context["__skip_security_audit__"] = True
-                    run.context["__skip_compliance__"] = True
-                    logger.info(
-                        "fix_retest_moderate_fast_path",
-                        run_id=run.run_id,
-                        cycle=run.fix_retest_cycle,
-                        severity=fix_severity,
-                    )
-                    run.current_stage = PipelineStage.QUALITY_REVIEW
+                    run.context["__known_issues__"] = _remaining
+                    # Don't continue — fall through to advance() with known issues
+                    await self._persist_run(run)
                 else:
-                    # STRUCTURAL — full cycle, clear skip flags from prior cycles
-                    run.context.pop("__fix_fast_path__", None)
-                    run.context.pop("__skip_security_audit__", None)
-                    run.context.pop("__skip_compliance__", None)
-                    logger.info(
-                        "fix_retest_loop",
-                        run_id=run.run_id,
-                        cycle=run.fix_retest_cycle,
-                        max_cycles=MAX_FIX_RETEST_CYCLES,
-                        severity=fix_severity,
-                    )
-                    run.current_stage = PipelineStage.QUALITY_REVIEW
+                    # CHANGE-7: Budget-aware degradation during fix-retest
+                    if hasattr(self, "_cost_tracker") and self._cost_tracker is not None:
+                        budget_state = self._cost_tracker.get_budget_state()
+                        if budget_state == "critical":
+                            logger.warning(
+                                "fix_retest_budget_critical",
+                                run_id=run.run_id,
+                                remaining_usd=round(self._cost_tracker.remaining_budget_usd, 2),
+                            )
+                            run.context["__budget_constrained__"] = True
+                            run.context["__skip_security_audit__"] = True
+                            run.context["__skip_compliance__"] = True
+                        elif budget_state == "constrained":
+                            run.context["__budget_constrained__"] = True
 
-                await self._persist_run(run)
-                continue
+                    run.fix_retest_cycle += 1
+
+                    # I4-FIX: Fast-path — trivial fixes (syntax/import/typo) skip
+                    # the full quality review cycle and go directly to TESTING.
+                    # Structural/moderate fixes still re-run all quality gates.
+                    fix_severity = "STRUCTURAL"
+                    if step_result.result.output:
+                        fix_severity = step_result.result.output.get(
+                            "fix_severity", "STRUCTURAL"
+                        )
+
+                    if fix_severity == "TRIVIAL":
+                        run.context["__fix_fast_path__"] = True
+                        logger.info(
+                            "fix_retest_fast_path",
+                            run_id=run.run_id,
+                            cycle=run.fix_retest_cycle,
+                            severity=fix_severity,
+                        )
+                        run.current_stage = PipelineStage.TESTING
+                    elif fix_severity == "MODERATE":
+                        # V4-FIX: MODERATE fast-path — skip security+compliance
+                        # but keep quality review, testing, tilotma for functional
+                        # validation.  Skip flags are cleared after loop exit.
+                        run.context["__fix_fast_path__"] = True
+                        run.context["__skip_security_audit__"] = True
+                        run.context["__skip_compliance__"] = True
+                        logger.info(
+                            "fix_retest_moderate_fast_path",
+                            run_id=run.run_id,
+                            cycle=run.fix_retest_cycle,
+                            severity=fix_severity,
+                        )
+                        run.current_stage = PipelineStage.QUALITY_REVIEW
+                    else:
+                        # STRUCTURAL — full cycle, clear skip flags from prior cycles
+                        run.context.pop("__fix_fast_path__", None)
+                        run.context.pop("__skip_security_audit__", None)
+                        run.context.pop("__skip_compliance__", None)
+                        logger.info(
+                            "fix_retest_loop",
+                            run_id=run.run_id,
+                            cycle=run.fix_retest_cycle,
+                            max_cycles=MAX_FIX_RETEST_CYCLES,
+                            severity=fix_severity,
+                        )
+                        run.current_stage = PipelineStage.QUALITY_REVIEW
+
+                    await self._persist_run(run)
+                    continue
 
             # V4-FIX: Clear MODERATE fast-path skip flags when exiting fix-retest
             # loop so they don't leak into normal sequential pipeline flow.
@@ -2551,6 +2585,23 @@ class PipelineOrchestrator:
             run.context[agent_name] = result.output
             # C2b-FIX: Compact large values to storage references
             await self._compact_agent_output(run, agent_name)
+
+            # CHANGE-9: Record success in mistake_memory for positive reinforcement.
+            # Future runs will see both "what worked" and "what failed" in their prompts.
+            try:
+                from app.services.mistake_memory import mistake_memory
+                file_count = result.output.get("file_count", 0)
+                framework = result.output.get("backend_framework") or result.output.get("framework", "")
+                summary = f"{agent_name} completed {stage.value} ({file_count} files, {framework})"
+                if result.output.get("self_check", {}).get("passed"):
+                    summary += " — self-check PASSED"
+                mistake_memory.record_success(
+                    agent_name=agent_name,
+                    task_type=stage.value,
+                    output_summary=summary,
+                )
+            except Exception:
+                pass  # Non-fatal
 
         return step
 
