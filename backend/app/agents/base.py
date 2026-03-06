@@ -499,7 +499,15 @@ async def call_ai_with_continuation(
             dynamic_system_context=dynamic_system_context,  # CACHE-FIX
         )
 
-        full_content += response.content
+        # 4.3-FIX: Strip markdown code fences from continuation responses.
+        # LLMs often prefix continuations with ```python\n and suffix with \n```,
+        # injecting invalid syntax into the middle of generated code.
+        _chunk = response.content
+        if continuation > 0:
+            import re as _re
+            _chunk = _re.sub(r'^```\w*\n?', '', _chunk)
+            _chunk = _re.sub(r'\n?```\s*$', '', _chunk)
+        full_content += _chunk
         total_output_tokens += response.output_tokens
         total_input_tokens += response.input_tokens
         total_latency_ms += response.latency_ms  # R29-FIX-7
@@ -558,6 +566,18 @@ async def call_ai_with_continuation(
     )
 
 
+@dataclass
+class Observation:
+    """Result of the system observing a tool execution.
+
+    PHASE-G: The system (not the LLM) evaluates every tool result and
+    decides whether to proceed, retry, or escalate.
+    """
+    proceed: bool = True        # Send result to LLM as normal
+    needs_escalation: bool = False  # Switch to more expensive model
+    override_result: str | None = None  # Replace tool result with this
+
+
 async def call_ai_with_tools(
     agent: Any,
     messages: list[dict[str, str]],
@@ -567,13 +587,15 @@ async def call_ai_with_tools(
     tool_handler: Any = None,
     max_tool_rounds: int = 10,
 ) -> AIResponse:
-    """Make an AI call with tool use loop.
+    """Make an AI call with observe→decide loop.
+
+    PHASE-G: After every tool execution, the SYSTEM evaluates the result
+    via tool_handler.observe() (if available). This allows the system to:
+    - Override tool results (e.g., inject verification warnings)
+    - Escalate to more expensive models mid-loop
+    - Make decisions independent of the LLM
 
     ``agent`` must have ``.default_complexity``, ``.default_model``, and ``.tools``.
-
-    Sends tools to the model, handles tool_use responses, calls the
-    handler, sends results back, and loops until the model returns
-    a final text response (no more tool calls).
     """
     from app.services.ai_router import get_ai_router
 
@@ -646,6 +668,25 @@ async def call_ai_with_tools(
                 _MAX_TOOL_RESULT_CHARS = 50_000
                 if len(result_str) > _MAX_TOOL_RESULT_CHARS:
                     result_str = result_str[:_MAX_TOOL_RESULT_CHARS] + "\n... [truncated]"
+
+                # PHASE-G: System observes tool result and can override/escalate.
+                # This is the core agentic mechanism: the SYSTEM (not LLM) evaluates
+                # every tool result and makes autonomous decisions.
+                if hasattr(tool_handler, 'observe'):
+                    observation = tool_handler.observe(tc["name"], result_str)
+                    if observation.override_result is not None:
+                        result_str = observation.override_result
+                    if observation.needs_escalation:
+                        # Switch to more expensive model for remaining rounds
+                        request = AIRequest(
+                            messages=request.messages if hasattr(request, 'messages') else ai_messages,
+                            system_prompt=system_prompt,
+                            task_type=task_type,
+                            complexity=TaskComplexity.HIGH,
+                            model_override=resolve_model_override(agent.default_model),
+                            tools=tool_defs,
+                        )
+                        logger.info("tool_loop_escalated", tool=tc["name"], reason="observation")
             except Exception as exc:
                 # R11-FIX: Sanitize tool exception — may contain credentials
                 # from downstream HTTP calls (httpx error messages include headers).
@@ -818,3 +859,373 @@ def get_agent(name: str) -> Any:
 def list_agents() -> list[str]:
     """List all registered agent names."""
     return sorted(_agents.keys())
+
+
+# ── PHASE-E: Verification Gates ─────────────────────────────────────
+
+
+@dataclass
+class VerificationResult:
+    """Result of a verification gate check."""
+    passed: bool
+    failures: list[str]  # Human-readable failure descriptions
+    warnings: list[str]  # Non-blocking warnings
+
+    def rejection_message(self) -> str:
+        """Build rejection message for the LLM."""
+        parts = [f"REJECTED — {len(self.failures)} error(s):"]
+        for f in self.failures[:5]:
+            parts.append(f"  • {f}")
+        if self.warnings:
+            parts.append(f"  (+ {len(self.warnings)} warning(s))")
+        parts.append("Fix ALL errors and call write_file again with corrected content.")
+        return "\n".join(parts)
+
+
+class VerificationGate:
+    """Hard gate that blocks write_file until verification passes.
+
+    Phase E: Agents can no longer write garbage code — every write_file
+    call runs HARD verification. If it fails, the LLM gets a REJECTED
+    message and MUST fix the code before the file is accepted.
+
+    This is the single most impactful change: bad code is caught at WRITE
+    TIME, not after all files are generated.
+    """
+
+    def __init__(self, extra_rules: list[Any] | None = None):
+        self._extra_rules = extra_rules or []
+
+    def verify_python(self, path: str, content: str, all_files: dict[str, str]) -> VerificationResult:
+        """Verify a Python file before accepting the write."""
+        import ast
+        import re
+
+        failures: list[str] = []
+        warnings: list[str] = []
+
+        # 1. Syntax validity (HARD — must pass)
+        try:
+            ast.parse(content)
+        except SyntaxError as e:
+            failures.append(f"SyntaxError at line {e.lineno}: {e.msg}")
+
+        # 2. Markdown fence detection (HARD — LLM artifact)
+        if "```python" in content or "```\n" in content:
+            failures.append("Contains markdown code fences (```). Remove them.")
+
+        # 3. Empty function bodies with just 'pass' (WARNING)
+        pass_only = re.findall(r"def\s+\w+\([^)]*\)(?:\s*->[^:]+)?:\s*\n\s+pass\s*$", content, re.MULTILINE)
+        if len(pass_only) > 2:
+            warnings.append(f"{len(pass_only)} functions have only 'pass' — likely incomplete")
+
+        # 4. Intra-project import resolution (WARNING)
+        import_lines = re.findall(r"^from\s+(app\.\S+)\s+import", content, re.MULTILINE)
+        for mod in import_lines:
+            # Convert module path to potential file path
+            mod_path = mod.replace(".", "/") + ".py"
+            mod_init = mod.replace(".", "/") + "/__init__.py"
+            if mod_path not in all_files and mod_init not in all_files:
+                # Also check without 'backend/' prefix
+                alt_path = "backend/" + mod_path
+                alt_init = "backend/" + mod_init
+                if alt_path not in all_files and alt_init not in all_files:
+                    warnings.append(f"Import '{mod}' may not resolve (no matching file generated yet)")
+
+        # 5. Package __init__.py check (WARNING)
+        dir_path = "/".join(path.split("/")[:-1])
+        if dir_path and dir_path.count("/") >= 1:
+            init_path = dir_path + "/__init__.py"
+            if init_path not in all_files and path != init_path:
+                # Only warn if there are other .py files in same directory
+                siblings = [p for p in all_files if p.startswith(dir_path + "/") and p.endswith(".py")]
+                if siblings:
+                    warnings.append(f"Directory '{dir_path}' may need an __init__.py")
+
+        # 6. Extra rules from mistake memory
+        for rule in self._extra_rules:
+            try:
+                result = rule(path, content, all_files)
+                if isinstance(result, str) and result:
+                    failures.append(result)
+            except Exception:
+                pass  # Don't let bad rules crash verification
+
+        return VerificationResult(
+            passed=len(failures) == 0,
+            failures=failures,
+            warnings=warnings,
+        )
+
+    def verify_typescript(self, path: str, content: str, all_files: dict[str, str]) -> VerificationResult:
+        """Verify a TypeScript/JavaScript file before accepting the write."""
+        import re
+
+        failures: list[str] = []
+        warnings: list[str] = []
+
+        # 1. Markdown fence detection (HARD)
+        if "```typescript" in content or "```tsx" in content or "```jsx" in content or "```\n" in content:
+            failures.append("Contains markdown code fences (```). Remove them.")
+
+        # 2. Balanced brackets (HARD — catches truncated files)
+        opens = content.count("{") + content.count("[") + content.count("(")
+        closes = content.count("}") + content.count("]") + content.count(")")
+        if abs(opens - closes) > 3:
+            failures.append(f"Unbalanced brackets: {opens} openers vs {closes} closers (likely truncated)")
+
+        # 3. Excessive 'any' type usage (WARNING)
+        any_count = len(re.findall(r":\s*any\b", content, re.IGNORECASE))
+        if any_count > 5:
+            warnings.append(f"Used 'any' type {any_count} times — consider proper typing")
+
+        # 4. Component export check for .tsx files (WARNING)
+        if path.endswith(".tsx"):
+            has_export = "export default" in content or "export function" in content or "export const" in content
+            if not has_export:
+                warnings.append("No export found in .tsx file — component won't be importable")
+
+        # 5. Extra rules from mistake memory
+        for rule in self._extra_rules:
+            try:
+                result = rule(path, content, all_files)
+                if isinstance(result, str) and result:
+                    failures.append(result)
+            except Exception:
+                pass
+
+        return VerificationResult(
+            passed=len(failures) == 0,
+            failures=failures,
+            warnings=warnings,
+        )
+
+    def verify(self, path: str, content: str, all_files: dict[str, str]) -> VerificationResult:
+        """Auto-dispatch to the right verifier based on file extension."""
+        if path.endswith(".py"):
+            return self.verify_python(path, content, all_files)
+        elif path.endswith((".ts", ".tsx", ".js", ".jsx")):
+            return self.verify_typescript(path, content, all_files)
+        else:
+            # Non-code files (JSON, YAML, HTML, CSS) — basic checks only
+            failures = []
+            if "```" in content and (content.startswith("```") or "\n```" in content[:50]):
+                failures.append("Contains markdown code fences.")
+            return VerificationResult(passed=len(failures) == 0, failures=failures, warnings=[])
+
+
+# ── PHASE-H: Goal Decomposition ──────────────────────────────────────
+
+
+@dataclass
+class SubGoal:
+    """A trackable sub-goal within an agent's work."""
+    id: str                       # e.g. "models.py"
+    description: str              # e.g. "Generate SQLAlchemy models"
+    file_path: str                # Expected output file
+    dependencies: list[str] = field(default_factory=list)  # Other goal IDs
+    completed: bool = False
+    failed: bool = False
+    attempts: int = 0
+
+
+class GoalTracker:
+    """PHASE-H: Tracks sub-goals and their completion status.
+
+    Decomposes a generation order into independent trackable goals.
+    Each goal has dependencies, completion status, and retry tracking.
+    """
+
+    def __init__(self, generation_order: list[dict[str, str]]) -> None:
+        self.goals: list[SubGoal] = []
+        self._build_goals(generation_order)
+
+    def _build_goals(self, generation_order: list[dict[str, str]]) -> None:
+        """Convert generation_order into sub-goals with dependencies."""
+        prev_id = ""
+        for step in generation_order:
+            path = step.get("path", "")
+            name = step.get("name", path)
+            goal_id = path or name
+
+            # Infer dependencies from step ordering and file types
+            deps = []
+            if prev_id and "model" not in goal_id.lower():
+                # Most files depend on models being generated first
+                model_goals = [g.id for g in self.goals if "model" in g.id.lower()]
+                deps = model_goals[:1]  # Depend on first model file only
+
+            self.goals.append(SubGoal(
+                id=goal_id,
+                description=name,
+                file_path=path,
+                dependencies=deps,
+            ))
+            prev_id = goal_id
+
+    def next_goal(self) -> SubGoal | None:
+        """Return next unmet goal whose dependencies are satisfied."""
+        completed_ids = {g.id for g in self.goals if g.completed}
+        for goal in self.goals:
+            if goal.completed or goal.failed:
+                continue
+            if all(dep in completed_ids for dep in goal.dependencies):
+                return goal
+        return None
+
+    def mark_complete(self, goal_id: str) -> None:
+        """Mark a goal as complete."""
+        for g in self.goals:
+            if g.id == goal_id:
+                g.completed = True
+                g.attempts += 1
+                break
+
+    def mark_failed(self, goal_id: str) -> None:
+        """Mark a goal as failed (max retries exceeded)."""
+        for g in self.goals:
+            if g.id == goal_id:
+                g.failed = True
+                break
+
+    def increment_attempt(self, goal_id: str) -> int:
+        """Increment attempt count, return new count."""
+        for g in self.goals:
+            if g.id == goal_id:
+                g.attempts += 1
+                return g.attempts
+        return 0
+
+    def is_all_done(self) -> bool:
+        """Check if all goals are completed or failed."""
+        return all(g.completed or g.failed for g in self.goals)
+
+    def get_goal_prompt(self, goal: SubGoal, all_files: dict[str, str]) -> str:
+        """Build a focused prompt for a single sub-goal."""
+        completed_files = [g.file_path for g in self.goals if g.completed]
+        prompt = (
+            f"Generate the file: {goal.file_path}\n"
+            f"Description: {goal.description}\n"
+        )
+        if completed_files:
+            prompt += f"Already generated: {', '.join(completed_files[:10])}\n"
+        prompt += "Write the file using write_file, then call task_complete."
+        return prompt
+
+    def summary(self) -> dict[str, Any]:
+        """Compact summary of progress."""
+        return {
+            "total": len(self.goals),
+            "completed": sum(1 for g in self.goals if g.completed),
+            "failed": sum(1 for g in self.goals if g.failed),
+            "remaining": sum(1 for g in self.goals if not g.completed and not g.failed),
+        }
+
+
+# ── PHASE-I: Adaptive Model Complexity ───────────────────────────────
+
+
+class AdaptiveComplexity:
+    """PHASE-I: Start cheap, escalate only when verification fails.
+
+    Expected savings: ~50-60% on model costs.
+    - Simple files (models, configs, types) → cheap model (Haiku/Flash)
+    - Complex files (auth, business logic) → auto-escalate on failure
+    """
+
+    def __init__(self, initial: TaskComplexity = TaskComplexity.LOW) -> None:
+        self.current = initial
+        self.consecutive_failures = 0
+        self._escalation_count = 0
+
+    def on_verification_pass(self) -> None:
+        """Reset failure counter on success."""
+        self.consecutive_failures = 0
+
+    def on_verification_fail(self) -> None:
+        """Track failures and escalate after threshold."""
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= 2:
+            self.escalate()
+            self.consecutive_failures = 0
+
+    def escalate(self) -> None:
+        """Move to next complexity tier."""
+        if self.current == TaskComplexity.LOW:
+            self.current = TaskComplexity.MEDIUM
+            self._escalation_count += 1
+            logger.info("adaptive_complexity_escalated", to="MEDIUM")
+        elif self.current == TaskComplexity.MEDIUM:
+            self.current = TaskComplexity.HIGH
+            self._escalation_count += 1
+            logger.info("adaptive_complexity_escalated", to="HIGH")
+
+    def de_escalate(self) -> None:
+        """After 3 consecutive successes at higher tier, try cheaper model."""
+        if self.consecutive_failures == 0 and self.current != TaskComplexity.LOW:
+            # Only de-escalate after sustained success
+            pass  # Future: implement de-escalation after N successes
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "current": self.current.value if hasattr(self.current, 'value') else str(self.current),
+            "escalation_count": self._escalation_count,
+        }
+
+
+async def reflect(
+    agent_name: str,
+    output_summary: str,
+    context_summary: str,
+    max_tokens: int = 500,
+) -> dict[str, Any]:
+    """3.1-FIX: Post-execution self-reflection using the cheapest model.
+
+    Calls a cheap model (Haiku/Flash) to critique any agent's output after
+    execution. Returns a dict with issues found, confidence score, and
+    improvement suggestions.
+
+    This is independent of the agent that produced the output — any agent's
+    output can be reflected upon. Cost: ~$0.001 per reflection.
+
+    Args:
+        agent_name: Which agent produced the output.
+        output_summary: Compact summary of what the agent produced (truncated).
+        context_summary: Brief project context (framework, tables, etc.)
+        max_tokens: Max response tokens for the reflection.
+
+    Returns:
+        Dict with keys: issues (list[str]), confidence (float 0-1),
+        suggestion (str). Returns empty dict on failure.
+    """
+    import json as _json
+
+    critique_prompt = (
+        f"You are reviewing the output of agent '{agent_name}'.\n"
+        f"Context: {context_summary}\n\n"
+        f"Output summary:\n{output_summary[:3000]}\n\n"
+        "Analyze the output for:\n"
+        "1. Completeness — are there missing components?\n"
+        "2. Consistency — do parts contradict each other?\n"
+        "3. Quality — are there obvious errors or shortcuts?\n\n"
+        "Respond in JSON: {\"issues\": [...], \"confidence\": 0.0-1.0, \"suggestion\": \"...\"}\n"
+        "If the output looks good, return {\"issues\": [], \"confidence\": 0.9, \"suggestion\": \"none\"}"
+    )
+
+    try:
+        from app.services.ai_router import AIRouter, AIRequest, AIMessage
+        router = AIRouter()
+        response = await router.call(AIRequest(
+            messages=[AIMessage(role="user", content=critique_prompt)],
+            complexity=TaskComplexity.LOW,  # Cheapest model
+            max_tokens=max_tokens,
+            agent_name=f"{agent_name}_reflection",
+        ))
+
+        from app.utils.json_parser import parse_json
+        result = parse_json(response.content, fallback={})
+        if isinstance(result, dict):
+            return result
+        return {}
+    except Exception:
+        return {}

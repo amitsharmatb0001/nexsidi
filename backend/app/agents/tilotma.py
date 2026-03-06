@@ -214,7 +214,7 @@ class Tilotma:
             )
 
         # --- Step 3: Compliance Auto-Detection ---
-        compliance_flags = self._detect_compliance(user_input)
+        compliance_flags = await self._detect_compliance(user_input)
 
         # --- Step 4: Parse AI response and build understanding ---
         ai_analysis = response.content
@@ -832,13 +832,33 @@ class Tilotma:
                 {"name": "Delivery", "type": "final"},
             ],
             "confidence": parsed.get("confidence", 0.7),
-            "compliance": [f.get("regulation", "") for f in self._detect_compliance(
+            "compliance": [f.get("regulation", "") for f in self._detect_compliance_sync(
                 pu.current_understanding if pu else ""
             )],
         }
 
-    def _detect_compliance(self, text: str) -> list[dict[str, str]]:
-        """Auto-detect compliance requirements from user text."""
+    def _detect_compliance_sync(self, text: str) -> list[dict[str, str]]:
+        """Keyword-only compliance detection (sync, for get_status)."""
+        text_lower = text.lower()
+        flags: list[dict[str, str]] = []
+        for regulation, keywords in _COMPLIANCE_PATTERNS.items():
+            matched = [kw for kw in keywords if kw in text_lower]
+            if matched:
+                flags.append({
+                    "regulation": regulation,
+                    "matched_keywords": ", ".join(matched),
+                    "confidence": "high" if len(matched) >= 2 else "medium",
+                })
+        return flags
+
+    async def _detect_compliance(self, text: str) -> list[dict[str, str]]:
+        """Auto-detect compliance requirements from user text.
+
+        3.2-FIX: Two-phase approach to reduce false positives:
+        1. Fast keyword pre-filter (zero cost) — unchanged
+        2. AI verification for keyword matches — cheap model checks context
+           and negation (e.g. "I do NOT want payments" → no payments flag)
+        """
         text_lower = text.lower()
         flags: list[dict[str, str]] = []
 
@@ -851,34 +871,62 @@ class Tilotma:
                     "confidence": "high" if len(matched) >= 2 else "medium",
                 })
 
+        # 3.2-FIX: AI verification of keyword matches to filter false positives.
+        # Only runs when keywords matched (zero cost when no matches).
+        if flags:
+            flags = await self._verify_compliance_flags(text, flags)
+
+        return flags
+
+    async def _verify_compliance_flags(
+        self,
+        text: str,
+        flags: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """3.2-FIX: Use cheap model to verify compliance flags are real.
+
+        Filters out false positives like "I do NOT want payments" matching
+        the payments regulation. Cost: ~$0.001 per verification.
+        """
+        regulations = ", ".join(f.get("regulation", "") for f in flags)
+        verify_prompt = (
+            f"User said: \"{text[:500]}\"\n\n"
+            f"Keyword matching detected these compliance areas: {regulations}\n\n"
+            "For each area, does the user ACTUALLY want this feature? "
+            "Check for negation ('I do NOT want', 'no payments', 'without', etc.).\n"
+            "Return ONLY a JSON list of regulations the user genuinely wants.\n"
+            "Example: [\"dpdp\", \"ecommerce\"]  (exclude areas that were negated)"
+        )
+
+        try:
+            from app.services.ai_router import AIRouter, AIRequest, AIMessage
+            from app.agents.base import TaskComplexity
+            router = AIRouter()
+
+            response = await router.call(AIRequest(
+                messages=[AIMessage(role="user", content=verify_prompt)],
+                complexity=TaskComplexity.LOW,
+                max_tokens=200,
+                agent_name="compliance_verify",
+            ))
+
+            from app.utils.json_parser import parse_json
+            verified = parse_json(response.content, fallback=None)
+            if isinstance(verified, list):
+                return [f for f in flags if f.get("regulation") in verified]
+        except Exception:
+            pass  # Fall back to keyword-only results
         return flags
 
     @staticmethod
     def _safe_json_parse(text: str) -> dict[str, Any] | None:
-        """Parse JSON from AI response, handling markdown code blocks."""
-        if not text:
-            return None
+        """Parse JSON from AI response, handling markdown code blocks.
 
-        # Strip markdown code fences
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n")
-            # Remove first line (```json) and last line (```)
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            cleaned = "\n".join(lines)
-
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            # Try to find JSON object in the text
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    return json.loads(cleaned[start:end + 1])
-                except json.JSONDecodeError:
-                    pass
-        return None
+        3.4-FIX: Delegates to shared json_parser utility which uses multi-strategy
+        approach (direct parse, fence stripping, balanced extraction, repair).
+        """
+        from app.utils.json_parser import parse_json
+        return parse_json(text, fallback=None)
 
     def get_status(self, memory_data: dict[str, Any] | None = None) -> dict[str, Any]:
         """Get current status for API."""

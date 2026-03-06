@@ -65,7 +65,8 @@ async def get_valkey_client() -> Any:
         # for managed Redis services like ElastiCache, Memorystore).
         pool_kwargs: dict[str, Any] = {
             "decode_responses": False,  # All consumers handle encoding themselves
-            "max_connections": 20,  # Single pool shared across all services
+            "max_connections": 50,  # 4.1-FIX: Raised from 20 — BLPOP holds connections open
+            "health_check_interval": 30,  # 4.1-FIX: Detect stale connections
             # R33-FIX: Add socket_timeout to prevent indefinite blocking.
             # Without this, a hung Valkey server causes all 20 pool connections
             # to block forever. Every subsequent operation (token revocation,

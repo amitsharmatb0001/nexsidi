@@ -219,6 +219,44 @@ AANYA_TOOLS = [
             "required": ["path"],
         },
     ),
+    # 1.4-FIX: Compile-check generated TS/JS files in sandboxed subprocess.
+    ToolDefinition(
+        name="compile_check",
+        description=(
+            "Run TypeScript compiler (tsc --noEmit) on generated .ts/.tsx files "
+            "to catch type errors before handoff. Returns compiler output."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path of the TypeScript file to compile-check",
+                },
+            },
+            "required": ["path"],
+        },
+    ),
+    # 1.4-FIX: Self-review tool — cheap model critique before task_complete.
+    ToolDefinition(
+        name="self_review",
+        description=(
+            "Request an independent code review of your generated files. "
+            "A separate AI reviewer checks for: missing imports, wrong prop types, "
+            "inconsistent routing, missing error boundaries. "
+            "Call this BEFORE task_complete."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "What to focus the review on (e.g. 'routing', 'components', 'all')",
+                },
+            },
+            "required": ["focus"],
+        },
+    ),
     # I1-FIX: Dynamic agent re-dispatch
     INTERRUPT_TOOL,
 ]
@@ -243,6 +281,51 @@ class AanyaToolHandler:
         self._backend_files = backend_files or {}  # AUDIT-FIX: lazy backend ref
         self._done = False
         self._summary = ""
+        # PHASE-E: Extra verification rules from mistake memory.
+        self._verification_rules: list[Any] = []
+        try:
+            from app.services.mistake_memory import mistake_memory
+            self._verification_rules = mistake_memory.build_validation_rules(
+                "aanya", "frontend_generation", ""
+            )
+        except Exception:
+            pass
+
+    def observe(self, tool_name: str, result: str) -> "Observation":
+        """PHASE-G: System evaluates tool result autonomously.
+
+        PHASE-I: Feeds pass/fail into AdaptiveComplexity for cross-goal
+        model escalation (cheap → expensive only when needed).
+        """
+        from app.agents.base import Observation
+
+        adaptive = getattr(self, "_adaptive", None)
+
+        if tool_name == "write_file":
+            if "REJECTED" in result:
+                self._consecutive_rejections = getattr(self, "_consecutive_rejections", 0) + 1
+                if adaptive:
+                    adaptive.on_verification_fail()
+                if self._consecutive_rejections >= 3:
+                    self._consecutive_rejections = 0
+                    return Observation(
+                        needs_escalation=True,
+                        override_result=result + "\n\n⚡ MODEL ESCALATED: Switching to more capable model.",
+                    )
+            else:
+                self._consecutive_rejections = 0
+                if adaptive:
+                    adaptive.on_verification_pass()
+
+        if result.startswith("[ERROR]") or result.startswith("Error"):
+            self._consecutive_errors = getattr(self, "_consecutive_errors", 0) + 1
+            if self._consecutive_errors >= 2:
+                self._consecutive_errors = 0
+                return Observation(needs_escalation=True)
+        else:
+            self._consecutive_errors = 0
+
+        return Observation()
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "write_file":
@@ -264,6 +347,11 @@ class AanyaToolHandler:
             return self._check_imports(**tool_input)
         elif tool_name == "check_types":
             return self._check_types(**tool_input)
+        # 1.4-FIX: Compile-check and self-review tools
+        elif tool_name == "compile_check":
+            return await self._compile_check(**tool_input)
+        elif tool_name == "self_review":
+            return await self._self_review(**tool_input)
         # I1-FIX: Dynamic agent re-dispatch
         elif tool_name == "request_agent_rerun":
             return self._request_agent_rerun(**tool_input)
@@ -276,8 +364,17 @@ class AanyaToolHandler:
     async def _write_file(self, path: str, content: str) -> str:
         if len(content) > self._MAX_FILE_SIZE:
             return f"Error: file too large ({len(content)} bytes, max {self._MAX_FILE_SIZE})"
+        # PHASE-E: Verification gate — reject bad code at write time.
+        from app.agents.base import VerificationGate
+        gate = VerificationGate(extra_rules=self._verification_rules)
+        result = gate.verify(path, content, self._files)
+        if not result.passed:
+            return result.rejection_message()
         self._files[path] = content
-        return f"Written {path} ({len(content)} chars)"
+        msg = f"Written {path} ({len(content)} chars)"
+        if result.warnings:
+            msg += "\n⚠ Warnings:\n" + "\n".join(f"  • {w}" for w in result.warnings[:3])
+        return msg
 
     async def _read_file(self, path: str) -> str:
         if path in self._files:
@@ -313,6 +410,106 @@ class AanyaToolHandler:
         if abs(opens - closes) > 5:
             return f"Possible syntax issue: unbalanced brackets (opens={opens}, closes={closes})"
         return "OK"
+
+    async def _compile_check(self, path: str) -> str:
+        """1.4-FIX: Run tsc --noEmit on a generated TypeScript file.
+
+        Writes all generated files to a temp directory with a minimal tsconfig,
+        then runs tsc. Returns compiler output capped at 5KB.
+        """
+        import subprocess
+        import tempfile
+
+        code = self._files.get(path)
+        if not code:
+            return f"File not found: {path}. Available: {list(self._files.keys())[:20]}"
+        if not path.endswith((".ts", ".tsx")):
+            return "compile_check only supports .ts/.tsx files."
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                import os
+                import json as _json
+                # Write all generated files
+                for fpath, content in self._files.items():
+                    full = os.path.join(tmpdir, fpath)
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    with open(full, "w", encoding="utf-8") as f:
+                        f.write(content)
+
+                # Write minimal tsconfig.json
+                tsconfig = {
+                    "compilerOptions": {
+                        "target": "ES2020",
+                        "module": "ESNext",
+                        "moduleResolution": "node",
+                        "jsx": "react-jsx",
+                        "noEmit": True,
+                        "strict": False,  # Lenient — catch only real errors
+                        "skipLibCheck": True,
+                        "esModuleInterop": True,
+                    },
+                    "include": ["./**/*.ts", "./**/*.tsx"],
+                }
+                with open(os.path.join(tmpdir, "tsconfig.json"), "w") as f:
+                    _json.dump(tsconfig, f)
+
+                result = subprocess.run(
+                    ["npx", "tsc", "--noEmit", "--pretty"],
+                    capture_output=True, text=True, timeout=30, cwd=tmpdir,
+                )
+                output = (result.stdout + result.stderr)[:5120]
+                status = "PASS" if result.returncode == 0 else f"FAIL (exit {result.returncode})"
+                return f"[{status}]\n{output}" if output else f"[{status}]"
+        except FileNotFoundError:
+            return "[SKIP] tsc/npx not available in this environment."
+        except subprocess.TimeoutExpired:
+            return "[TIMEOUT] TypeScript compilation exceeded 30s limit."
+        except Exception as exc:
+            return f"[ERROR] {type(exc).__name__}: {str(exc)[:500]}"
+
+    async def _self_review(self, focus: str = "all") -> str:
+        """1.4-FIX: Request a cheap-model review of generated frontend code."""
+        if not self._files:
+            return "No files to review yet. Write files first."
+
+        code_summary_parts = []
+        budget = 15_000
+        for path, content in self._files.items():
+            chunk = f"\n--- {path} ---\n{content[:3000]}"
+            if len(chunk) > budget:
+                break
+            code_summary_parts.append(chunk)
+            budget -= len(chunk)
+        code_summary = "".join(code_summary_parts)
+
+        review_prompt = (
+            f"Review the following generated frontend code. Focus: {focus}.\n"
+            "Check for:\n"
+            "1. Missing imports (React, hooks, components)\n"
+            "2. Inconsistent prop types between parent/child components\n"
+            "3. Broken routing (wrong paths, missing route definitions)\n"
+            "4. Missing error boundaries or loading states\n"
+            "5. Hardcoded API URLs that should use environment variables\n"
+            "6. Accessibility issues (missing alt text, aria labels)\n\n"
+            "Return a numbered list of issues found, or 'NO ISSUES FOUND' if clean.\n\n"
+            f"Code:\n{code_summary}"
+        )
+
+        try:
+            from app.services.ai_router import AIRouter, AIRequest, AIMessage
+            from app.agents.base import TaskComplexity
+            router = AIRouter()
+            response = await router.call(AIRequest(
+                messages=[AIMessage(role="user", content=review_prompt)],
+                complexity=TaskComplexity.LOW,
+                max_tokens=1000,
+                run_id=self._pipeline_run_id,
+                agent_name="aanya_self_review",
+            ))
+            return f"## Self-Review Results:\n{response.content}"
+        except Exception as exc:
+            return f"Self-review unavailable: {type(exc).__name__}: {str(exc)[:200]}"
 
     def _list_files(self) -> str:
         if not self._files:
@@ -611,6 +808,23 @@ class Aanya:
             backend_files=backend_file_contents,  # AUDIT-FIX: lazy-load ref
         )
 
+        # PHASE-H: Initialize goal tracker for progress tracking
+        from app.agents.base import GoalTracker, AdaptiveComplexity
+        goal_tracker = GoalTracker(generation_order)
+
+        # PHASE-I: Start with cheapest model, escalate on failures.
+        # Wire into tool handler so observe() can update on pass/fail.
+        adaptive = AdaptiveComplexity()
+        tool_handler._adaptive = adaptive
+
+        logger.info(
+            "agentic_phase_start",
+            framework=framework_display,
+            files_to_generate=len(generation_order),
+            template_files_available=len(generated_files),
+            goals=goal_tracker.summary(),
+        )
+
         system_prompt = self._build_agentic_system_prompt(
             contract=contract,
             generation_order=generation_order,
@@ -634,6 +848,7 @@ class Aanya:
                 }],
                 system_prompt=system_prompt,
                 task_type="general",
+                complexity=adaptive.current,  # PHASE-I: Start cheap, escalate on failure
                 tool_handler=tool_handler,
                 max_tool_rounds=30,
             )
@@ -651,7 +866,7 @@ class Aanya:
                 from app.services.pipeline import get_run_cost_tracker
                 tracker = get_run_cost_tracker(pipeline_run_id)
                 if tracker is not None:
-                    tracker.record(response, agent_name=self.name, model_key="high")
+                    await tracker.record(response, agent_name=self.name, model_key="high")
             except Exception:
                 pass  # Cost tracking is non-fatal
 
@@ -663,20 +878,61 @@ class Aanya:
             logger.error("agentic_generation_failed", error=safe_err)
             # Non-fatal: continue with whatever was written before the exception
 
+        # PHASE-H: Track goal completion based on which files were generated
+        for goal in goal_tracker.goals:
+            if goal.file_path in generated_files and generated_files.get(goal.file_path):
+                goal_tracker.mark_complete(goal.id)
+        logger.info("goal_tracking_complete", **goal_tracker.summary())
+
         # generated_files has been mutated in place by AanyaToolHandler._write_file
         # (handler holds a reference to the same dict)
         frontend_files = [p for p in generated_files if "frontend/" in p or "mobile/" in p or "desktop/" in p]
 
-        # ── Layer 1: Builder Self-Check ──
-        # Validate own output before downstream handoff — catch obvious issues
-        # before reviewers waste AI calls.
+        # ── Layer 1: Builder Self-Check (1.4-FIX: BLOCKING) ──
+        # Validate own output before downstream handoff. If errors found, build a
+        # fix prompt and re-run the tool loop. Max 2 self-fix cycles.
         self_check = self._run_self_check(generated_files, contract, framework_display)
+        _self_fix_cycles = 0
+
+        while self_check.get("errors", 0) > 0 and _self_fix_cycles < 2:
+            _self_fix_cycles += 1
+            error_details = self_check.get("error_details", [])
+            error_summary = "\n".join(
+                f"- {e['file']}: {e['issue']}" for e in error_details[:10]
+            )
+            fix_prompt = (
+                f"Your generated code has {self_check['errors']} error(s) that MUST be fixed:\n\n"
+                f"{error_summary}\n\n"
+                "Fix each error by calling write_file with corrected content. "
+                "Then call task_complete when all errors are resolved."
+            )
+            logger.warning(
+                "self_check_fix_cycle",
+                cycle=_self_fix_cycles,
+                errors=self_check.get("errors", 0),
+            )
+            tool_handler._done = False
+            try:
+                await call_ai_with_tools(
+                    self,
+                    messages=[{"role": "user", "content": fix_prompt}],
+                    system_prompt=system_prompt,
+                    task_type="general",
+                    tool_handler=tool_handler,
+                    max_tool_rounds=5,
+                )
+            except Exception as exc:
+                from app.services.ai_router import _sanitize_error
+                logger.error("self_fix_cycle_failed", cycle=_self_fix_cycles, error=_sanitize_error(exc))
+                break
+            self_check = self._run_self_check(generated_files, contract, framework_display)
 
         logger.info(
             "self_check_complete",
             errors=self_check.get("errors", 0),
             warnings=self_check.get("warnings", 0),
             passed=self_check.get("passed", False),
+            fix_cycles=_self_fix_cycles,
         )
 
         output = {
@@ -693,6 +949,9 @@ class Aanya:
             "platform": platform,
             "agentic_summary": tool_handler._summary,
             "self_check": self_check,
+            "self_fix_cycles": _self_fix_cycles,
+            "goal_tracker": goal_tracker.summary(),  # PHASE-H
+            "adaptive_complexity": adaptive.summary(),  # PHASE-I
         }
 
         await store_output(self, pipeline_run_id, output)
@@ -941,6 +1200,20 @@ class Aanya:
             "Write ONLY valid TypeScript/JSX code — no markdown fences, no explanations.",
             "Match entity/field names EXACTLY from the contract.",
         ])
+
+        # ── 12. Mistake Memory (1.5-FIX) ──
+        # Close the Fixer → Builder learning loop: Fixer records mistakes
+        # after fixing code. Aanya reads them here to avoid repeating errors.
+        try:
+            from app.services.mistake_memory import mistake_memory
+            lessons = mistake_memory.build_lessons_prompt(
+                self.name, "frontend_generation",
+                f"framework={framework_display}, files={len(generation_order)}",
+            )
+            if lessons:
+                prompt_parts.append(lessons)
+        except Exception:
+            pass  # Non-fatal — proceed without lessons
 
         return "\n".join(prompt_parts)
 

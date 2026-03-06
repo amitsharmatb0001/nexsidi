@@ -181,6 +181,11 @@ class Settings(BaseSettings):
     # "kubernetes" uses ephemeral K8s Jobs for sandbox isolation.
     executor_type: str = "docker"
 
+    # 2.4-FIX: Pipeline execution mode.
+    # "sequential" — fixed STAGE_ORDER (existing behavior, default).
+    # "agentic" — AI PlannerAgent decides what stage to run next dynamically.
+    pipeline_mode: str = "sequential"
+
     # C1-FIX: InitContainer image for K8s executor GCS code download.
     gcs_init_image: str = "google/cloud-sdk:slim"
 
@@ -287,9 +292,27 @@ def _ensure_secrets_loaded() -> None:
 
         try:
             from app.services.secret_manager import load_secrets
-            count = load_secrets()
-            if count > 0:
-                logger.info("Loaded %d secrets from GCP Secret Manager", count)
+
+            # 4.7-FIX: If there's a running event loop, load_secrets() would
+            # block it (synchronous GCP API calls). Offload to a thread.
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(load_secrets)
+                    count = future.result(timeout=30)
+                logger.info(
+                    "Loaded %d secrets via thread pool (event loop was running)", count,
+                )
+            else:
+                count = load_secrets()
+                if count > 0:
+                    logger.info("Loaded %d secrets from GCP Secret Manager", count)
         except Exception as exc:
             # Non-fatal: fall back to env vars / .env
             logger.debug("Secret Manager unavailable: %s", exc)

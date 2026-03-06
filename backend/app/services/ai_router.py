@@ -94,6 +94,16 @@ def _sanitize_error(exc: Exception) -> str:
         "[REDACTED_SA]",
         msg,
     )
+    # 4.8-FIX: Additional patterns for GCS bucket paths, Firebase tokens,
+    # and connection strings with embedded passwords.
+    msg = re.sub(r"gs://[A-Za-z0-9_./-]+", "gs://[REDACTED]", msg)
+    msg = re.sub(
+        r"(?:postgresql|mysql|redis|mongodb|amqp)(?:\+\w+)?://[^\s\"']+",
+        "[REDACTED_CONNECTION_STRING]",
+        msg,
+    )
+    # Firebase server keys (starts with AAAA) and web API keys
+    msg = re.sub(r"AAAA[A-Za-z0-9_:/-]{100,}", "[REDACTED_FIREBASE]", msg)
     return msg
 
 
@@ -314,6 +324,7 @@ class CircuitState:
         self,
         failure_threshold: int = 3,
         reset_timeout_seconds: float = 60.0,
+        provider_key: str = "",
     ) -> None:
         self.failures: int = 0
         self.last_failure_at: float = 0.0
@@ -321,6 +332,9 @@ class CircuitState:
         self._half_open: bool = False
         self.failure_threshold = failure_threshold
         self.reset_timeout_seconds = reset_timeout_seconds
+        # 4.5-FIX: provider_key enables distributed state via Valkey so all
+        # workers share the same circuit breaker (e.g. "anthropic", "google").
+        self._provider_key = provider_key
         # R27-FIX-23: Lazy-init Lock to avoid binding to wrong/no event loop
         # when CircuitState is created at import time or from a non-async context
         # (same pattern as DEFERRED-FIX-4 for Semaphore).
@@ -336,10 +350,47 @@ class CircuitState:
             self._lock = asyncio.Lock()
         return self._lock
 
+    async def _sync_to_valkey(self) -> None:
+        """4.5-FIX: Push circuit state to Valkey for cross-worker sharing."""
+        if not self._provider_key:
+            return
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            client = await get_valkey_client()
+            key = f"circuit:{self._provider_key}"
+            await client.hset(key, mapping={
+                "failures": str(self.failures),
+                "is_open": str(int(self.is_open)),
+                "half_open": str(int(self._half_open)),
+                "last_failure_at": str(self.last_failure_at),
+            })
+            await client.expire(key, 300)  # 5min TTL — stale state auto-clears
+        except Exception:
+            pass  # Fall back to in-memory state
+
+    async def _sync_from_valkey(self) -> None:
+        """4.5-FIX: Read circuit state from Valkey (other workers may have updated)."""
+        if not self._provider_key:
+            return
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            client = await get_valkey_client()
+            data = await client.hgetall(f"circuit:{self._provider_key}")
+            if data:
+                self.failures = int(data.get(b"failures", 0))
+                self.is_open = bool(int(data.get(b"is_open", 0)))
+                self._half_open = bool(int(data.get(b"half_open", 0)))
+                self.last_failure_at = float(data.get(b"last_failure_at", 0.0))
+        except Exception:
+            pass  # Fall back to in-memory state
+
     async def record_failure(self) -> None:
         async with self._get_lock():
+            # 4.5-FIX: Sync from Valkey first so we see other workers' failures.
+            await self._sync_from_valkey()
             self.failures += 1
-            self.last_failure_at = time.monotonic()
+            # 4.5-FIX: Use time.time() (not monotonic) for cross-process consistency.
+            self.last_failure_at = time.time()
             if self._half_open:
                 # Half-open probe failed → re-open circuit.
                 # REVIEW-FIX: last_failure_at is ALREADY updated above, which
@@ -352,6 +403,7 @@ class CircuitState:
             elif self.failures >= self.failure_threshold:
                 self.is_open = True
                 logger.warning("circuit_breaker_open", failures=self.failures)
+            await self._sync_to_valkey()
 
     async def record_success(self) -> None:
         async with self._get_lock():
@@ -361,18 +413,22 @@ class CircuitState:
             self.failures = 0
             self.is_open = False
             self._half_open = False
+            await self._sync_to_valkey()
 
     async def is_available(self) -> bool:
         async with self._get_lock():
+            # 4.5-FIX: Read latest state from Valkey (other workers may have tripped).
+            await self._sync_from_valkey()
             if not self.is_open:
                 return True
             # Check if reset timeout has passed → transition to half-open
-            elapsed = time.monotonic() - self.last_failure_at
+            elapsed = time.time() - self.last_failure_at
             if elapsed >= self.reset_timeout_seconds:
                 if not self._half_open:
                     # Allow exactly ONE probe request
                     self._half_open = True
                     logger.info("circuit_breaker_half_open")
+                    await self._sync_to_valkey()
                     return True
                 # Already in half-open with a probe in flight → block others
                 return False
@@ -548,8 +604,8 @@ class AIRouter:
         self._vertex_location = "us-central1"
 
         self._circuits: dict[Provider, CircuitState] = {
-            Provider.ANTHROPIC: CircuitState(),
-            Provider.GOOGLE: CircuitState(),
+            Provider.ANTHROPIC: CircuitState(provider_key="anthropic"),
+            Provider.GOOGLE: CircuitState(provider_key="google"),
         }
         # Shared httpx client -- connection pooling across providers
         self._http: httpx.AsyncClient | None = None
@@ -1767,13 +1823,6 @@ class GeminiCacheManager:
                             hash=content_hash,
                             cache_name=cache_name,
                         )
-                        # R20-FIX: Clean up _pending on SUCCESS path too.
-                        # R19 only cleaned on Exception. On success, the cache
-                        # entry in _cache handles deduplication. The _pending
-                        # Lock is no longer needed. After TTL expires and _cache
-                        # evicts the entry, _pending still held the Lock forever.
-                        async with self._global_lock:
-                            self._pending.pop(content_hash, None)
                         return cache_name
                 logger.warning(
                     "gemini_cache_create_failed",
@@ -1781,16 +1830,14 @@ class GeminiCacheManager:
                     hash=content_hash,
                 )
             except Exception as exc:
-                # R25-FIX-2: Sanitize error to prevent API key leakage.
-                # str(exc) for httpx errors can contain the full request
-                # context including x-goog-api-key header values.
                 logger.warning("gemini_cache_create_error", error=_sanitize_error(exc))
-
-            # R20-FIX: Clean up _pending on ALL exit paths (success, non-200,
-            # exception). R19 only cleaned on exception, leaking Lock objects
-            # on the success and non-200 paths.
-            async with self._global_lock:
-                self._pending.pop(content_hash, None)
+            finally:
+                # 4.4-FIX: Guarantee _pending cleanup on ALL exit paths via
+                # try/finally. Previously, cleanup was duplicated across
+                # success/failure/exception branches; any new early return
+                # could leak a _pending Lock object forever.
+                async with self._global_lock:
+                    self._pending.pop(content_hash, None)
 
             return None
 
@@ -1917,14 +1964,23 @@ class ProjectCostTracker:
         # R25-FIX-6: Incremental call_count counter. Previously used
         # len(self._entries) which caps at deque maxlen (10,000).
         self._total_call_count: int = 0
+        # 4.10-FIX: asyncio.Lock prevents concurrent record() calls from
+        # racing on cost accumulation and exceeding the hard cap. Lazy-init
+        # to avoid binding to wrong event loop at import time.
+        self._record_lock: asyncio.Lock | None = None
 
-    def record(
+    async def record(
         self,
         response: AIResponse,
         agent_name: str = "unknown",
         model_key: str = "",
     ) -> CostEntry:
         """Record an AI response's cost.
+
+        4.10-FIX: Now async with asyncio.Lock to prevent concurrent calls from
+        racing on cost accumulation. Without the lock, two concurrent AI calls
+        completing simultaneously could both pass the cap check, allowing total
+        cost to exceed _HARD_CAP_USD by up to one call's cost.
 
         Args:
             response: AIResponse from ai_router.call().
@@ -1935,66 +1991,71 @@ class ProjectCostTracker:
         Returns:
             CostEntry with calculated costs.
         """
-        # Resolve model key from model_id if not provided
-        if not model_key:
-            model_key = self._resolve_model_key(response.model_used)
+        # 4.10-FIX: Lazy-init lock (same pattern as CircuitState._get_lock)
+        if self._record_lock is None:
+            self._record_lock = asyncio.Lock()
 
-        # M5-FIX: Warn on unknown model instead of silently defaulting to sonnet pricing
-        costs = _COST_PER_1K_TOKENS.get(model_key)
-        if costs is None:
-            logger.warning("unknown_model_cost_fallback", model_key=model_key)
-            costs = {"input": 0.003, "output": 0.015}  # sonnet pricing as safe default
-        input_cost = (response.input_tokens / 1000) * costs["input"]
-        output_cost = (response.output_tokens / 1000) * costs["output"]
-        total_cost = input_cost + output_cost
+        async with self._record_lock:
+            # Resolve model key from model_id if not provided
+            if not model_key:
+                model_key = self._resolve_model_key(response.model_used)
 
-        entry = CostEntry(
-            model_key=model_key,
-            agent_name=agent_name,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            input_cost=input_cost,
-            output_cost=output_cost,
-            total_cost=total_cost,
-            timestamp=time.time(),
-        )
+            # M5-FIX: Warn on unknown model instead of silently defaulting to sonnet pricing
+            costs = _COST_PER_1K_TOKENS.get(model_key)
+            if costs is None:
+                logger.warning("unknown_model_cost_fallback", model_key=model_key)
+                costs = {"input": 0.003, "output": 0.015}  # sonnet pricing as safe default
+            input_cost = (response.input_tokens / 1000) * costs["input"]
+            output_cost = (response.output_tokens / 1000) * costs["output"]
+            total_cost = input_cost + output_cost
 
-        self._entries.append(entry)
-        self._total_input_tokens += response.input_tokens
-        self._total_output_tokens += response.output_tokens
-        self._total_cost += total_cost
-        self._total_call_count += 1
+            entry = CostEntry(
+                model_key=model_key,
+                agent_name=agent_name,
+                input_tokens=response.input_tokens,
+                output_tokens=response.output_tokens,
+                input_cost=input_cost,
+                output_cost=output_cost,
+                total_cost=total_cost,
+                timestamp=time.time(),
+            )
 
-        # COST-CAP-FIX: Enforce hard cost cap per pipeline run.
-        if self._total_cost > self._HARD_CAP_USD:  # COST-CAP-FIX
-            raise PipelineCostLimitError(
-                f"Pipeline cost {self._total_cost:.2f} exceeded cap {self._HARD_CAP_USD:.2f}"
-            )  # COST-CAP-FIX
+            self._entries.append(entry)
+            self._total_input_tokens += response.input_tokens
+            self._total_output_tokens += response.output_tokens
+            self._total_cost += total_cost
+            self._total_call_count += 1
 
-        # DEFERRED-FIX-17: Update incremental breakdown dicts
-        if model_key not in self._per_model:
-            self._per_model[model_key] = {
-                "input_tokens": 0, "output_tokens": 0,
-                "total_cost": 0.0, "call_count": 0,
-            }
-        m = self._per_model[model_key]
-        m["input_tokens"] += entry.input_tokens
-        m["output_tokens"] += entry.output_tokens
-        m["total_cost"] += entry.total_cost
-        m["call_count"] += 1
+            # COST-CAP-FIX: Enforce hard cost cap per pipeline run.
+            if self._total_cost > self._HARD_CAP_USD:  # COST-CAP-FIX
+                raise PipelineCostLimitError(
+                    f"Pipeline cost {self._total_cost:.2f} exceeded cap {self._HARD_CAP_USD:.2f}"
+                )  # COST-CAP-FIX
 
-        if agent_name not in self._per_agent:
-            self._per_agent[agent_name] = {
-                "input_tokens": 0, "output_tokens": 0,
-                "total_cost": 0.0, "call_count": 0,
-            }
-        a = self._per_agent[agent_name]
-        a["input_tokens"] += entry.input_tokens
-        a["output_tokens"] += entry.output_tokens
-        a["total_cost"] += entry.total_cost
-        a["call_count"] += 1
+            # DEFERRED-FIX-17: Update incremental breakdown dicts
+            if model_key not in self._per_model:
+                self._per_model[model_key] = {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "total_cost": 0.0, "call_count": 0,
+                }
+            m = self._per_model[model_key]
+            m["input_tokens"] += entry.input_tokens
+            m["output_tokens"] += entry.output_tokens
+            m["total_cost"] += entry.total_cost
+            m["call_count"] += 1
 
-        return entry
+            if agent_name not in self._per_agent:
+                self._per_agent[agent_name] = {
+                    "input_tokens": 0, "output_tokens": 0,
+                    "total_cost": 0.0, "call_count": 0,
+                }
+            a = self._per_agent[agent_name]
+            a["input_tokens"] += entry.input_tokens
+            a["output_tokens"] += entry.output_tokens
+            a["total_cost"] += entry.total_cost
+            a["call_count"] += 1
+
+            return entry
 
     @staticmethod
     def _resolve_model_key(model_id: str) -> str:

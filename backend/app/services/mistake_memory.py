@@ -30,14 +30,27 @@ _FALLBACK_STORE: dict[str, list[dict[str, Any]]] = {}  # agent -> [mistakes]
 
 
 def _get_chroma():
-    """Lazy-initialize ChromaDB client."""
+    """Lazy-initialize ChromaDB client.
+
+    3.3-FIX: Use PersistentClient in production/staging so mistake memory
+    survives restarts. Ephemeral mode is kept for dev/tests to avoid
+    polluting the filesystem.
+    """
     global _chroma_client
     if _chroma_client is not None:
         return _chroma_client
     try:
         import chromadb
-        _chroma_client = chromadb.Client()
-        logger.info("chromadb_initialized", backend="ephemeral")
+        import os
+        env = os.environ.get("ENVIRONMENT", "development").lower()
+        if env in ("production", "staging"):
+            persist_dir = os.environ.get("CHROMADB_PERSIST_DIR", "./data/chromadb")
+            os.makedirs(persist_dir, exist_ok=True)
+            _chroma_client = chromadb.PersistentClient(path=persist_dir)
+            logger.info("chromadb_initialized", backend="persistent", path=persist_dir)
+        else:
+            _chroma_client = chromadb.Client()
+            logger.info("chromadb_initialized", backend="ephemeral")
         return _chroma_client
     except ImportError:
         logger.warning("chromadb_not_installed", fallback="in-memory dict")
@@ -186,6 +199,105 @@ class MistakeMemory:
         lines.append("")
 
         return "\n".join(lines)
+
+    def build_validation_rules(
+        self,
+        agent_name: str,
+        task_type: str,
+        context: str,
+    ) -> list:
+        """PHASE-F: Convert past mistakes into HARD validation rules.
+
+        Returns a list of callables: rule(path, content, all_files) -> str | None.
+        Returns error string if rule fails, None if passes.
+
+        Unlike build_lessons_prompt() which returns prompt text the LLM can
+        ignore, these rules run inside VerificationGate and BLOCK writes that
+        would repeat past mistakes.
+        """
+        mistakes = self.query_similar_mistakes(agent_name, task_type, context, n_results=10)
+        if not mistakes:
+            return []
+
+        rules = []
+        seen_patterns: set[str] = set()  # Deduplicate
+
+        for mistake in mistakes:
+            error = mistake.get("error", "").lower()
+            fix = mistake.get("fix", "").lower()
+
+            # Pattern: Missing __init__.py
+            if "__init__.py" in fix and "init_py" not in seen_patterns:
+                seen_patterns.add("init_py")
+
+                def init_py_rule(path: str, content: str, all_files: dict) -> str | None:
+                    """Ensure package directories have __init__.py."""
+                    if not path.endswith(".py"):
+                        return None
+                    parts = path.split("/")
+                    if len(parts) < 2:
+                        return None
+                    for i in range(1, len(parts)):
+                        pkg_dir = "/".join(parts[:i])
+                        init_path = pkg_dir + "/__init__.py"
+                        if init_path not in all_files and path != init_path:
+                            # Check if there are other .py files in this dir
+                            has_siblings = any(
+                                p.startswith(pkg_dir + "/") and p.endswith(".py") and p != path
+                                for p in all_files
+                            )
+                            if has_siblings:
+                                return f"Package '{pkg_dir}' needs __init__.py (past mistake)"
+                    return None
+
+                rules.append(init_py_rule)
+
+            # Pattern: Markdown fences in generated code
+            if ("markdown" in error or "code fence" in error) and "fence" not in seen_patterns:
+                seen_patterns.add("fence")
+
+                def fence_rule(path: str, content: str, all_files: dict) -> str | None:
+                    """Strict markdown fence detection (past mistake)."""
+                    import re
+                    if re.search(r"^```\w*\s*$", content, re.MULTILINE):
+                        return "Contains markdown code fences (repeated past mistake)"
+                    return None
+
+                rules.append(fence_rule)
+
+            # Pattern: Import errors
+            if ("import" in error and ("not found" in error or "no module" in error)
+                    and "import_check" not in seen_patterns):
+                seen_patterns.add("import_check")
+
+                def import_rule(path: str, content: str, all_files: dict) -> str | None:
+                    """Strict import resolution (past mistake with imports)."""
+                    import re
+                    if not path.endswith(".py"):
+                        return None
+                    imports = re.findall(r"^from\s+(app\.\S+)\s+import", content, re.MULTILINE)
+                    for mod in imports:
+                        mod_file = mod.replace(".", "/") + ".py"
+                        mod_init = mod.replace(".", "/") + "/__init__.py"
+                        if (mod_file not in all_files and mod_init not in all_files
+                                and "backend/" + mod_file not in all_files):
+                            return f"Import '{mod}' has no matching file (repeated past mistake)"
+                    return None
+
+                rules.append(import_rule)
+
+            # Pattern: Syntax errors
+            if "syntaxerror" in error and "strict_syntax" not in seen_patterns:
+                seen_patterns.add("strict_syntax")
+                # Syntax check is already in VerificationGate — no extra rule needed
+
+        logger.debug(
+            "validation_rules_built",
+            agent=agent_name,
+            rules_count=len(rules),
+            patterns=list(seen_patterns),
+        )
+        return rules
 
 
 # Module-level singleton

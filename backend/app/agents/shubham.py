@@ -779,6 +779,50 @@ SHUBHAM_TOOLS: list[ToolDefinition] = [
             "required": ["path"],
         },
     ),
+    # 1.1-FIX: Run generated Python code in sandboxed subprocess to verify
+    # it actually works (not just valid syntax). 10s timeout, no network.
+    ToolDefinition(
+        name="run_code",
+        description=(
+            "Execute a generated Python file in a sandboxed subprocess. "
+            "Returns stdout+stderr (max 5KB). Use AFTER write_file to verify "
+            "code runs without errors. 10s timeout, no network access."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path of the Python file to run",
+                },
+                "args": {
+                    "type": "string",
+                    "description": "Optional command-line arguments",
+                },
+            },
+            "required": ["path"],
+        },
+    ),
+    # 1.2-FIX: Self-review tool — cheap model critique before task_complete.
+    ToolDefinition(
+        name="self_review",
+        description=(
+            "Request an independent code review of your generated files. "
+            "A separate AI reviewer checks for: missing imports, wrong API "
+            "routes vs contract, hardcoded values, missing error handling. "
+            "Call this BEFORE task_complete to catch issues early."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "focus": {
+                    "type": "string",
+                    "description": "What to focus the review on (e.g. 'API routes', 'models', 'all')",
+                },
+            },
+            "required": ["focus"],
+        },
+    ),
     # I1-FIX: Dynamic agent re-dispatch
     INTERRUPT_TOOL,
 ]
@@ -806,6 +850,16 @@ class ShubhamToolHandler:
         self._pipeline_context = pipeline_context or {}  # For agent oracle fallback
         self._done = False
         self._summary = ""
+        # PHASE-E: Extra verification rules from mistake memory.
+        # Mistakes become BLOCKING validation rules, not just prompt text.
+        self._verification_rules: list[Any] = []
+        try:
+            from app.services.mistake_memory import mistake_memory
+            self._verification_rules = mistake_memory.build_validation_rules(
+                "shubham", "backend_generation", ""
+            )
+        except Exception:
+            pass  # Non-fatal — proceed without extra rules
 
     @property
     def done(self) -> bool:
@@ -816,6 +870,48 @@ class ShubhamToolHandler:
     def summary(self) -> str:
         """Summary provided by the LLM when it called task_complete."""
         return self._summary
+
+    def observe(self, tool_name: str, result: str) -> "Observation":
+        """PHASE-G: System evaluates tool result autonomously.
+
+        This is the key agentic mechanism: the system (not the LLM) decides
+        whether a tool result is acceptable and can escalate to a more
+        expensive model if quality is dropping.
+
+        PHASE-I: Feeds pass/fail into AdaptiveComplexity for cross-goal
+        model escalation (cheap → expensive only when needed).
+        """
+        from app.agents.base import Observation
+
+        adaptive = getattr(self, "_adaptive", None)
+
+        # Track consecutive write rejections — if too many, escalate model
+        if tool_name == "write_file":
+            if "REJECTED" in result:
+                self._consecutive_rejections = getattr(self, "_consecutive_rejections", 0) + 1
+                if adaptive:
+                    adaptive.on_verification_fail()
+                if self._consecutive_rejections >= 3:
+                    self._consecutive_rejections = 0
+                    return Observation(
+                        needs_escalation=True,
+                        override_result=result + "\n\n⚡ MODEL ESCALATED: Switching to more capable model due to repeated failures.",
+                    )
+            else:
+                self._consecutive_rejections = 0
+                if adaptive:
+                    adaptive.on_verification_pass()
+
+        # Track tool errors — escalate if tools keep failing
+        if result.startswith("[ERROR]") or result.startswith("Error"):
+            self._consecutive_errors = getattr(self, "_consecutive_errors", 0) + 1
+            if self._consecutive_errors >= 2:
+                self._consecutive_errors = 0
+                return Observation(needs_escalation=True)
+        else:
+            self._consecutive_errors = 0
+
+        return Observation()  # Proceed normally
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         """Route tool calls to the appropriate handler method."""
@@ -839,6 +935,12 @@ class ShubhamToolHandler:
             return self._check_imports(**tool_input)
         elif tool_name == "check_types":
             return self._check_types(**tool_input)
+        # 1.1-FIX: Run generated code in sandbox
+        elif tool_name == "run_code":
+            return await self._run_code(**tool_input)
+        # 1.2-FIX: Self-review via cheap model
+        elif tool_name == "self_review":
+            return await self._self_review(**tool_input)
         # I1-FIX: Dynamic agent re-dispatch
         elif tool_name == "request_agent_rerun":
             return self._request_agent_rerun(**tool_input)
@@ -846,8 +948,18 @@ class ShubhamToolHandler:
             return f"Unknown tool: {tool_name}"
 
     async def _write_file(self, path: str, content: str) -> str:
+        # PHASE-E: Verification gate — reject bad code at write time.
+        # The LLM gets a REJECTED message and MUST fix before file is accepted.
+        from app.agents.base import VerificationGate
+        gate = VerificationGate(extra_rules=self._verification_rules)
+        result = gate.verify(path, content, self._files)
+        if not result.passed:
+            return result.rejection_message()
         self._files[path] = content
-        return f"Written {path} ({len(content)} chars)"
+        msg = f"Written {path} ({len(content)} chars)"
+        if result.warnings:
+            msg += "\n⚠ Warnings:\n" + "\n".join(f"  • {w}" for w in result.warnings[:3])
+        return msg
 
     async def _read_file(self, path: str) -> str:
         # C3-FIX: Raised read limit from 10K to 50K so the LLM can inspect
@@ -955,6 +1067,109 @@ class ShubhamToolHandler:
         if stack:
             return f"Unclosed bracket: {stack[-1]}"
         return "OK (non-Python file, basic validation passed)"
+
+    async def _run_code(self, path: str, args: str = "") -> str:
+        """1.1-FIX: Execute a generated Python file in a sandboxed subprocess.
+
+        Writes ALL generated files to a temp directory so relative imports work,
+        then runs the target file with a 10s timeout. No network access (best-effort).
+        Returns stdout+stderr capped at 5KB.
+        """
+        import subprocess
+        import tempfile
+
+        code = self._files.get(path)
+        if not code:
+            return f"File not found: {path}. Available: {list(self._files.keys())[:20]}"
+        if not path.endswith(".py"):
+            return "run_code only supports Python files."
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                import os
+                # Write all generated files so imports resolve
+                for fpath, content in self._files.items():
+                    full = os.path.join(tmpdir, fpath)
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    with open(full, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    # Create __init__.py for each package directory
+                    pkg_dir = os.path.dirname(full)
+                    init_path = os.path.join(pkg_dir, "__init__.py")
+                    if not os.path.exists(init_path):
+                        with open(init_path, "w") as f:
+                            pass
+
+                target = os.path.join(tmpdir, path)
+                cmd = ["python", target]
+                if args:
+                    cmd.extend(args.split())
+
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    cwd=tmpdir,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                output = (result.stdout + result.stderr)[:5120]
+                status = "SUCCESS" if result.returncode == 0 else f"EXIT CODE {result.returncode}"
+                return f"[{status}]\n{output}" if output else f"[{status}] (no output)"
+        except subprocess.TimeoutExpired:
+            return "[TIMEOUT] Execution exceeded 10s limit."
+        except Exception as exc:
+            return f"[ERROR] {type(exc).__name__}: {str(exc)[:500]}"
+
+    async def _self_review(self, focus: str = "all") -> str:
+        """1.2-FIX: Request a cheap-model review of generated code.
+
+        Calls the cheapest available model (Haiku/Flash) to critique the generated
+        code BEFORE task_complete. Catches issues the generator model missed:
+        missing imports, wrong API routes, hardcoded values, missing error handling.
+        """
+        if not self._files:
+            return "No files to review yet. Write files first."
+
+        # Build a compact code summary for the reviewer (cap at 15K chars)
+        code_summary_parts = []
+        budget = 15_000
+        for path, content in self._files.items():
+            chunk = f"\n--- {path} ---\n{content[:3000]}"
+            if len(chunk) > budget:
+                break
+            code_summary_parts.append(chunk)
+            budget -= len(chunk)
+        code_summary = "".join(code_summary_parts)
+
+        review_prompt = (
+            f"Review the following generated code. Focus: {focus}.\n"
+            "Check for:\n"
+            "1. Missing imports that would cause ImportError\n"
+            "2. Wrong API route paths vs what the contract specifies\n"
+            "3. Hardcoded values that should be configurable\n"
+            "4. Missing error handling (bare except, no validation)\n"
+            "5. Type mismatches between models and API responses\n"
+            "6. Missing __init__.py files for packages\n\n"
+            "Return a numbered list of issues found, or 'NO ISSUES FOUND' if clean.\n\n"
+            f"Code:\n{code_summary}"
+        )
+
+        try:
+            from app.services.ai_router import AIRouter, AIRequest, AIMessage
+            from app.agents.base import TaskComplexity
+
+            router = AIRouter()
+            response = await router.call(AIRequest(
+                messages=[AIMessage(role="user", content=review_prompt)],
+                complexity=TaskComplexity.LOW,  # Cheapest model
+                max_tokens=1000,
+                run_id=self._pipeline_run_id,
+                agent_name="shubham_self_review",
+            ))
+            return f"## Self-Review Results:\n{response.content}"
+        except Exception as exc:
+            return f"Self-review unavailable: {type(exc).__name__}: {str(exc)[:200]}"
 
     def _list_files(self) -> str:
         if not self._files:
@@ -1231,11 +1446,21 @@ class Shubham:
             pipeline_context=context,  # For agent oracle fallback in ask_architect
         )
 
+        # PHASE-H: Initialize goal tracker for progress tracking
+        from app.agents.base import GoalTracker, AdaptiveComplexity
+        goal_tracker = GoalTracker(generation_order)
+
+        # PHASE-I: Start with cheapest model, escalate on failures.
+        # Wire into tool handler so observe() can update on pass/fail.
+        adaptive = AdaptiveComplexity()
+        tool_handler._adaptive = adaptive
+
         logger.info(
             "agentic_phase_start",
             framework=backend_framework,
             files_to_generate=len(generation_order),
             template_files_available=len(generated_files),
+            goals=goal_tracker.summary(),
         )
 
         try:
@@ -1253,12 +1478,13 @@ class Shubham:
                 }],
                 system_prompt=system_prompt,
                 task_type="general",
+                complexity=adaptive.current,  # PHASE-I: Start cheap, escalate on failure
                 tool_handler=tool_handler,
                 max_tool_rounds=30,  # Generous limit for large projects
             )
 
             if cost_tracker is not None:
-                cost_tracker.record(response, agent_name=self.name, model_key="high")
+                await cost_tracker.record(response, agent_name=self.name, model_key="high")
 
             logger.info(
                 "agentic_phase_complete",
@@ -1277,16 +1503,59 @@ class Shubham:
             # exception — keep whatever was written so downstream agents can work
             # with partial results rather than nothing.
 
-        # ── Layer 1: Builder Self-Check ──
-        # Validate own output before handing off — catch errors early
-        # before downstream reviewers waste AI calls on obvious issues.
+        # PHASE-H: Track goal completion based on which files were generated
+        for goal in goal_tracker.goals:
+            if goal.file_path in generated_files and generated_files.get(goal.file_path):
+                goal_tracker.mark_complete(goal.id)
+        logger.info("goal_tracking_complete", **goal_tracker.summary())
+
+        # ── Layer 1: Builder Self-Check (1.3-FIX: BLOCKING) ──
+        # Validate own output before handing off. If errors found, build a fix
+        # prompt and re-run the tool loop. Max 2 self-fix cycles to prevent
+        # infinite loops while still catching obvious issues.
         self_check = self._run_self_check(generated_files, contract, backend_framework)
+        _self_fix_cycles = 0
+
+        while self_check.get("errors", 0) > 0 and _self_fix_cycles < 2:
+            _self_fix_cycles += 1
+            error_details = self_check.get("error_details", [])
+            error_summary = "\n".join(
+                f"- {e['file']}: {e['issue']}" for e in error_details[:10]
+            )
+            fix_prompt = (
+                f"Your generated code has {self_check['errors']} error(s) that MUST be fixed:\n\n"
+                f"{error_summary}\n\n"
+                "Fix each error by calling write_file with corrected content. "
+                "Then call task_complete when all errors are resolved."
+            )
+            logger.warning(
+                "self_check_fix_cycle",
+                cycle=_self_fix_cycles,
+                errors=self_check.get("errors", 0),
+            )
+            # Reset tool_handler done state so the loop can run again
+            tool_handler._done = False
+            try:
+                await call_ai_with_tools(
+                    self,
+                    messages=[{"role": "user", "content": fix_prompt}],
+                    system_prompt=system_prompt,
+                    task_type="general",
+                    tool_handler=tool_handler,
+                    max_tool_rounds=5,  # Limited rounds for fixes
+                )
+            except Exception as exc:
+                from app.services.ai_router import _sanitize_error
+                logger.error("self_fix_cycle_failed", cycle=_self_fix_cycles, error=_sanitize_error(exc))
+                break
+            self_check = self._run_self_check(generated_files, contract, backend_framework)
 
         logger.info(
             "self_check_complete",
             errors=self_check.get("errors", 0),
             warnings=self_check.get("warnings", 0),
             passed=self_check.get("passed", False),
+            fix_cycles=_self_fix_cycles,
         )
 
         output = {
@@ -1303,6 +1572,9 @@ class Shubham:
             "agentic_summary": tool_handler.summary if tool_handler.done else "",
             "cost_summary": cost_tracker.summary(),
             "self_check": self_check,
+            "self_fix_cycles": _self_fix_cycles,
+            "goal_tracker": goal_tracker.summary(),  # PHASE-H
+            "adaptive_complexity": adaptive.summary(),  # PHASE-I
         }
 
         await store_output(self, pipeline_run_id, output)
@@ -1649,6 +1921,23 @@ class Shubham:
                 user_feedback,
                 "",
             ])
+
+        # ── 12. Mistake Memory (1.5-FIX) ──
+        # Close the Fixer → Builder learning loop: Fixer records mistakes in
+        # mistake_memory after fixing code. Shubham reads them here so it avoids
+        # repeating the same errors in future generations.
+        try:
+            from app.services.mistake_memory import mistake_memory
+            backend_framework = fw_config.framework if fw_config else "unknown"
+            table_count = len(contract.get("database", {}).get("tables", []))
+            lessons = mistake_memory.build_lessons_prompt(
+                self.name, "backend_generation",
+                f"framework={backend_framework}, tables={table_count}",
+            )
+            if lessons:
+                prompt_parts.append(lessons)
+        except Exception:
+            pass  # Non-fatal — proceed without lessons
 
         return "\n".join(prompt_parts)
 

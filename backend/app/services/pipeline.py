@@ -1431,6 +1431,12 @@ class PipelineOrchestrator:
                 # of how the pipeline exits (success, failure, timeout, cancel).
                 await self._release_distributed_lock(run.run_id)
                 await self._release_distributed_slot(run.run_id)
+                # 4.2-FIX: Always clean up cost tracker, even on crash.
+                # Without this, orphaned trackers accumulate in the global
+                # dict, each with a 10K-entry deque — OOM after many runs.
+                _RUN_COST_TRACKERS.pop(run.run_id, None)
+                from app.services.ai_router import unregister_cost_tracker
+                unregister_cost_tracker(run.run_id)
 
     async def _get_max_step_order(self, run: PipelineRun) -> int:
         """Query the max step_order from DB for this run.
@@ -1519,6 +1525,11 @@ class PipelineOrchestrator:
             )
         except Exception:
             pass
+
+        # 2.2-FIX: Branch on pipeline_mode — "agentic" uses PlannerAgent.
+        settings = get_settings()
+        if settings.pipeline_mode == "agentic":
+            return await self._run_pipeline_agentic(run, _cost_tracker, step_count)
 
         while run.current_stage != PipelineStage.COMPLETED:
             # R27-FIX-21: Only rate-limit stages that actually make AI calls.
@@ -1959,6 +1970,112 @@ class PipelineOrchestrator:
             # R17-FIX: Track when this run entered PAUSED state for TTL eviction
             self._paused_at[run.run_id] = time.monotonic()
 
+        return run
+
+    # ── 2.2-FIX: Agentic Pipeline Mode ─────────────────────────────────
+
+    def _summarize_state(self, run: PipelineRun) -> dict[str, Any]:
+        """2.3-FIX: Build compact state dict (<2000 tokens) for planner."""
+        completed = []
+        failed = []
+        for step in run.step_results:
+            if step.result and step.result.status == AgentStatus.COMPLETED:
+                completed.append(step.stage.value)
+            elif step.result and step.result.status == AgentStatus.FAILED:
+                failed.append(step.stage.value)
+
+        ctx = run.context or {}
+        return {
+            "project_type": ctx.get("project_type", "unknown"),
+            "backend_framework": ctx.get("backend_framework", "unknown"),
+            "has_frontend": not ctx.get("__skip_frontend__"),
+            "has_database": not ctx.get("__skip_database__"),
+            "completed_stages": completed,
+            "failed_stages": failed,
+            "file_count": len(ctx.get("file_contents", {})),
+            "fix_cycles": ctx.get("__fix_cycle__", 0),
+        }
+
+    async def _run_pipeline_agentic(
+        self,
+        run: PipelineRun,
+        cost_tracker: ProjectCostTracker,
+        step_count: int,
+    ) -> PipelineRun:
+        """2.2-FIX: AI-driven pipeline execution using PlannerAgent.
+
+        Instead of following fixed STAGE_ORDER, asks the PlannerAgent what
+        stage to run next based on project state. Falls back to sequential
+        mode on planner failure.
+        """
+        from app.agents.planner import PlannerAgent
+
+        planner = PlannerAgent()
+        max_iterations = len(PipelineStage) * 2  # Safety cap
+        iteration = 0
+
+        while run.current_stage != PipelineStage.COMPLETED and iteration < max_iterations:
+            iteration += 1
+            state = self._summarize_state(run)
+
+            try:
+                decision = await planner.plan_next(
+                    project_state=state,
+                    completed_stages=state["completed_stages"],
+                    failed_stages=state["failed_stages"],
+                    last_result=(
+                        run.step_results[-1].result.output
+                        if run.step_results and run.step_results[-1].result
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("planner_failed_fallback_sequential", error=str(exc)[:200])
+                # Fallback: run current stage sequentially
+                decision = None
+
+            if decision and decision.next_actions:
+                # Execute planned action(s)
+                for action in decision.next_actions:
+                    target_stage = None
+                    for stage in PipelineStage:
+                        if stage.value == action.stage:
+                            target_stage = stage
+                            break
+                    if target_stage is None:
+                        continue
+
+                    run.current_stage = target_stage
+                    await self._persist_run(run)
+
+                    # Use existing execute_stage + advance infrastructure
+                    step_result = await self.execute_stage(run)
+                    step_count += 1
+                    run.step_results.append(step_result)
+                    await self._persist_step(run, step_result, step_count)
+
+                    if step_result.result and step_result.result.status == AgentStatus.FAILED:
+                        logger.warning(
+                            "agentic_stage_failed",
+                            stage=action.stage,
+                            agent=step_result.agent_name,
+                        )
+
+                if not decision.next_actions:
+                    # Planner says we're done
+                    run.current_stage = PipelineStage.COMPLETED
+            else:
+                # Fallback: advance one stage sequentially
+                step_result = await self.execute_stage(run)
+                step_count += 1
+                run.step_results.append(step_result)
+                await self._persist_step(run, step_result, step_count)
+                await self.advance(run)
+
+        # Mark completed
+        run.current_stage = PipelineStage.COMPLETED
+        run.status = PipelineRunStatus.COMPLETED
+        await self._persist_run(run)
         return run
 
     def _get_run_lock(self, run_id: str) -> asyncio.Lock:

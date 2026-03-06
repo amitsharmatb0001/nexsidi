@@ -1217,7 +1217,7 @@ class Fixer:
                 from app.services.pipeline import get_run_cost_tracker
                 tracker = get_run_cost_tracker(pipeline_run_id)
                 if tracker is not None:
-                    tracker.record(response, agent_name=self.name, model_key="high")
+                    await tracker.record(response, agent_name=self.name, model_key="high")
             except Exception:
                 pass  # Cost tracking is non-fatal
 
