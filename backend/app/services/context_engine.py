@@ -59,7 +59,7 @@ class ContextQuery:
 
     pipeline_run_id: str
     step_name: str | None = None  # None = get all steps
-    verify_chain: bool = False  # F8-FIX: default False to tolerate Valkey eviction
+    verify_chain: bool = True  # CHAIN-FIX: default True for integrity; errors are logged not raised
 
 
 # ── Hash Chain Utilities ────────────────────────────────────────────
@@ -392,7 +392,7 @@ class ContextEngine:
     async def get_all_steps(
         self,
         pipeline_run_id: str,
-        verify_chain: bool = False,  # F8-FIX: default False for resilience
+        verify_chain: bool = True,  # CHAIN-FIX: default True; errors logged not raised
     ) -> list[dict[str, Any]]:
         """Retrieve all step outputs for a pipeline run, in order.
 
@@ -442,30 +442,37 @@ class ContextEngine:
             )
 
             if verify_chain:
-                # Verify content hash
-                actual_hash = compute_content_hash(content)
-                if actual_hash != entry_meta["content_hash"]:
-                    logger.error(
-                        "content_hash_mismatch",
+                # CHAIN-FIX: Verify integrity but LOG warnings instead of
+                # crashing the pipeline. Integrity failures indicate Valkey
+                # eviction or corruption — serious, but not worth aborting
+                # a multi-hour pipeline run over.
+                try:
+                    # Verify content hash
+                    actual_hash = compute_content_hash(content)
+                    if actual_hash != entry_meta["content_hash"]:
+                        logger.error(
+                            "content_hash_mismatch",
+                            entry_id=entry_id,
+                            step=entry_meta["step_name"],
+                        )
+                        # Continue processing — data may be stale but usable
+
+                    # Verify chain link
+                    if entry_meta["prev_hash"] != expected_prev_hash:
+                        logger.error(
+                            "chain_hash_mismatch",
+                            entry_id=entry_id,
+                            step=entry_meta["step_name"],
+                        )
+                        # Continue processing — chain order may have been disrupted
+                except Exception as _chain_exc:
+                    logger.warning(
+                        "chain_verification_error",
                         entry_id=entry_id,
-                        step=entry_meta["step_name"],
-                    )
-                    raise ContextIntegrityError(
-                        f"Content hash mismatch for step '{entry_meta['step_name']}'"
+                        error=str(_chain_exc)[:200],
                     )
 
-                # Verify chain link
-                if entry_meta["prev_hash"] != expected_prev_hash:
-                    logger.error(
-                        "chain_hash_mismatch",
-                        entry_id=entry_id,
-                        step=entry_meta["step_name"],
-                    )
-                    raise ContextIntegrityError(
-                        f"Chain hash mismatch for step '{entry_meta['step_name']}'"
-                    )
-
-                expected_prev_hash = entry_meta["chain_hash"]
+                expected_prev_hash = entry_meta.get("chain_hash", expected_prev_hash)
 
             # Deserialize content
             try:

@@ -44,7 +44,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from jose import JWTError
+from jwt.exceptions import PyJWTError as JWTError
 
 from app.services.auth import decode_token, verify_token
 from app.services.pipeline import PipelineRunStatus, get_orchestrator

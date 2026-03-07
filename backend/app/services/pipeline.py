@@ -1025,13 +1025,32 @@ class PipelineOrchestrator:
                 completed_at=datetime.now(timezone.utc),
             )
 
-        # Handle special stages
-        if isinstance(agent_name, str) and agent_name.startswith("__"):
+        # Handle special stages (checkpoints, done marker)
+        # DELIVERY-FIX: Exclude __delivery__ from skip — it needs to build the
+        # ZIP package. Only __checkpoint_*__ and __done__ should be skipped.
+        if isinstance(agent_name, str) and agent_name.startswith("__") and agent_name != "__delivery__":
             return StepResult(
                 stage=stage,
                 agent_name=agent_name,
                 completed_at=datetime.now(timezone.utc),
                 skipped=True,
+            )
+
+        # DELIVERY-FIX: Handle delivery stage — build ZIP package, check simulation
+        if agent_name == "__delivery__":
+            from app.engine.delivery import get_delivery_engine
+            delivery_engine = get_delivery_engine()
+            try:
+                pkg = delivery_engine.build_package(run.run_id, run.context)
+                await self._persist_artifact(run.run_id, run.organization_id, pkg.zip_bytes)
+                logger.info("delivery_package_built", run_id=run.run_id, files=len(pkg.file_list))
+            except Exception as exc:
+                logger.error("delivery_build_failed", run_id=run.run_id, error=str(exc)[:200])
+            return StepResult(
+                stage=stage,
+                agent_name=agent_name,
+                completed_at=datetime.now(timezone.utc),
+                skipped=False,
             )
 
         # Handle parallel stages (quality review)

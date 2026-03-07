@@ -364,6 +364,16 @@ services:
     depends_on:
       sandbox-backend:
         condition: service_healthy
+    environment:
+      # FRONTEND-URL-FIX: Inject backend API URL for all major frameworks.
+      # Without these, the frontend cannot reach the backend inside the sandbox
+      # network. We set ALL common env var names so any framework works.
+      NEXT_PUBLIC_API_URL: http://sandbox-backend:8000
+      VITE_API_URL: http://sandbox-backend:8000
+      REACT_APP_API_URL: http://sandbox-backend:8000
+      API_URL: http://sandbox-backend:8000
+      NEXT_PUBLIC_WS_URL: ws://sandbox-backend:8000
+      VITE_WS_URL: ws://sandbox-backend:8000
     read_only: true
     tmpfs:
       - /tmp:size=256m
@@ -1090,18 +1100,45 @@ class ExecutionEngine:
                 })
             return results
 
-        # Run Playwright tests via docker compose exec
+        # PLAYWRIGHT-FIX: Run Playwright from HOST against the exposed frontend port.
+        # Previously ran inside sandbox-backend container which is read-only,
+        # has no internet, and doesn't have Chromium installed — tests always failed.
+        # Now we discover the frontend's mapped port and run tests from the host.
         try:
+            # Discover the frontend's randomly mapped host port
+            frontend_port = 3000  # fallback
+            try:
+                fp_proc = subprocess.run(
+                    [
+                        "docker", "compose", "-f", compose_path,
+                        "port", "sandbox-frontend", "3000",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if fp_proc.returncode == 0 and fp_proc.stdout.strip():
+                    mapped = fp_proc.stdout.strip().split(":")[-1]
+                    frontend_port = int(mapped)
+            except Exception:
+                pass
+
+            frontend_url = f"http://localhost:{frontend_port}"
+
             proc = subprocess.run(
                 [
-                    "docker", "compose", "-f", compose_path,
-                    "exec", "-T", "sandbox-backend",
-                    "playwright", "test", "playwright_tests/",
+                    "npx", "playwright", "test", "playwright_tests/",
                     "--reporter=json",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                env={
+                    **os.environ,
+                    "BASE_URL": frontend_url,
+                    "PLAYWRIGHT_BASE_URL": frontend_url,
+                },
+                cwd=state.work_dir if hasattr(state, 'work_dir') else None,
             )
             raw_output = proc.stdout + proc.stderr
 

@@ -22,7 +22,7 @@ FASTAPI_RULES: tuple[str, ...] = (
     "6. Use `Annotated[type, Depends(...)]` for type-safe dependency injection — "
     "import from `typing` and declare type aliases",
     "7. Password hashing: `bcrypt` via `passlib.context.CryptContext` — "
-    "JWT: `python-jose` with HS256 algorithm and expiration",
+    "JWT: `PyJWT` with HS256 algorithm and expiration (NEVER use python-jose — CVE-2024-33663)",
     "8. Database sessions: use `async with AsyncSession() as session` — "
     "ALWAYS use `session.execute(select(...))` not `session.query()`",
     "9. Every model MUST define `__tablename__`, primary key with `mapped_column(BigInteger, primary_key=True)`, "

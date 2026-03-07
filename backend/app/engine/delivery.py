@@ -109,18 +109,32 @@ class DeliveryEngine:
         tests were SKIPPED but previously appeared as passing. Now the
         delivery summary explicitly warns the customer.
         """
-        # F4-FIX: Detect simulation mode
+        # F4-FIX + DELIVERY-FIX: Detect ALL simulation modes (sandbox, deploy, git)
         aarav_output = context.get("aarav", {})
-        is_simulation = (
+        pranav_output = context.get("pranav", {})
+        git_output = context.get("git_agent", {})
+        sim_sandbox = (
             isinstance(aarav_output, dict)
             and aarav_output.get("is_simulation_sandbox", False)
         )
+        sim_deploy = (
+            isinstance(pranav_output, dict)
+            and pranav_output.get("is_simulation_deploy", False)
+        )
+        sim_git = (
+            isinstance(git_output, dict)
+            and git_output.get("is_simulation_git", False)
+        )
+        is_simulation = sim_sandbox or sim_deploy or sim_git
         if is_simulation:
             context.setdefault("__simulation_mode__", True)
             logger.warning(
                 "delivery_simulation_mode",
                 pipeline_run_id=pipeline_run_id,
-                msg="Project was NOT tested in a real Docker sandbox",
+                sandbox_simulated=sim_sandbox,
+                deploy_simulated=sim_deploy,
+                git_simulated=sim_git,
+                msg="Project has simulated stages — NOT fully verified",
             )
 
         contract = context.get("vikram", {}).get("contract", {})
@@ -185,6 +199,34 @@ class DeliveryEngine:
                 blocklist_json = orjson.dumps(blocklist_findings, option=orjson.OPT_INDENT_2).decode("utf-8")
                 zf.writestr(f"{project_name}/reports/blocklist_scan.json", blocklist_json)
                 manifest.report_files += 1
+
+            # DELIVERY-FIX: Add prominent warning file when stages were simulated
+            if is_simulation:
+                sim_parts = []
+                if sim_sandbox:
+                    sim_parts.append("- **Testing**: Docker sandbox was NOT available. All tests were SIMULATED (no real code execution).")
+                if sim_deploy:
+                    sim_parts.append("- **Deployment**: No cloud provider token was available. Deployment was SIMULATED.")
+                if sim_git:
+                    sim_parts.append("- **Git**: Git operations were SIMULATED.")
+                sim_warning = (
+                    "# ⚠️ SIMULATION WARNING\n\n"
+                    "**This project was delivered with simulated stages.**\n\n"
+                    "The following stages did NOT execute against real infrastructure:\n\n"
+                    + "\n".join(sim_parts) + "\n\n"
+                    "## What This Means\n\n"
+                    "The generated code has NOT been verified to work in a real environment.\n"
+                    "Before using this code in production:\n\n"
+                    "1. Run `docker-compose up` locally and verify all services start\n"
+                    "2. Run the test suite: `make test`\n"
+                    "3. Verify frontend connects to backend\n"
+                    "4. Test all API endpoints manually\n\n"
+                    "## Why Did This Happen?\n\n"
+                    "The NexSidi pipeline requires Docker for sandbox testing and cloud provider\n"
+                    "credentials for deployment. When these are unavailable, the pipeline completes\n"
+                    "with simulated results to deliver your code, but it has NOT been tested.\n"
+                )
+                zf.writestr(f"{project_name}/SIMULATION_WARNING.md", sim_warning)
 
             # 6. Manifest
             manifest.total_files = (

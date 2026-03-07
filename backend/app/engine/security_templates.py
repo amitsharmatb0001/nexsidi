@@ -240,7 +240,8 @@ def verify_password(plain: str, hashed: str) -> bool:
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import jwt, JWTError
+import jwt
+from jwt.exceptions import PyJWTError as JWTError
 
 SECRET_KEY = "CHANGE_ME"  # load from env
 ALGORITHM = "HS256"

@@ -129,6 +129,22 @@ class AgentResult:
         return 0.0
 
 
+# ── Shared Utilities ────────────────────────────────────────────────
+
+
+def clamp_completeness(value: Any) -> int:
+    """Clamp completeness_pct to valid 0-100 range.
+
+    COMPLETENESS-FIX: LLM self-evaluation can return values outside 0-100
+    (e.g., -1, 150, "high"). This utility ensures a valid percentage.
+    The default of -1 in some agents was itself invalid.
+    """
+    try:
+        return max(0, min(100, int(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
 # ── Tool Definition ─────────────────────────────────────────────────
 
 

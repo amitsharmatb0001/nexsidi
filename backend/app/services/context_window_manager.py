@@ -58,14 +58,37 @@ class ContextWindowManager:
             )
     """
 
-    def count_tokens(self, text: str) -> int:
-        """Estimate token count.
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        """Estimate token count for the given model.
 
-        Uses tiktoken if available, falls back to char/4 estimation.
+        TOKENIZER-FIX: Uses model-appropriate counting instead of hardcoding
+        GPT-4's cl100k_base for all models. Claude and Gemini use different
+        tokenizers — cl100k_base gives ~15-20% wrong counts for them, causing
+        premature context summarization or context overflow.
+
+        - OpenAI models: Use tiktoken with correct model encoding
+        - Claude models: ~3.5 chars per token (measured average)
+        - Gemini models: ~3.8 chars per token (SentencePiece-based)
+        - Unknown/fallback: 4 chars per token
         """
+        model = model or ""
+        model_lower = model.lower()
+
+        # Claude models: different tokenizer, use char-based estimate
+        if any(name in model_lower for name in ("claude", "haiku", "sonnet", "opus")):
+            return int(len(text) / 3.5)
+
+        # Gemini models: SentencePiece-based, slightly different ratio
+        if any(name in model_lower for name in ("gemini",)):
+            return int(len(text) / 3.8)
+
+        # OpenAI models: use tiktoken with correct model
         try:
             import tiktoken
-            enc = tiktoken.encoding_for_model("gpt-4")  # cl100k_base
+            try:
+                enc = tiktoken.encoding_for_model(model or "gpt-4")
+            except KeyError:
+                enc = tiktoken.encoding_for_model("gpt-4")  # fallback
             return len(enc.encode(text))
         except (ImportError, Exception):
             return len(text) // _CHARS_PER_TOKEN

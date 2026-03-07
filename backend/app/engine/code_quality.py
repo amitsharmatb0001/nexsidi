@@ -519,7 +519,7 @@ _KNOWN_STDLIB_MODULES: frozenset[str] = frozenset({
 
 _KNOWN_THIRD_PARTY: frozenset[str] = frozenset({
     "fastapi", "sqlalchemy", "pydantic", "alembic", "uvicorn",
-    "jose", "bcrypt", "httpx", "redis", "celery", "jinja2",
+    "jose", "jwt", "bcrypt", "httpx", "redis", "celery", "jinja2",
     "orjson", "structlog", "dotenv", "starlette", "passlib",
     "pytest", "anyio", "greenlet", "asyncpg",
 })

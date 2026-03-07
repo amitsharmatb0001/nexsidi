@@ -31,6 +31,7 @@ from app.agents.base import (
     INTERRUPT_TOOL,
     ToolDefinition,
     call_ai_with_tools,
+    clamp_completeness,
     estimate_file_complexity,
     register_agent,
     run_agent,
@@ -1655,7 +1656,7 @@ class Shubham:
                 "llm_self_evaluation_complete",
                 missing=len(llm_eval.get("missing_implementations", [])),
                 wrong_imports=len(llm_eval.get("wrong_imports", [])),
-                completeness_pct=llm_eval.get("completeness_pct", -1),
+                completeness_pct=clamp_completeness(llm_eval.get("completeness_pct", 0)),
             )
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
@@ -2170,6 +2171,38 @@ class Shubham:
             "9. Every function must be fully implemented with real business logic.",
             f"10. Error comments use `{fw_config.error_comment_prefix}`.",
             "11. Match table/column names EXACTLY from the contract.",
+            "",
+        ])
+
+        # ── 9a. RUNTIME ENVIRONMENT RULES (MASTER-PROMPT-FIX) ──
+        # Without these, the generated app cannot run locally or in production.
+        prompt_parts.extend([
+            "## CRITICAL: Runtime Environment Rules",
+            "",
+            "### JWT Library — NEVER use python-jose",
+            "Use `PyJWT` (`import jwt`) for all JWT operations. python-jose has CVE-2024-33663.",
+            "```python",
+            "import jwt",
+            "from jwt.exceptions import PyJWTError as JWTError",
+            "# jwt.encode(payload, secret, algorithm='HS256')",
+            "# jwt.decode(token, secret, algorithms=['HS256'])",
+            "```",
+            "",
+            "### Environment Variables — NEVER hardcode URLs or secrets",
+            "ALL configuration MUST come from environment variables:",
+            "- `DATABASE_URL` — database connection string",
+            "- `REDIS_URL` / `VALKEY_URL` — cache connection string",
+            "- `JWT_SECRET_KEY` — MUST be loaded from env, NEVER hardcoded",
+            "- `CORS_ORIGINS` — comma-separated allowed origins",
+            "- `ENVIRONMENT` — 'development' | 'staging' | 'production'",
+            "Use `pydantic-settings` for FastAPI or `python-decouple` for Django.",
+            "",
+            "### Generated App Must Include",
+            "Your generated code must ensure the following exist (via template engine or your own files):",
+            "- A `/health` endpoint that returns `{\"status\": \"ok\"}` — required for deployment health checks.",
+            "- A CORS middleware configured from `CORS_ORIGINS` env var (not hardcoded `*`).",
+            "- `alembic/` directory with proper migration config if using SQLAlchemy.",
+            "- A `scripts/seed.py` that creates demo data for local testing.",
             "",
         ])
 

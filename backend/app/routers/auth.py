@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from jose import JWTError
+from jwt.exceptions import PyJWTError as JWTError
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 

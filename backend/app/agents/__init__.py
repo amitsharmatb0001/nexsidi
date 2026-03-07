@@ -51,14 +51,42 @@ def register_all_agents() -> int:
         "app.agents.system_monitor",
     ]
 
+    # AGENT-IMPORT-FIX: Mandatory agents MUST import successfully.
+    # If a pipeline-critical agent fails to import (e.g., syntax error in
+    # shubham.py), the pipeline will start with a missing agent and fail
+    # confusingly downstream. Utility agents (whatsapp, support, etc.) are
+    # non-fatal — they're not part of the core pipeline.
+    _MANDATORY_AGENTS = frozenset({
+        "app.agents.tilotma",
+        "app.agents.saanvi",
+        "app.agents.vikram",
+        "app.agents.dhruv",
+        "app.agents.vanya",
+        "app.agents.shubham",
+        "app.agents.aanya",
+        "app.agents.karan",
+        "app.agents.navya",
+        "app.agents.deepika",
+        "app.agents.aarav",
+        "app.agents.fixer",
+        "app.agents.pranav",
+    })
+
     imported = 0
     for module_name in _agent_modules:
         try:
             __import__(module_name)
             imported += 1
         except Exception as exc:
-            # Non-fatal: agent won't be available but pipeline continues
-            logger.warning("agent_import_failed: %s (%s)", module_name, exc)
+            if module_name in _MANDATORY_AGENTS:
+                # FATAL: Pipeline-critical agent — re-raise so startup fails loudly
+                logger.error("FATAL: mandatory agent import failed: %s (%s)", module_name, exc)
+                raise ImportError(
+                    f"Mandatory agent {module_name} failed to import: {exc}"
+                ) from exc
+            else:
+                # Non-fatal: utility agent won't be available but pipeline continues
+                logger.warning("agent_import_failed: %s (%s)", module_name, exc)
 
     from app.agents.base import list_agents
     registered = list_agents()

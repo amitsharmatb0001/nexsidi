@@ -16,7 +16,7 @@ dependencies = [
     "greenlet>=3.1.0",
 
     # Auth
-    "python-jose[cryptography]>=3.3.0",
+    "PyJWT[crypto]>=2.8.0",
     "bcrypt>=4.2.0",
     "pyotp>=2.9.0",
     "httpx>=0.28.0",
