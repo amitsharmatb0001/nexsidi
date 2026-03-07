@@ -101,15 +101,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ) from exc
         logger.warning("revocation_store_deferred", error=_sanitize_error(exc))
 
-    # CELERY-PROD-FIX: Celery is required in production for horizontal scaling.
-    # use_celery=False runs pipelines inside the API process — same event loop,
-    # same crash domain, no horizontal scale. One rogue pipeline OOMs the server.
-    if settings.is_production and not settings.use_celery:
+    # WORKER-PROD-FIX: Production requires an external worker (async or Celery).
+    # In-process execution (asyncio.create_task) shares crash domain with API.
+    _has_external_worker = (
+        settings.worker_type == "async" or settings.use_celery
+    )
+    if settings.is_production and not _has_external_worker:
         raise RuntimeError(
-            "USE_CELERY must be True in production. "
-            "In-process pipeline execution (use_celery=False) cannot scale horizontally "
-            "and shares memory + crash domain with the API server. "
-            "Set USE_CELERY=true and configure CELERY_BROKER_URL."
+            "Production requires an external pipeline worker. "
+            "Set WORKER_TYPE=async (recommended) or USE_CELERY=true. "
+            "In-process execution shares memory + crash domain with the API server."
+        )
+    # Celery is deprecated — warn if still enabled
+    if settings.use_celery:
+        logger.warning(
+            "celery_dispatch_deprecated",
+            msg=(
+                "Celery pipeline dispatch is deprecated. "
+                "Set WORKER_TYPE=async for the native asyncio worker "
+                "(better performance, no thread blocking). "
+                "Celery support will be removed in a future release."
+            ),
         )
 
     # AI Router (lazy-init, just ensure it's importable)

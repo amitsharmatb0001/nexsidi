@@ -429,8 +429,26 @@ class FixerToolHandler:
                     "the structure, then make a targeted fix."
                 )
 
+        # TOKEN BURN GUARDRAIL: Warn when rewriting large existing files.
+        # Full file rewrites consume ~10x more tokens than search_replace patches.
+        _line_count = content.count("\n") + 1
+        _is_existing = path in self._snapshots
+        _token_warn = ""
+        if _is_existing and _line_count > 200:
+            _token_warn = (
+                f"\n⚠ TOKEN WARNING: You wrote {_line_count} lines to an EXISTING file. "
+                f"Full file rewrites are ~10x more expensive than search_replace patches. "
+                f"Next time, use search_replace to fix ONLY the broken lines."
+            )
+            logger.warning(
+                "fixer_large_rewrite",
+                path=path,
+                line_count=_line_count,
+                chars=len(content),
+            )
+
         # Manifest injection: show Fixer what files it has patched
-        msg = f"Written {path} ({len(content)} chars)"
+        msg = f"Written {path} ({len(content)} chars){_token_warn}"
         manifest_lines = ["\n\n📂 PATCHED FILES (check for consistency, avoid re-breaking):"]
         for fpath in sorted(self._written_files.keys()):
             fc = self._written_files[fpath]
@@ -714,7 +732,7 @@ class FixerToolHandler:
 
         from app.agents.tools.code_validator import check_imports, extract_project_files
 
-        project_files = extract_project_files(self._context)
+        project_files, req_packages = extract_project_files(self._context)
         # Also include files written in the current fix session
         for fp in self._written_files:
             if fp.endswith(".py"):
@@ -722,7 +740,7 @@ class FixerToolHandler:
                 if mod.endswith(".py"):
                     mod = mod[:-3]
                 project_files.add(mod)
-        return check_imports(path, code, project_files)
+        return check_imports(path, code, project_files, req_packages)
 
     async def _search_solution(self, error_message: str, context: str = "") -> str:
         """Search web for a solution using the Research Agent.
@@ -1055,6 +1073,28 @@ class Fixer:
 
             report.attempts.append(attempt)
 
+            # TOKEN BURN TRACKING: Log cumulative fix cost per iteration.
+            try:
+                from app.services.pipeline import get_run_cost_tracker
+                _ct = get_run_cost_tracker(pipeline_run_id)
+                if _ct:
+                    _fix_cost = _ct.total_cost_usd
+                    logger.info(
+                        "fixer_cost_checkpoint",
+                        iteration=iteration,
+                        total_cost_usd=round(_fix_cost, 4),
+                        run_id=pipeline_run_id,
+                    )
+                    if _fix_cost > 0.50:
+                        logger.warning(
+                            "fixer_cost_threshold_exceeded",
+                            total_cost_usd=round(_fix_cost, 4),
+                            iteration=iteration,
+                            msg="Fix loop has consumed >$0.50 — consider aborting",
+                        )
+            except Exception:
+                pass  # Cost tracking is non-critical
+
             # CHANGE-6: Detect duplicate fixes — same file + same output = stuck
             if not attempt.success:
                 content_after = (attempt.file_content_after or "")[:200]
@@ -1239,6 +1279,12 @@ class Fixer:
             "- check_imports: verify all Python imports resolve correctly",
             "- search_solution: search web for error solutions (use for unfamiliar errors)",
             "- report_complete: signal the fix is done",
+            "",
+            "⚠ COST AWARENESS — Token burn prevention:",
+            "Full file rewrites with write_file cost ~10x more tokens than search_replace patches.",
+            "For a 500-line file: search_replace ≈ $0.01, write_file ≈ $0.10.",
+            "ALWAYS try search_replace FIRST. Use write_file ONLY for new files or >50% changes.",
+            "If search_replace fails, try apply_diff. write_file is the LAST RESORT.",
             "",
             "PREFERRED — Use search_replace for targeted fixes:",
             "Provide the exact text to find and its replacement.",

@@ -109,6 +109,20 @@ terraform {{{{
       version = "~> 5.0"
     }}}}
   }}}}
+  # Remote state — prevents Day-2 state loss in ephemeral environments.
+  # Create the S3 bucket and DynamoDB table BEFORE running terraform init:
+  #   aws s3 mb s3://{project_id}-tfstate --region {region}
+  #   aws dynamodb create-table --table-name {project_id}-tflock \\
+  #     --attribute-definitions AttributeName=LockID,AttributeType=S \\
+  #     --key-schema AttributeName=LockID,KeyType=HASH \\
+  #     --billing-mode PAY_PER_REQUEST
+  backend "s3" {{{{
+    bucket         = "{project_id}-tfstate"
+    key            = "terraform/state/{service_name}.tfstate"
+    region         = "{region}"
+    dynamodb_table = "{project_id}-tflock"
+    encrypt        = true
+  }}}}
 }}}}
 
 provider "aws" {{{{
@@ -194,6 +208,16 @@ terraform {{{{
       version = "~> 3.0"
     }}}}
   }}}}
+  # Remote state — prevents Day-2 state loss in ephemeral environments.
+  # Create the storage account BEFORE running terraform init:
+  #   az storage account create -n {service_name}tfstate -g rg-{service_name} -l {region} --sku Standard_LRS
+  #   az storage container create -n tfstate --account-name {service_name}tfstate
+  backend "azurerm" {{{{
+    resource_group_name  = "rg-{service_name}"
+    storage_account_name = "{service_name}tfstate"
+    container_name       = "tfstate"
+    key                  = "terraform.tfstate"
+  }}}}
 }}}}
 
 provider "azurerm" {{{{
@@ -252,6 +276,15 @@ terraform {{{{
       version = "~> 0.1"
     }}}}
   }}}}
+  # Remote state — prevents Day-2 state loss in ephemeral environments.
+  # Fly.io has no native Terraform backend. Use any S3-compatible store
+  # (AWS S3, Cloudflare R2, MinIO) or Terraform Cloud:
+  #   https://developer.hashicorp.com/terraform/language/settings/backends
+  # Example with Terraform Cloud (free for up to 500 resources):
+  # cloud {{{{
+  #   organization = "your-org"
+  #   workspaces {{ name = "{service_name}" }}
+  # }}}}
 }}}}
 
 provider "fly" {{{{
@@ -321,6 +354,19 @@ terraform {{{{
       source  = "digitalocean/digitalocean"
       version = "~> 2.0"
     }}}}
+  }}}}
+  # Remote state — prevents Day-2 state loss in ephemeral environments.
+  # DigitalOcean Spaces is S3-compatible. Create a Space first:
+  #   doctl spaces create {project_id}-tfstate --region {region}
+  backend "s3" {{{{
+    endpoints = {{{{ s3 = "https://{region}.digitaloceanspaces.com" }}}}
+    bucket    = "{project_id}-tfstate"
+    key       = "terraform/state/{service_name}.tfstate"
+    region    = "us-east-1"  # Required by S3 backend but ignored by DO Spaces
+    skip_credentials_validation = true
+    skip_metadata_api_check     = true
+    skip_requesting_account_id  = true
+    skip_s3_checksum            = true
   }}}}
 }}}}
 
@@ -429,6 +475,13 @@ terraform {{{{
       version = "~> 1.0"
     }}}}
   }}}}
+  # Remote state — prevents Day-2 state loss in ephemeral environments.
+  # Vercel has no native Terraform backend. Use Terraform Cloud (free):
+  # cloud {{{{
+  #   organization = "your-org"
+  #   workspaces {{ name = "{service_name}" }}
+  # }}}}
+  # Or use any S3-compatible backend (AWS S3, Cloudflare R2, etc.)
 }}}}
 
 provider "vercel" {{{{
@@ -497,6 +550,13 @@ terraform {{{{
       version = "~> 5.0"
     }}}}
   }}}}
+  # Remote state — prevents Day-2 state loss in ephemeral environments.
+  # Heroku has no native Terraform backend. Use Terraform Cloud (free):
+  # cloud {{{{
+  #   organization = "your-org"
+  #   workspaces {{ name = "{service_name}" }}
+  # }}}}
+  # Or use any S3-compatible backend (AWS S3, Cloudflare R2, etc.)
 }}}}
 
 provider "heroku" {{{{

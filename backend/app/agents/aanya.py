@@ -638,7 +638,7 @@ class AanyaToolHandler:
             return f"File not found: {path}"
         from app.agents.tools.code_validator import check_imports, extract_project_files
 
-        project_files = extract_project_files(self._pipeline_context)
+        project_files, req_packages = extract_project_files(self._pipeline_context)
         # Include files from current session and backend refs
         for fp in list(self._files) + list(self._backend_files):
             if fp.endswith(".py"):
@@ -646,7 +646,7 @@ class AanyaToolHandler:
                 if mod.endswith(".py"):
                     mod = mod[:-3]
                 project_files.add(mod)
-        base_result = check_imports(path, code, project_files)
+        base_result = check_imports(path, code, project_files, req_packages)
 
         # CHANGE-4: Check imported names against export registry (TS/JS)
         import re as _re

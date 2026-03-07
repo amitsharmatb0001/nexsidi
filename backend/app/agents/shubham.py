@@ -1356,7 +1356,7 @@ class ShubhamToolHandler:
             return f"File not found: {path}"
         from app.agents.tools.code_validator import check_imports, extract_project_files
 
-        project_files = extract_project_files(self._pipeline_context)
+        project_files, req_packages = extract_project_files(self._pipeline_context)
         # Also include files written in the current session
         for fp in self._files:
             if fp.endswith(".py"):
@@ -1364,7 +1364,7 @@ class ShubhamToolHandler:
                 if mod.endswith(".py"):
                     mod = mod[:-3]
                 project_files.add(mod)
-        base_result = check_imports(path, code, project_files)
+        base_result = check_imports(path, code, project_files, req_packages)
 
         # CHANGE-4: Check imported names against export registry
         import re as _re

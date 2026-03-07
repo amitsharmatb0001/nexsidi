@@ -29,29 +29,131 @@ KNOWN_THIRD_PARTY: frozenset[str] = frozenset({
     "alembic", "passlib", "jose", "jwt", "bcrypt", "dotenv", "orjson",
     "httpx", "requests", "celery", "redis", "structlog", "django", "flask",
     "starlette", "databases", "aiohttp", "asyncpg", "psycopg2", "psycopg",
-    # Data / ML
-    "numpy", "pandas", "pillow", "PIL",
+    "gunicorn", "hypercorn", "daphne", "websockets", "socketio",
+    "marshmallow", "wtforms", "flask_login", "flask_sqlalchemy",
+    "django_rest_framework", "rest_framework", "ninja", "litestar",
+    # Data / ML / Science
+    "numpy", "pandas", "pillow", "PIL", "scipy", "matplotlib", "seaborn",
+    "sklearn", "scikit_learn", "torch", "tensorflow", "transformers",
+    "langchain", "openai", "anthropic", "tiktoken", "tokenizers",
     # Auth / security
     "email_validator", "python_multipart", "slowapi", "pyotp", "qrcode",
-    "fido2", "webauthn", "cryptography", "argon2",
+    "fido2", "webauthn", "cryptography", "argon2", "itsdangerous",
     # Cloud / infra
-    "boto3", "botocore", "google", "firebase_admin",
+    "boto3", "botocore", "google", "firebase_admin", "azure",
+    "digitalocean", "linode_api4", "oci",
     # Payments / comms
-    "stripe", "sendgrid", "twilio",
+    "stripe", "sendgrid", "twilio", "paypalrestsdk",
     # ORM / DB drivers
-    "pymongo", "motor", "tortoise", "peewee", "prisma",
+    "pymongo", "motor", "tortoise", "peewee", "prisma", "sqlmodel",
+    "pymysql", "cx_Oracle", "oracledb", "cassandra", "elasticsearch",
     # Testing
-    "pytest", "unittest", "mock", "faker", "factory",
+    "pytest", "unittest", "mock", "faker", "factory", "hypothesis",
+    "playwright", "selenium", "locust",
     # Template / serialization
-    "jinja2", "greenlet", "yaml", "toml", "msgpack",
-    # Misc
-    "celery", "kombu", "valkey", "jsonschema",
+    "jinja2", "greenlet", "yaml", "toml", "msgpack", "pyyaml", "tomli",
+    # CLI / utilities
+    "click", "typer", "rich", "tqdm", "colorama", "tabulate",
+    "tenacity", "retry", "schedule", "apscheduler",
+    # Monitoring / observability
+    "sentry_sdk", "prometheus_client", "opentelemetry", "loguru",
+    "datadog", "newrelic", "statsd",
+    # Message queues / streaming
+    "pika", "kombu", "valkey", "kafka", "confluent_kafka", "nats",
+    # Validation / config
+    "jsonschema", "cerberus", "attrs", "cattrs", "environ", "decouple",
+    # File / media
+    "openpyxl", "xlsxwriter", "reportlab", "weasyprint", "python_docx",
+    "boto", "minio", "paramiko", "fabric",
 })
 
 # Top-level prefixes considered project-internal
 INTERNAL_PREFIXES: frozenset[str] = frozenset({
     "app", "backend", "core", "config", "src", "lib", "utils", "helpers",
 })
+
+
+# ── Requirements-based package resolution ─────────────────────────
+
+
+def _extract_requirements_packages(context: dict[str, Any]) -> set[str]:
+    """Extract importable package names from the project's requirements.txt.
+
+    Reads requirements.txt (and optionally package.json) from generated file
+    contents in agent context.  Converts pip package names to importable
+    top-level module names (e.g. ``python-dotenv`` → ``dotenv``,
+    ``Pillow`` → ``PIL``).  This prevents false "unresolved import" warnings
+    for packages the project explicitly depends on.
+    """
+    import re
+
+    # Well-known pip-name → import-name mismatches
+    _PIP_TO_IMPORT: dict[str, str] = {
+        "python-dotenv": "dotenv",
+        "pillow": "PIL",
+        "scikit-learn": "sklearn",
+        "python-jose": "jose",
+        "python-multipart": "multipart",
+        "pyjwt": "jwt",
+        "python-dateutil": "dateutil",
+        "beautifulsoup4": "bs4",
+        "pyyaml": "yaml",
+        "opencv-python": "cv2",
+        "opencv-contrib-python": "cv2",
+        "python-docx": "docx",
+        "flask-sqlalchemy": "flask_sqlalchemy",
+        "flask-login": "flask_login",
+        "django-rest-framework": "rest_framework",
+        "sentry-sdk": "sentry_sdk",
+        "prometheus-client": "prometheus_client",
+    }
+
+    packages: set[str] = set()
+
+    # Scan all agents' file_contents for requirements.txt
+    for agent_name in ("shubham", "aanya", "dhruv", "pranav"):
+        agent_out = context.get(agent_name, {})
+        if not isinstance(agent_out, dict):
+            continue
+        file_contents = agent_out.get("file_contents", {})
+        if not isinstance(file_contents, dict):
+            continue
+
+        for fpath, content in file_contents.items():
+            if not isinstance(content, str):
+                continue
+
+            # Python requirements.txt
+            if fpath.endswith("requirements.txt"):
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith("-"):
+                        continue
+                    # Strip version specifiers: package>=1.0 → package
+                    pip_name = re.split(r"[>=<!\[;]", line)[0].strip().lower()
+                    if not pip_name:
+                        continue
+                    # Map pip name to import name
+                    if pip_name in _PIP_TO_IMPORT:
+                        packages.add(_PIP_TO_IMPORT[pip_name])
+                    else:
+                        # Default: replace hyphens with underscores
+                        packages.add(pip_name.replace("-", "_"))
+
+            # Node package.json — extract dependency names
+            if fpath.endswith("package.json"):
+                try:
+                    import json
+                    pkg = json.loads(content)
+                    for dep_key in ("dependencies", "devDependencies"):
+                        for dep_name in pkg.get(dep_key, {}):
+                            # Strip scope: @scope/name → name
+                            clean = dep_name.split("/")[-1] if "/" in dep_name else dep_name
+                            packages.add(clean)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    return packages
 
 
 # ── Import Checking ────────────────────────────────────────────────
@@ -61,6 +163,7 @@ def check_imports(
     path: str,
     code: str,
     project_files: set[str] | None = None,
+    requirements_packages: set[str] | None = None,
 ) -> str:
     """Verify all imports in a Python file resolve to known modules.
 
@@ -98,6 +201,7 @@ def check_imports(
         return "No imports found in file."
 
     project_files = project_files or set()
+    requirements_packages = requirements_packages or set()
     unresolved: list[dict[str, Any]] = []
 
     for imp in imports:
@@ -107,8 +211,11 @@ def check_imports(
         # stdlib
         if top_level in sys.stdlib_module_names:
             continue
-        # known third-party
+        # known third-party (hardcoded list)
         if top_level in KNOWN_THIRD_PARTY:
+            continue
+        # project's own requirements.txt / package.json packages
+        if top_level in requirements_packages:
             continue
         # project file
         if any(module.startswith(pf) or pf.startswith(module) for pf in project_files):
@@ -244,12 +351,18 @@ def _check_types_typescript(path: str, code: str) -> str:
 # ── Project File Extraction ────────────────────────────────────────
 
 
-def extract_project_files(context: dict[str, Any]) -> set[str]:
-    """Build a set of dotted module paths from agent context.
+def extract_project_files(
+    context: dict[str, Any],
+) -> tuple[set[str], set[str]]:
+    """Build sets of dotted module paths and requirements packages.
 
-    Scans ``shubham`` and ``aanya`` outputs for ``generated_files`` /
-    ``file_contents`` keys and converts file paths to Python module paths
-    so ``check_imports`` can recognise project-internal imports.
+    Returns:
+        Tuple of (project_files, requirements_packages).
+
+        * ``project_files`` — dotted module paths from generated code files
+          (e.g. ``{"app.models.user", "app.routers"}``).
+        * ``requirements_packages`` — importable top-level names extracted
+          from the project's ``requirements.txt`` / ``package.json``.
     """
     project_files: set[str] = set()
     for agent in ("shubham", "aanya"):
@@ -262,7 +375,11 @@ def extract_project_files(context: dict[str, Any]) -> set[str]:
         # file_contents dict keys
         for fp in agent_out.get("file_contents", {}):
             _add_module_path(project_files, fp)
-    return project_files
+
+    # Also extract importable package names from requirements.txt
+    req_packages = _extract_requirements_packages(context)
+
+    return project_files, req_packages
 
 
 def _add_module_path(project_files: set[str], fp: str) -> None:
