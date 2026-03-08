@@ -33,6 +33,8 @@ from app.agents.base import (
     register_agent,
     run_agent,
     store_output,
+    check_inbox,
+    format_inbox_for_prompt,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -287,6 +289,10 @@ class SecurityGuardian:
         context: dict[str, Any],
     ) -> AgentResult:
         """Run a full security scan on the pipeline output."""
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         code_files = self._collect_code(context)
 
         # Run all scans

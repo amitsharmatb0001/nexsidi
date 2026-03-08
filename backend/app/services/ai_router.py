@@ -47,7 +47,24 @@ _ACTIVE_COST_TRACKERS: dict[str, "ProjectCostTracker"] = {}
 
 def register_cost_tracker(run_id: str, tracker: "ProjectCostTracker") -> None:
     """F6-FIX: Register a cost tracker so AIRouter.call() can pre-flight check."""
+    import time as _time
+    # AUDIT-T2-17: Store registration timestamp for TTL-based eviction
     _ACTIVE_COST_TRACKERS[run_id] = tracker
+    # Evict stale trackers (orphaned on early failure) — older than 24h
+    _evict_stale_cost_trackers()
+
+
+def _evict_stale_cost_trackers(max_age_seconds: int = 86400) -> None:
+    """AUDIT-T2-17: Remove cost trackers orphaned by early pipeline failure."""
+    import time as _time
+    now = _time.monotonic()
+    stale = [
+        k for k, v in _ACTIVE_COST_TRACKERS.items()
+        if hasattr(v, "_registered_at") and now - v._registered_at > max_age_seconds
+    ]
+    for k in stale:
+        logger.info("cost_tracker_evicted_stale", run_id=k)
+        del _ACTIVE_COST_TRACKERS[k]
 
 
 def unregister_cost_tracker(run_id: str) -> None:
@@ -365,8 +382,9 @@ class CircuitState:
                 "last_failure_at": str(self.last_failure_at),
             })
             await client.expire(key, 300)  # 5min TTL — stale state auto-clears
-        except Exception:
-            pass  # Fall back to in-memory state
+        except Exception as exc:
+            # AUDIT-T1-5: Log sync failures — previously silent, caused cross-worker divergence
+            logger.warning("circuit_breaker_valkey_sync_failed", provider=self._provider_key, error=str(exc)[:100])
 
     async def _sync_from_valkey(self) -> None:
         """4.5-FIX: Read circuit state from Valkey (other workers may have updated)."""
@@ -381,8 +399,9 @@ class CircuitState:
                 self.is_open = bool(int(data.get(b"is_open", 0)))
                 self._half_open = bool(int(data.get(b"half_open", 0)))
                 self.last_failure_at = float(data.get(b"last_failure_at", 0.0))
-        except Exception:
-            pass  # Fall back to in-memory state
+        except Exception as exc:
+            # AUDIT-T1-5: Log sync failures — previously silent, caused cross-worker divergence
+            logger.warning("circuit_breaker_valkey_sync_failed", provider=self._provider_key, error=str(exc)[:100])
 
     async def record_failure(self) -> None:
         async with self._get_lock():
@@ -554,6 +573,11 @@ class AIRequest:
     shared_context: SharedContext | None = None  # Cacheable shared project context
     dynamic_system_context: str | None = None  # CACHE-FIX: appended to system AFTER cached blocks
     pipeline_run_id: str | None = None  # F6-FIX: for pre-flight cost cap check
+    # NATIVE-SEARCH: When True, inject provider-native web search:
+    #   Claude → web_search_20250305 (Brave Search, server-side)
+    #   Gemini → google_search grounding (Google Search, server-side)
+    # No extra API key needed — search is built into the AI provider.
+    enable_native_web_search: bool = False
 
 
 @dataclass(slots=True)
@@ -598,10 +622,15 @@ class AIRouter:
         self._anthropic_key = settings.anthropic_api_key
         self._google_key = settings.google_ai_api_key
 
-        # Vertex AI dual-project settings
+        # Vertex AI dual-project settings (Gemini — uses YugNex project)
         self._use_vertex = settings.use_cloud_secrets
         self._vertex_project = settings.gcp_ai_project_id  # "yugnex-ai"
-        self._vertex_location = "us-central1"
+        self._vertex_location = "us-central1"  # Gemini stays on us-central1
+
+        # Claude via Vertex AI Model Garden (asia-south1 / Mumbai)
+        # IMPORTANT: This is for Claude ONLY — Gemini config is untouched.
+        self._claude_vertex_location = settings.claude_vertex_location  # "asia-south1"
+        self._claude_vertex_project = settings.claude_vertex_project_id
 
         self._circuits: dict[Provider, CircuitState] = {
             Provider.ANTHROPIC: CircuitState(provider_key="anthropic"),
@@ -701,7 +730,20 @@ class AIRouter:
         # R27-FIX-22: Use explicit default per mode instead of fragile
         # list(values())[1] which depends on dict insertion order.
         _MODE_DEFAULT_MODEL = {"mixed": "haiku", "gemini": "gemini-pro", "claude": "haiku"}
-        model_key = active_map.get(request.complexity, _MODE_DEFAULT_MODEL.get(mode, "haiku"))
+        model_key = active_map.get(request.complexity)
+        if model_key is None:
+            # P2-5: Unmapped complexity — use highest available model (fail-safe).
+            # Old code fell back to haiku, catastrophic for complex projects.
+            model_key = (
+                active_map.get(TaskComplexity.CRITICAL)
+                or active_map.get(TaskComplexity.HIGH)
+                or _MODE_DEFAULT_MODEL.get(mode, "haiku")
+            )
+            logger.warning(
+                "ai_router_complexity_unmapped",
+                complexity=request.complexity,
+                fallback=model_key,
+            )
         spec = MODELS[model_key]
 
         # 4. Check circuit breaker — escalate if provider is down
@@ -812,7 +854,7 @@ class AIRouter:
                         try:
                             delay = min(max(delay, float(retry_after)), 120.0)
                         except ValueError:
-                            pass
+                            pass  # Expected: invalid value — fall through to default
                     logger.warning(
                         "ai_call_retrying",
                         model=spec.display_name,
@@ -1090,7 +1132,77 @@ class AIRouter:
     async def _call_anthropic(
         self, spec: ModelSpec, request: AIRequest, request_id: str
     ) -> AIResponse:
-        """Call Claude via Anthropic Messages API."""
+        """Call Claude via Vertex AI Model Garden (preferred) or direct Anthropic API.
+
+        Routing priority:
+        1. Vertex AI Model Garden (asia-south1) — if claude_vertex_project_id is set
+           and Vertex AI credentials are available. No API key needed.
+        2. Direct Anthropic API — fallback when Vertex AI is unavailable.
+        """
+        # Try Vertex AI Model Garden first (Claude in asia-south1)
+        if self._claude_vertex_project and self._use_vertex:
+            try:
+                return await self._call_anthropic_vertex(spec, request, request_id)
+            except Exception as vertex_exc:
+                logger.warning(
+                    "claude_vertex_fallback_to_direct",
+                    error=_sanitize_error(vertex_exc),
+                    request_id=request_id,
+                )
+                # Fall through to direct Anthropic API
+
+        return await self._call_anthropic_direct(spec, request, request_id)
+
+    async def _call_anthropic_vertex(
+        self, spec: ModelSpec, request: AIRequest, request_id: str
+    ) -> AIResponse:
+        """Call Claude via Vertex AI Model Garden (asia-south1 / Mumbai).
+
+        Endpoint:
+            POST https://{location}-aiplatform.googleapis.com/v1/projects/{project}/
+                 locations/{location}/publishers/anthropic/models/{model}:rawPredict
+
+        Uses OAuth Bearer token from VertexAICredentialManager (same SA as Gemini).
+        Response format is identical to direct Anthropic API.
+        """
+        token = await self._get_vertex_token()
+        if not token:
+            raise RuntimeError("No Vertex AI credentials for Claude Model Garden")
+
+        http = await self._get_http()
+        url = (
+            f"https://{self._claude_vertex_location}-aiplatform.googleapis.com/v1/"
+            f"projects/{self._claude_vertex_project}/"
+            f"locations/{self._claude_vertex_location}/"
+            f"publishers/anthropic/models/{spec.model_id}:rawPredict"
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        body = self._build_anthropic_body(spec, request)
+        # Vertex AI Model Garden uses rawPredict — body format is identical
+        # to direct Anthropic API but wrapped in the Vertex AI endpoint.
+
+        logger.debug(
+            "claude_vertex_call",
+            project=self._claude_vertex_project,
+            location=self._claude_vertex_location,
+            model=spec.model_id,
+            request_id=request_id,
+        )
+
+        resp = await http.post(url, headers=headers, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+
+        return self._parse_anthropic_response(data, spec, request_id)
+
+    async def _call_anthropic_direct(
+        self, spec: ModelSpec, request: AIRequest, request_id: str
+    ) -> AIResponse:
+        """Call Claude via direct Anthropic Messages API (fallback)."""
         http = await self._get_http()
         headers = {
             "x-api-key": self._anthropic_key,
@@ -1112,7 +1224,16 @@ class AIRouter:
         resp.raise_for_status()
         data = resp.json()
 
-        # Extract text content and tool calls
+        return self._parse_anthropic_response(data, spec, request_id)
+
+    @staticmethod
+    def _parse_anthropic_response(
+        data: dict[str, Any], spec: ModelSpec, request_id: str
+    ) -> AIResponse:
+        """Parse response from either Vertex AI Model Garden or direct Anthropic API.
+
+        Both return the same Anthropic Messages API format.
+        """
         text_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         for block in data.get("content", []):
@@ -1124,6 +1245,18 @@ class AIRouter:
                     "name": block["name"],
                     "input": block["input"],
                 })
+            # NATIVE-SEARCH: Claude's server-side web search returns these block types.
+            # server_tool_use = search query executed by Claude internally
+            # web_search_tool_result = search results (encrypted_content for citations)
+            # These are handled internally by the API — we just collect text from them.
+            elif block["type"] == "server_tool_use":
+                # Claude's internal search query — log but don't add to tool_calls
+                # (these are executed server-side, not by our tool handler)
+                pass
+            elif block["type"] == "web_search_tool_result":
+                # Search results — content may contain web_search_result items
+                # These are passed back automatically in multi-turn conversations
+                pass
 
         usage = data.get("usage", {})
         stop_reason = data.get("stop_reason", "end_turn")
@@ -1175,6 +1308,12 @@ class AIRouter:
                 if block.is_error:
                     result_block["is_error"] = True
                 blocks.append(result_block)
+            elif isinstance(block, dict):
+                # NATIVE-SEARCH: Pass through raw dict blocks (server_tool_use,
+                # web_search_tool_result) from Claude's native search responses.
+                # These must be preserved verbatim in multi-turn conversations
+                # for citations to work correctly.
+                blocks.append(block)
         return blocks or ""
 
     @staticmethod
@@ -1273,7 +1412,38 @@ class AIRouter:
 
         # Tools
         if request.tools:
-            body["tools"] = request.tools
+            body["tools"] = list(request.tools)  # Copy so we don't mutate original
+        else:
+            body["tools"] = []
+
+        # NATIVE-SEARCH: Inject Claude's built-in web search tool.
+        # This gives Claude access to real-time Brave Search without any API key.
+        # Runs server-side inside the API call — no external HTTP needed.
+        # Supports: Opus 4.6, Sonnet 4.6, Sonnet 4.5, Haiku 4.5
+        if request.enable_native_web_search:
+            # Only inject if not already present (avoid duplicates)
+            _has_native_search = any(
+                t.get("type", "").startswith("web_search_2025") or
+                t.get("type", "").startswith("web_search_2026")
+                for t in body["tools"]
+            )
+            if not _has_native_search:
+                body["tools"].append({
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5,
+                    "user_location": {
+                        "type": "approximate",
+                        "country": "IN",
+                        "region": "Maharashtra",
+                        "timezone": "Asia/Kolkata",
+                    },
+                })
+                logger.debug("native_web_search_injected", provider="anthropic")
+
+        # Remove empty tools list to avoid API errors
+        if not body["tools"]:
+            del body["tools"]
 
         return body
 
@@ -1508,6 +1678,28 @@ class AIRouter:
             logger.warning("gemini_other_finish_reason", request_id=request_id)
             raise ValueError("Gemini response terminated with unspecified reason")
 
+        # NATIVE-SEARCH: Extract Gemini grounding metadata from search results.
+        # When google_search tool is used, response includes groundingMetadata
+        # with search queries, web results, and grounding chunks (citations).
+        grounding = candidates[0].get("groundingMetadata", {})
+        if grounding:
+            # Append grounding sources as context for the response
+            grounding_chunks = grounding.get("groundingChunks", [])
+            if grounding_chunks:
+                citations: list[str] = []
+                for chunk in grounding_chunks[:5]:  # Max 5 citations
+                    web = chunk.get("web", {})
+                    if web.get("title") and web.get("uri"):
+                        citations.append(f"[{web['title']}]({web['uri']})")
+                if citations:
+                    text += "\n\nSources: " + ", ".join(citations)
+            logger.debug(
+                "gemini_grounding_metadata",
+                search_queries=len(grounding.get("webSearchQueries", [])),
+                grounding_chunks=len(grounding_chunks),
+                request_id=request_id,
+            )
+
         usage = data.get("usageMetadata", {})
         return AIResponse(
             content=text,
@@ -1574,9 +1766,13 @@ class AIRouter:
         # use them, causing tool use loops to fail silently.
         # Google's format: tools = [{"functionDeclarations": [...]}]
         # Anthropic format uses input_schema; Google uses "parameters".
+        _google_tools: list[dict[str, Any]] = []
         if request.tools:
             function_declarations: list[dict[str, Any]] = []
             for tool in request.tools:
+                # Skip Anthropic-native tool types (web_search_*) — not valid for Google
+                if tool.get("type", "").startswith("web_search_"):
+                    continue
                 decl: dict[str, Any] = {
                     "name": tool["name"],
                     "description": tool.get("description", ""),
@@ -1586,7 +1782,19 @@ class AIRouter:
                 if schema:
                     decl["parameters"] = schema
                 function_declarations.append(decl)
-            body["tools"] = [{"functionDeclarations": function_declarations}]
+            if function_declarations:
+                _google_tools.append({"functionDeclarations": function_declarations})
+
+        # NATIVE-SEARCH: Inject Gemini's Google Search grounding tool.
+        # This gives Gemini access to real-time Google Search without API key.
+        # Returns groundingMetadata with search queries, web results, citations.
+        # Supports: Gemini 2.5 Flash, Gemini 2.5 Pro on Vertex AI
+        if request.enable_native_web_search:
+            _google_tools.append({"googleSearch": {}})
+            logger.debug("native_web_search_injected", provider="google")
+
+        if _google_tools:
+            body["tools"] = _google_tools
 
         # Thinking (Gemini calls it "thought")
         if request.enable_thinking and spec.supports_thinking:

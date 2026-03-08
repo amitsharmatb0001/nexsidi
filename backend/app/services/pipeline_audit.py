@@ -764,7 +764,7 @@ class PipelineAuditService:
         try:
             self._run_order.remove(pipeline_run_id)
         except ValueError:
-            pass
+            pass  # Expected: invalid value — fall through to default
 
     def _evict_old_runs(self) -> None:
         """MEM-FIX: Evict oldest pipeline runs when over capacity."""

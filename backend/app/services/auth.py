@@ -20,6 +20,10 @@ from jwt.exceptions import PyJWTError as JWTError
 
 from app.config import get_settings
 
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 # bcrypt max input is 72 bytes — we truncate to prevent ValueError
 _BCRYPT_MAX_BYTES = 72
 

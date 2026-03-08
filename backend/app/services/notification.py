@@ -347,12 +347,73 @@ class NotificationService:
         )
 
     async def _send_email(self, payload: NotificationPayload) -> None:
-        """Queue email notification (in production: SMTP via async worker)."""
-        logger.debug(
-            "email_notification_queued",
-            title=payload.title,
-            user_id=payload.user_id,
-        )
+        """Send email notification via ZeptoMail SMTP.
+
+        AUDIT-B1-FIX: Previously this was a logging stub that never sent emails.
+        Now wired to the real email.py SMTP service.
+        """
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        from app.config import get_settings
+        from app.services.email import _send_email as _smtp_send
+
+        settings = get_settings()
+        if not settings.has_email:
+            logger.warning(
+                "email_notification_skipped: email not configured",
+                title=payload.title,
+                user_id=payload.user_id,
+            )
+            return
+
+        sender = settings.zeptomail_sender_email or "noreply@nexsidi.com"
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = payload.title[:200]
+        msg["From"] = sender
+        # AUDIT-B1-FIX: We don't have user email in the payload.
+        # Look up from DB if needed, or use a placeholder for web-only users.
+        to_email = (payload.data or {}).get("email", "")
+        if not to_email:
+            logger.debug(
+                "email_notification_skip: no email in payload data",
+                user_id=payload.user_id,
+            )
+            return
+
+        msg["To"] = to_email
+
+        # Plain text
+        msg.attach(MIMEText(payload.body, "plain"))
+
+        # HTML version
+        html_body = f"""\
+<html>
+  <body style="font-family:Arial,sans-serif;color:#222;">
+    <h2>{payload.title}</h2>
+    <p>{payload.body}</p>
+    {"<p><a href='" + payload.link + "'>View Details</a></p>" if payload.link else ""}
+    <hr style="margin-top:32px;border:none;border-top:1px solid #eee;">
+    <p style="color:#888;font-size:12px;">NexSidi Notification</p>
+  </body>
+</html>"""
+        msg.attach(MIMEText(html_body, "html"))
+
+        sent = await _smtp_send(msg)
+        if sent:
+            logger.info(
+                "email_notification_sent",
+                title=payload.title,
+                user_id=payload.user_id,
+                to_email=to_email[:50],
+            )
+        else:
+            logger.error(
+                "email_notification_failed",
+                title=payload.title,
+                user_id=payload.user_id,
+            )
 
     # ── Rate Limiting ─────────────────────────────────────────────
 

@@ -425,6 +425,133 @@ async def init_prompt_engine() -> PromptEngine:
     return _engine
 
 
+def get_template(name: str) -> PromptTemplate | None:
+    """Convenience: look up a template from the global registry.
+
+    This is the function DynamicPromptBuilder calls. Returns None if the
+    template doesn't exist (safe to use before any templates are registered).
+    """
+    return _registry.get(name)
+
+
+def render_prompt_template(
+    template: PromptTemplate,
+    variables: dict[str, str],
+) -> str:
+    """Render a PromptTemplate's system_prompt with variables.
+
+    Convenience wrapper around render_template() that auto-provides
+    the allowed_variables from the template.
+    """
+    allowed = template.allowed_variables if template.allowed_variables is not None else None
+    return render_template(template.system_prompt, variables, allowed)
+
+
+# ── Base Agent Templates ────────────────────────────────────────────
+# Seed the registry with base-role templates for every agent.
+# These are intentionally minimal — DynamicPromptBuilder layers
+# knowledge, lessons, framework rules, and warnings on top.
+
+_INITIAL_TEMPLATES: dict[str, PromptTemplate] = {
+    "tilotma_base_role": PromptTemplate(
+        name="tilotma_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Tilotma, the Requirements Analyst agent. "
+            "Extract structured requirements from user input: features, "
+            "tech stack, pages, endpoints, database tables, auth, deployment."
+        ),
+    ),
+    "vikram_base_role": PromptTemplate(
+        name="vikram_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Vikram, the Software Architect agent. "
+            "Design the system architecture: folder structure, contracts, "
+            "API schemas, database models, component hierarchy."
+        ),
+    ),
+    "saanvi_base_role": PromptTemplate(
+        name="saanvi_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Saanvi, the Requirements Analysis agent. "
+            "Refine and validate requirements, resolve ambiguities, "
+            "identify missing pieces, and produce a complete spec."
+        ),
+    ),
+    "vanya_base_role": PromptTemplate(
+        name="vanya_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Vanya, the UI/UX Design agent. "
+            "Create component designs, page layouts, design tokens, "
+            "responsive breakpoints, and accessibility specs."
+        ),
+    ),
+    "dhruv_base_role": PromptTemplate(
+        name="dhruv_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Dhruv, the Database Engineer agent. "
+            "Generate DDL, migrations, seed data, indexes, and "
+            "connection configs for the chosen database."
+        ),
+    ),
+    "shubham_base_role": PromptTemplate(
+        name="shubham_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Shubham, the Backend Engineer agent. "
+            "Generate production-quality backend code: routes, controllers, "
+            "middleware, auth, models, services, tests."
+        ),
+    ),
+    "aanya_base_role": PromptTemplate(
+        name="aanya_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Aanya, the Frontend Engineer agent. "
+            "Generate production-quality frontend code: pages, components, "
+            "state management, API integration, styling."
+        ),
+    ),
+    "karan_base_role": PromptTemplate(
+        name="karan_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Karan, the Security Auditor agent. "
+            "Review all generated code for security vulnerabilities: "
+            "injection, XSS, CSRF, auth bypass, secrets exposure."
+        ),
+    ),
+    "fixer_base_role": PromptTemplate(
+        name="fixer_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are the Fixer agent. "
+            "Fix code errors found by testing and security audit: "
+            "syntax, logic, type errors, security findings."
+        ),
+    ),
+    "pranav_base_role": PromptTemplate(
+        name="pranav_base_role",
+        version="1.0.0",
+        system_prompt=(
+            "You are Pranav, the Deployment & Evaluation agent. "
+            "Generate deployment configs (Docker, CI/CD, cloud) "
+            "and evaluate overall project quality."
+        ),
+    ),
+}
+
+# Register all initial templates at import time
+for _tmpl in _INITIAL_TEMPLATES.values():
+    _registry.register(_tmpl)
+
+logger.info("prompt_engine_templates_seeded", count=len(_INITIAL_TEMPLATES))
+
+
 async def shutdown_prompt_engine() -> None:
     """Shutdown the Prompt Engine. Call at app shutdown.
 

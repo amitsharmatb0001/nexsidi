@@ -22,6 +22,9 @@ Secret mapping (GCP secret name -> env var):
     ZEPTOMAIL_SMTP_PORT     -> ZEPTOMAIL_SMTP_PORT
     ZEPTOMAIL_SMTP_SERVER   -> ZEPTOMAIL_SMTP_SERVER
     ZEPTOMAIL_USERNAME      -> ZEPTOMAIL_USERNAME
+    FIRECRAWL_API_KEY       -> FIRECRAWL_API_KEY
+    GOOGLE_CSE_API_KEY      -> GOOGLE_CSE_API_KEY
+    GOOGLE_CSE_ID           -> GOOGLE_CSE_ID
 
 DATABASE_URL is constructed from:
     DB_USER     (env var, default: nexsidi_app)
@@ -58,6 +61,10 @@ SECRET_TO_ENV: dict[str, str] = {
     "ZEPTOMAIL_SMTP_PORT": "ZEPTOMAIL_SMTP_PORT",
     "ZEPTOMAIL_SMTP_SERVER": "ZEPTOMAIL_SMTP_SERVER",
     "ZEPTOMAIL_USERNAME": "ZEPTOMAIL_USERNAME",
+    # Agentic pipeline secrets
+    "FIRECRAWL_API_KEY": "FIRECRAWL_API_KEY",
+    "GOOGLE_CSE_API_KEY": "GOOGLE_CSE_API_KEY",
+    "GOOGLE_CSE_ID": "GOOGLE_CSE_ID",
 }
 
 # Cache TTL for secrets (15 minutes)

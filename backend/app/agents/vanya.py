@@ -27,6 +27,9 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai_with_tools,
+    check_inbox,
+    format_inbox_for_prompt,
+    notify_agents,
     register_agent,
     run_agent,
     store_output,
@@ -111,6 +114,11 @@ class VanyaToolHandler:
             # WCAG contrast checks
             bg_rgb = _hex_to_rgb(colors.get("background", ""))
             text_rgb = _hex_to_rgb(colors.get("text_primary", ""))
+            # AUDIT-T2-10: Warn when hex is invalid instead of silently skipping contrast check
+            if colors.get("background") and not bg_rgb:
+                warnings.append(f"Invalid hex color for 'background': '{colors.get('background')}' — contrast check skipped")
+            if colors.get("text_primary") and not text_rgb:
+                warnings.append(f"Invalid hex color for 'text_primary': '{colors.get('text_primary')}' — contrast check skipped")
             if bg_rgb and text_rgb:
                 ratio = _contrast_ratio(bg_rgb, text_rgb)
                 if ratio < 4.5:
@@ -125,6 +133,8 @@ class VanyaToolHandler:
                     )
 
             text2_rgb = _hex_to_rgb(colors.get("text_secondary", ""))
+            if colors.get("text_secondary") and not text2_rgb:
+                warnings.append(f"Invalid hex color for 'text_secondary': '{colors.get('text_secondary')}' — contrast check skipped")
             if bg_rgb and text2_rgb:
                 ratio = _contrast_ratio(bg_rgb, text2_rgb)
                 if ratio < 4.5:
@@ -308,6 +318,10 @@ class Vanya:
         context: dict[str, Any],
     ) -> AgentResult:
         """Generate UI/UX design specs from architecture contract."""
+        # PHASE-3: Check inbox for messages from other agents
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         vikram_output = context.get("vikram")
         if not vikram_output:
             return AgentResult(
@@ -356,6 +370,26 @@ class Vanya:
             "complete spec (design_tokens + page_specs + component_specs)"
         )
 
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            _frontend_fw = contract.get("tech_stack", {}).get("frontend", "")
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "ui_design",
+                    "framework": _frontend_fw,
+                    "task_summary": f"Design UI/UX for {project_name} ({len(pages)} pages)",
+                    "previous_agent_outputs": {
+                        "vikram": f"Contract with {len(pages)} pages",
+                    },
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
+
         import orjson
         pages_json = orjson.dumps(pages).decode("utf-8")
 
@@ -367,6 +401,16 @@ class Vanya:
             "</project_context>\n\n"
             "Generate the UI/UX design specification for the pages described above."
         )
+
+        # PHASE-3: Inject inbox messages into prompt context
+        if inbox_context:
+            user_content = f"{inbox_context}\n\n{user_content}"
+            # AUTHORITY directives from Tilotma/Vikram override normal flow
+            if "AUTHORITY" in inbox_context:
+                system_prompt += (
+                    "\n\n⚠ AUTHORITY DIRECTIVE RECEIVED — you MUST comply:\n"
+                    + inbox_context
+                )
 
         # FIX-40: Inject rejected approaches
         from app.agents.base import build_rejection_context
@@ -419,6 +463,13 @@ class Vanya:
             logger.warning("vanya_self_eval_failed", exc_info=True)
 
         await store_output(self, pipeline_run_id, output)
+
+        # PHASE-3: Notify agents that design specs are ready
+        await notify_agents(
+            self.name, pipeline_run_id,
+            f"Design specs complete for {project_name} ({len(pages)} pages). "
+            f"Tokens validated: {handler._tokens_validated}, Spec validated: {handler._spec_validated}.",
+        )
 
         return AgentResult(
             agent_name=self.name,

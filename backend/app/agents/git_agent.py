@@ -21,7 +21,7 @@ from __future__ import annotations
 import base64  # GIT-FIX
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -31,13 +31,26 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
     register_agent,
     run_agent,
     store_output,
+    check_inbox,
+    format_inbox_for_prompt,
 )
 from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
+
+
+def _get_github_api_base() -> str:
+    """Get GitHub API base URL from config (avoids hardcoded URLs)."""
+    try:
+        from app.config import get_settings
+        return get_settings().github_api_base_url
+    except Exception:
+        return "https://api.github.com"
 
 
 class GitProvider(str, Enum):
@@ -191,23 +204,6 @@ class GitOperationResult:
 
 
 @dataclass(slots=True)
-class TokenSession:
-    """In-memory token session for Git operations.
-
-    Token is held only for the duration of the operation.
-    """
-
-    token_id: str                    # Unique ID for audit logging
-    provider: GitProvider
-    created_at_mono: float = 0.0     # monotonic time for timeout
-    max_retries: int = 1
-    retries_used: int = 0
-    is_destroyed: bool = False
-
-    def destroy(self) -> None:
-        """Mark token as destroyed (actual token is in caller's scope)."""
-        self.is_destroyed = True
-
 
 class GitAgent:
     """Git Agent -- manages source code repositories.
@@ -223,8 +219,8 @@ class GitAgent:
 
     @property
     def tools(self) -> list:
-        """No tools — Git Agent is pure automation, no AI tool loop."""
-        return []
+        """Web search tools for looking up Git/GitHub API docs."""
+        return [WEB_SEARCH_TOOL, WEB_SCRAPE_TOOL]
 
     async def run(
         self,
@@ -246,6 +242,10 @@ class GitAgent:
         2. Push backend + frontend code
         3. Create PR with structured description
         """
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         contract = context.get("vikram", {}).get("contract", {})
         if not contract:
             return AgentResult(
@@ -365,7 +365,7 @@ class GitAgent:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.request(
                 method,
-                f"https://api.github.com{path}",
+                f"{_get_github_api_base()}{path}",
                 headers=headers,
                 json=json,
             )
@@ -752,22 +752,6 @@ def _collect_files(context: dict[str, Any], agent_key: str) -> dict[str, str]:
 
 
 # Token audit helper
-def log_token_event(
-    event_type: str,
-    provider: str,
-    repo_url: str = "",
-    token_id: str = "",
-) -> None:
-    """Audit log for token lifecycle events. NEVER logs the actual token."""
-    logger.info(
-        "git_token_event",
-        event_type=event_type,
-        provider=provider,
-        repo_url=repo_url,
-        token_id=token_id,
-    )
 
-
-# Register
 _git_agent = GitAgent()
 register_agent(_git_agent)

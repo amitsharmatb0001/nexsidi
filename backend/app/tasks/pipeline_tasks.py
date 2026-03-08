@@ -168,13 +168,13 @@ async def _shutdown_services() -> None:
         from app.services.agent_message_bus import shutdown_agent_message_bus
         await shutdown_agent_message_bus()
     except Exception:
-        pass
+        pass  # Non-critical — error logged upstream or handled by caller
 
     try:
         from app.services.pipeline_events import shutdown_pipeline_events
         await shutdown_pipeline_events()
     except Exception:
-        pass
+        pass  # Non-critical — error logged upstream or handled by caller
 
     # R26-FIX-35: Close shared Valkey pool AFTER services that use it,
     # but BEFORE DB close. Previously leaked 20 connections per worker shutdown.
@@ -290,6 +290,34 @@ async def _run_pipeline_async(
         execution_mode=execution_mode,
     )
 
+    # Feature flag: Use LangGraph StateGraph or legacy while-loop
+    from app.config import get_settings
+    _settings = get_settings()
+
+    if _settings.enable_langgraph:
+        # LangGraph path: dynamic graph with conditional edges, crash recovery
+        from app.services.pipeline_graph import run_pipeline_graph
+
+        logger.info("pipeline_using_langgraph", run_id=run.run_id)
+        graph_result = await run_pipeline_graph(
+            run_id=run.run_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            project_id=project_id,
+            context=run.context,
+            execution_mode=execution_mode,
+        )
+
+        # Map graph result back to pipeline run format
+        return {
+            "run_id": run.run_id,
+            "status": graph_result.get("status", "unknown"),
+            "current_stage": graph_result.get("current_stage", "completed"),
+            "context_keys": list(graph_result.get("context", {}).keys()),
+            "error": graph_result.get("error"),
+        }
+
+    # Legacy path: sequential while-loop orchestrator
     # run_pipeline() persists state after every stage.  If the worker
     # crashes, the DB has the latest state for resume.
     result = await orch.run_pipeline(run)
@@ -447,7 +475,7 @@ try:
         logger.info("celery_worker_shutdown_complete")
 except ImportError:
     # Celery not installed — skip signal registration
-    pass
+    pass  # Expected: optional dependency not installed
 
 
 # ── Celery task definitions ──────────────────────────────────────

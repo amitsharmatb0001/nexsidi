@@ -28,10 +28,14 @@ from app.agents.base import (
     AgentInterruptRequest,
     AgentResult,
     AgentStatus,
+    ASK_AGENT_TOOL,
     INTERRUPT_TOOL,
     ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
     call_ai_with_tools,
     clamp_completeness,
+    handle_web_tool,
     register_agent,
     run_agent,
     store_output,
@@ -260,6 +264,10 @@ AANYA_TOOLS = [
     ),
     # I1-FIX: Dynamic agent re-dispatch
     INTERRUPT_TOOL,
+    # AGENTIC-FIX: Inter-agent communication + web research
+    ASK_AGENT_TOOL,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
 ]
 
 
@@ -289,8 +297,8 @@ class AanyaToolHandler:
             self._verification_rules = mistake_memory.build_validation_rules(
                 "aanya", "frontend_generation", ""
             )
-        except Exception:
-            pass
+        except Exception as _mm_exc:
+            logger.debug("mistake_memory_init_failed", error=str(_mm_exc)[:200])
 
         # CHANGE-2: Persistent gate instance (loop detection history preserved)
         # + rejection counter for max-rejection cap.
@@ -298,6 +306,9 @@ class AanyaToolHandler:
         self._gate = VerificationGate(extra_rules=self._verification_rules)
         self._rejection_counts: dict[str, int] = {}
         self._unresolved: dict[str, list[str]] = {}
+        # AUDIT-T2-2: Initialize counters properly instead of fragile getattr pattern
+        self._consecutive_rejections: int = 0
+        self._consecutive_errors: int = 0
         # CHANGE-4: Export registry for hallucination detection
         self._export_registry: dict[str, set[str]] = {}
 
@@ -313,11 +324,20 @@ class AanyaToolHandler:
 
         if tool_name == "write_file":
             if "REJECTED" in result:
-                self._consecutive_rejections = getattr(self, "_consecutive_rejections", 0) + 1
+                # AUDIT-T3-4: Track rejection reason — only escalate if same error repeats
+                _rejection_reason = result[:200]
+                _last_reason = getattr(self, "_last_rejection_reason", "")
+                self._last_rejection_reason = _rejection_reason
+                if _rejection_reason != _last_reason:
+                    # Different rejection reason — reset counter
+                    self._consecutive_rejections = 1
+                else:
+                    self._consecutive_rejections = getattr(self, "_consecutive_rejections", 0) + 1
                 if adaptive:
                     adaptive.on_verification_fail()
                 if self._consecutive_rejections >= 3:
                     self._consecutive_rejections = 0
+                    self._last_rejection_reason = ""
                     return Observation(
                         needs_escalation=True,
                         override_result=result + "\n\n⚡ MODEL ESCALATED: Switching to more capable model.",
@@ -338,6 +358,11 @@ class AanyaToolHandler:
         return Observation()
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        # AGENTIC-FIX: Delegate shared tools (web_search, web_scrape, ask_agent)
+        shared_result = await handle_web_tool(tool_name, tool_input)
+        if shared_result is not None:
+            return shared_result
+
         if tool_name == "write_file":
             return await self._write_file(**tool_input)
         elif tool_name == "read_file":
@@ -549,9 +574,10 @@ class AanyaToolHandler:
         )
 
         try:
-            from app.services.ai_router import AIRouter, AIRequest, AIMessage
+            from app.services.ai_router import get_ai_router, AIRequest, AIMessage
             from app.agents.base import TaskComplexity
-            router = AIRouter()
+            # AUDIT-T1-10: Use singleton — AIRouter() creates orphaned instances
+            router = get_ai_router()
             response = await router.call(AIRequest(
                 messages=[AIMessage(role="user", content=review_prompt)],
                 complexity=TaskComplexity.LOW,
@@ -728,13 +754,13 @@ def _load_config(contract: dict[str, Any]) -> Any:
         try:
             return get_frontend_framework_config(key)
         except (ValueError, KeyError):
-            pass
+            pass  # Expected: resolved key not found — fall through to direct name
 
     # Try direct name
     try:
         return get_frontend_framework_config(frontend_name)
     except (ValueError, KeyError):
-        pass
+        pass  # Expected: direct name not found — fall through to fallback
 
     # Ultimate fallback: nextjs
     return get_frontend_framework_config("nextjs")
@@ -768,7 +794,7 @@ def get_generation_order(framework: str) -> list[dict[str, str]]:
         config = get_frontend_framework_config(framework)
         return [dict(step) for step in config.generation_order]
     except (ValueError, KeyError):
-        pass
+        pass  # Expected: config not registered — fall through to legacy orders
 
     return FRAMEWORK_GENERATION_ORDERS.get(framework, NEXTJS_GENERATION_ORDER)
 
@@ -785,7 +811,7 @@ def get_rules(framework: str) -> list[str]:
         config = get_frontend_framework_config(framework)
         return list(config.rules)
     except (ValueError, KeyError):
-        pass
+        pass  # Expected: config not registered — fall through to legacy rules
 
     return FRONTEND_RULES.get(framework, DEFAULT_FRONTEND_RULES)
 
@@ -936,6 +962,44 @@ class Aanya:
             user_feedback=(user_feedback + _rejection_ctx) if _rejection_ctx else user_feedback,
         )
 
+        # PHASE-3: Check inbox for messages from other agents
+        _prev_outputs = {
+            "vikram": f"Contract for {contract.get('project_name', 'project')}",
+            "shubham": f"Backend: {len(backend_file_contents)} files",
+            "vanya": f"Design spec: {bool(vanya_output.get('design_spec'))}",
+        }
+        try:
+            from app.agents.base import check_inbox, format_inbox_for_prompt
+            _inbox_msgs = await check_inbox(self.name, pipeline_run_id)
+            if _inbox_msgs:
+                _inbox_text = format_inbox_for_prompt(_inbox_msgs)
+                _prev_outputs["_agent_messages"] = _inbox_text
+                # AUTHORITY directives from Tilotma/Vikram override normal flow
+                if "AUTHORITY" in _inbox_text:
+                    system_prompt += (
+                        "\n\n⚠ AUTHORITY DIRECTIVE RECEIVED — you MUST comply:\n"
+                        + _inbox_text
+                    )
+        except Exception as _ib_exc:
+            logger.debug("aanya_inbox_failed", error=str(_ib_exc)[:100])
+
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "frontend_generation",
+                    "framework": frontend_framework,
+                    "task_summary": f"Generate {framework_display} frontend ({len(generation_order)} files)",
+                    "previous_agent_outputs": _prev_outputs,
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
+
         try:
             response = await call_ai_with_tools(
                 self,
@@ -968,8 +1032,8 @@ class Aanya:
                 tracker = get_run_cost_tracker(pipeline_run_id)
                 if tracker is not None:
                     await tracker.record(response, agent_name=self.name, model_key="high")
-            except Exception:
-                pass  # Cost tracking is non-fatal
+            except Exception as _cost_exc:
+                logger.debug("cost_tracking_failed", error=str(_cost_exc)[:200])
 
         except Exception as exc:
             # R28-FIX-1: Sanitize exceptions so API keys never appear in logs or
@@ -1066,8 +1130,8 @@ class Aanya:
                         )
                         if _lessons:
                             guidance_parts.append(_lessons[:500])
-                    except Exception:
-                        pass
+                    except Exception as _mm_exc:
+                        logger.debug("mistake_memory_lookup_failed", error=str(_mm_exc)[:200])
                     system_prompt = system_prompt + "\n".join(guidance_parts)
 
             logger.warning(
@@ -1117,6 +1181,85 @@ class Aanya:
             "goal_tracker": goal_tracker.summary(),  # PHASE-H
             "adaptive_complexity": adaptive.summary(),  # PHASE-I
         }
+
+        # PHASE-2: Agent self-testing — start frontend and test pages in browser
+        try:
+            from app.services.agent_sandbox import AgentSandbox
+            from app.services.project_workspace import get_workspace
+            _ws = get_workspace(pipeline_run_id)
+            for _fp, _fc in generated_files.items():
+                _ws.write_file(_fp, _fc, agent=self.name)
+            _sandbox = AgentSandbox(run_id=pipeline_run_id, workspace_path=_ws.get_docker_bind_mount())
+            _start = await _sandbox.start_frontend(framework=frontend_framework)
+            if _start.get("status") in ("running", "simulated", "started_unhealthy"):
+                # Test each page from the contract
+                _pages = contract.get("frontend", {}).get("pages", [])
+                _test_results = []
+                for _pg in _pages[:8]:  # Test first 8 pages
+                    _route = _pg.get("route", "/")
+                    _tr = await _sandbox.test_page(path=_route)
+                    _test_results.append({
+                        "route": _route,
+                        "loaded": _tr.loaded,
+                        "js_errors": len(_tr.js_errors),
+                        "missing_elements": _tr.missing_elements,
+                        "error": _tr.error,
+                    })
+                output["self_test_results"] = {
+                    "server_started": True,
+                    "simulated": _start.get("status") == "simulated",
+                    "pages_tested": len(_test_results),
+                    "pages_loaded": sum(1 for t in _test_results if t["loaded"]),
+                    "details": _test_results,
+                }
+                logger.info(
+                    "frontend_self_test_complete",
+                    tested=len(_test_results),
+                    loaded=sum(1 for t in _test_results if t["loaded"]),
+                    simulated=_start.get("status") == "simulated",
+                )
+            else:
+                output["self_test_results"] = {
+                    "server_started": False,
+                    "error": _start.get("error", "Frontend start failed"),
+                }
+                logger.warning("frontend_self_test_server_failed", status=_start.get("status"))
+            await _sandbox.cleanup()
+        except Exception as _st_exc:
+            logger.warning("frontend_self_test_skipped", error=str(_st_exc)[:200])
+
+        # PHASE-3: Report failures to Shubham if self-test found broken endpoints
+        try:
+            _self_test = output.get("self_test_results", {})
+            _failed_pages = [
+                d for d in _self_test.get("details", [])
+                if not d.get("loaded") and d.get("error")
+            ]
+            if _failed_pages:
+                from app.agents.base import report_error_to_agent
+                for _fp in _failed_pages[:3]:  # Report first 3
+                    await report_error_to_agent(
+                        from_agent=self.name,
+                        to_agent="shubham",
+                        pipeline_run_id=pipeline_run_id,
+                        error_type="broken_page",
+                        file_path=_fp.get("route", "/"),
+                        description=f"Page failed to load: {_fp.get('error', 'unknown')}",
+                    )
+            # Notify others about frontend completion
+            from app.agents.base import notify_agents
+            await notify_agents(
+                from_agent=self.name,
+                pipeline_run_id=pipeline_run_id,
+                message=(
+                    f"Frontend generation complete: {len(generated_files)} files, "
+                    f"{framework_display} framework. "
+                    f"Self-test: {_self_test.get('pages_loaded', 'N/A')}/{_self_test.get('pages_tested', 'N/A')} pages loaded."
+                ),
+                to_agents=["karan", "aarav"],
+            )
+        except Exception as _notify_exc:
+            logger.debug("aanya_notify_failed", error=str(_notify_exc)[:100])
 
         await store_output(self, pipeline_run_id, output)
 
@@ -1292,8 +1435,8 @@ class Aanya:
             tracker = get_run_cost_tracker(pipeline_run_id)
             if tracker is not None:
                 await tracker.record(response, agent_name=self.name, model_key="low")
-        except Exception:
-            pass
+        except Exception as _cost_exc:
+            logger.debug("cost_tracking_failed", error=str(_cost_exc)[:200])
 
         from app.utils.json_parser import parse_json
         result = parse_json(response.content, fallback={})
@@ -1632,8 +1775,8 @@ class Aanya:
                     "Pay EXTRA attention to avoiding these error types."
                 )
                 prompt_parts.append("\n".join(warning_parts))
-        except Exception:
-            pass  # Non-fatal — proceed without lessons
+        except Exception as _mm_exc:
+            logger.debug("mistake_memory_prompt_failed", error=str(_mm_exc)[:200])
 
         return "\n".join(prompt_parts)
 

@@ -126,8 +126,9 @@ class ValKeyRateLimiter:
             # FIX-49: Escalating alerts — track consecutive failures.
             # An attacker could DDoS Valkey to disable rate limiting.
             # After 5 consecutive failures, escalate to ERROR level.
-            _consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
-            self._consecutive_failures = _consecutive_failures
+            # AUDIT-T2-8: Use properly initialized attr instead of fragile getattr
+            self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+            _consecutive_failures = self._consecutive_failures
             if _consecutive_failures > 5:
                 logger.error(
                     "rate_limiter_persistent_failure",

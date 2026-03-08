@@ -51,6 +51,19 @@ ruff>=0.8.0
 # GCS object storage for K8s code delivery (already pulled by google-cloud-secret-manager)
 # google-cloud-storage>=2.18.0
 
+# Agentic pipeline (LangGraph state machine with crash recovery)
+langgraph>=0.3.0
+langgraph-checkpoint-postgres>=2.0.0
+
+# Web search for agents (Firecrawl)
+firecrawl-py>=1.0.0
+
+# Claude SDK (Vertex AI Model Garden fallback to direct API)
+anthropic>=1.0.0
+
+# Vector memory (pgvector on existing PostgreSQL — no new DB needed)
+pgvector>=0.3.0
+
 # Utilities
 python-dotenv>=1.0.1
 orjson>=3.10.0

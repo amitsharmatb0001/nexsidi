@@ -26,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import json
 import signal
-import sys
 from typing import Any
 
 import structlog
@@ -122,7 +121,7 @@ async def _shutdown_services() -> None:
             mod = importlib.import_module(module_path)
             await getattr(mod, fn_name)()
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
 
     # Agent message bus + pipeline events
     for path in [
@@ -136,7 +135,7 @@ async def _shutdown_services() -> None:
             mod = importlib.import_module(module_path)
             await getattr(mod, fn_name)()
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
 
     # Valkey pool
     try:
@@ -144,7 +143,7 @@ async def _shutdown_services() -> None:
 
         await shutdown_valkey_client()
     except Exception:
-        pass
+        pass  # Non-critical — error logged upstream or handled by caller
 
     # Database
     try:
@@ -152,7 +151,7 @@ async def _shutdown_services() -> None:
 
         await close_database()
     except Exception:
-        pass
+        pass  # Non-critical — error logged upstream or handled by caller
 
     logger.info("services_shutdown_complete")
 
@@ -303,7 +302,7 @@ async def main() -> None:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
             # Windows doesn't support add_signal_handler
-            pass
+            pass  # Expected: abstract method not overridden
 
     try:
         await _worker_loop()

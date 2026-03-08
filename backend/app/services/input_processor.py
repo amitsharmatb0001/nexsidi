@@ -15,7 +15,6 @@ RequirementInput that the pipeline's REQUIREMENTS stage can consume.
 
 from __future__ import annotations
 
-import mimetypes
 import re
 from dataclasses import dataclass, field
 from enum import Enum

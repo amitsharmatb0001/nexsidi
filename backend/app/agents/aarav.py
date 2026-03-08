@@ -40,9 +40,13 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
     register_agent,
     run_agent,
     store_output,
+    check_inbox,
+    format_inbox_for_prompt,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -161,8 +165,8 @@ class Aarav:
 
     @property
     def tools(self) -> list:
-        """No tools — Aarav is pure automation, no AI tool loop."""
-        return []
+        """Web search tools for researching test frameworks and error solutions."""
+        return [WEB_SEARCH_TOOL, WEB_SCRAPE_TOOL]
 
     async def run(
         self,
@@ -190,6 +194,10 @@ class Aarav:
         8. Security scanning (bandit, safety, npm audit)
         9. Database verification (tables, constraints, seed data)
         """
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         sandbox_start = time.monotonic()
         report = SandboxTestReport(sandbox_id=pipeline_run_id)
 
@@ -224,8 +232,27 @@ class Aarav:
         # `pip install` or `npm install` executes the package's setup.py.
         pre_sec = await self._phase_pre_security_scan(context)
         report.add(pre_sec)
-        # Non-blocking: pre-scan warnings don't stop the build, but they
-        # are recorded in the report for visibility.
+        # P1-4: Block build if pre-scan found CRITICAL findings (typosquat/malicious).
+        if pre_sec.errors:
+            critical_findings = [
+                f for f in pre_sec.errors
+                if any(kw in f.get("type", "") or kw in f.get("details", "")
+                       for kw in ("typosquat", "malicious", "install-script"))
+            ]
+            if critical_findings:
+                logger.error("pre_security_scan_blocking", findings=critical_findings)
+                report.add(TestPhaseResult(
+                    phase=TestPhase.SECURITY_SCAN,
+                    status=TestStatus.FAILED,
+                    errors=[{
+                        "type": "security_block",
+                        "details": f"BLOCKED: {len(critical_findings)} critical security finding(s) in dependencies",
+                    }],
+                    output="Build blocked: dangerous packages detected in dependency files.",
+                ))
+                result = self._build_result(report, sandbox_start)
+                await store_output(self, pipeline_run_id, result.output)
+                return result
         if _check_timeout("pre_security_scan"):
             result = self._build_result(report, sandbox_start)
             await store_output(self, pipeline_run_id, result.output)
@@ -304,10 +331,32 @@ class Aarav:
             await store_output(self, pipeline_run_id, result.output)
             return result
 
+        # Phase 7.5 (Directive 2): Visual Matrix Testing — multi-viewport screenshots
+        visual_matrix_result = await self._phase_visual_matrix_test(
+            pipeline_run_id, contract, context,
+        )
+        if visual_matrix_result is not None:
+            report.add(visual_matrix_result)
+        if _check_timeout("visual_matrix_test"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
         # Phase 8: Security Scanning (NEW — bandit, safety, npm audit)
         security_result = await self._phase_security_scan(pipeline_run_id, contract)
         report.add(security_result)
         if _check_timeout("security_scan"):
+            result = self._build_result(report, sandbox_start)
+            await store_output(self, pipeline_run_id, result.output)
+            return result
+
+        # Phase 8.5 (Directive 2): Mobile Visual Testing — build + emulator test
+        mobile_visual_result = await self._phase_mobile_visual_test(
+            pipeline_run_id, contract, context,
+        )
+        if mobile_visual_result is not None:
+            report.add(mobile_visual_result)
+        if _check_timeout("mobile_visual_test"):
             result = self._build_result(report, sandbox_start)
             await store_output(self, pipeline_run_id, result.output)
             return result
@@ -318,6 +367,10 @@ class Aarav:
 
         # STORE-FIX: Persist output to context engine for downstream agents
         result = self._build_result(report, sandbox_start)
+
+        # Phase 2B (Directive 2): Attach visual test report to output
+        # for downstream consumers (checkpoint.py, tilotma.py).
+        result.output["visual_test_report"] = self._collect_visual_report(report)
 
         # ── AI test analysis: LLM analyzes failures and provides triage ──
         try:
@@ -959,8 +1012,8 @@ class Aarav:
                                         "line": dep_type,
                                         "issue": f"Git/HTTP dependency: {dep_name}@{dep_ver}",
                                     })
-                    except Exception:
-                        pass  # Unparseable package.json — will fail in build anyway
+                    except Exception as _pkg_exc:
+                        logger.debug("package_json_parse_failed", path=path, error=str(_pkg_exc)[:200])
 
             elapsed = (time.monotonic() - phase_start) * 1000
 
@@ -968,7 +1021,7 @@ class Aarav:
                 logger.warning("pre_security_scan_findings", count=len(findings), findings=findings[:5])
                 return TestPhaseResult(
                     phase=TestPhase.SECURITY_SCAN,
-                    status=TestStatus.PASSED if len(findings) < 5 else TestStatus.FAILED,
+                    status=TestStatus.PASSED if len(findings) == 0 else TestStatus.FAILED,
                     duration_ms=elapsed,
                     tests_total=len(file_contents),
                     tests_passed=len(file_contents) - len(findings),
@@ -996,6 +1049,279 @@ class Aarav:
                 errors=[{"type": "exception", "details": _sanitize_error(exc)}],
             )
 
+    # ── Phase 7.5 + 8.5: Visual Testing (Directive 2) ──────────────
+
+    async def _phase_visual_matrix_test(
+        self,
+        pipeline_run_id: str,
+        contract: dict[str, Any],
+        context: dict[str, Any],
+    ) -> TestPhaseResult | None:
+        """Phase 7.5 (Directive 2): Multi-viewport visual matrix test.
+
+        Runs Playwright across 4 viewports (mobile, tablet, desktop, large)
+        capturing screenshots at every flow step. Results feed into checkpoint
+        visual evidence and Tilotma's verification matrix.
+        """
+        from app.config import get_settings
+        if not get_settings().visual_testing_enabled:
+            return None
+
+        pages = contract.get("frontend", {}).get("pages", [])
+        if not pages:
+            return None  # No frontend — skip visual testing entirely
+
+        phase_start = time.monotonic()
+
+        try:
+            from app.services.browser_testing import BrowserTestRunner
+
+            runner = BrowserTestRunner()
+
+            # Build flow steps from contract pages: navigate to each page
+            flows = []
+            for page in pages[:10]:  # Cap at 10 pages
+                page_path = page.get("route", page.get("path", "/"))
+                flows.append({
+                    "name": page.get("name", page_path),
+                    "steps": [
+                        {"action": "navigate", "url_path": page_path},
+                        {"action": "wait", "seconds": 2},
+                        {"action": "screenshot"},
+                    ],
+                })
+
+            # Determine base URL from sandbox or DevBox
+            base_url = self._resolve_base_url(pipeline_run_id, context)
+            if not base_url:
+                elapsed = (time.monotonic() - phase_start) * 1000
+                return TestPhaseResult(
+                    phase=TestPhase.BROWSER_TEST,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    output="Visual matrix skipped — no running frontend URL available",
+                )
+
+            matrix_report = await runner.test_visual_matrix(
+                base_url=base_url,
+                flows=flows,
+            )
+
+            elapsed = (time.monotonic() - phase_start) * 1000
+
+            # Count pass/fail across matrix entries
+            total_entries = len(matrix_report.entries) if matrix_report else 0
+            passed_entries = sum(
+                1 for e in (matrix_report.entries if matrix_report else [])
+                if e.flow_result and e.flow_result.passed
+            )
+            failed_entries = total_entries - passed_entries
+
+            # Store screenshots for checkpoint consumption
+            self._visual_matrix_data = matrix_report
+
+            return TestPhaseResult(
+                phase=TestPhase.BROWSER_TEST,
+                status=TestStatus.PASSED if failed_entries == 0 else TestStatus.FAILED,
+                duration_ms=elapsed,
+                tests_total=total_entries,
+                tests_passed=passed_entries,
+                tests_failed=failed_entries,
+                output=(
+                    f"Visual matrix: {passed_entries}/{total_entries} viewport×flow "
+                    f"combinations passed across 4 viewports"
+                ),
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            elapsed = (time.monotonic() - phase_start) * 1000
+            logger.warning("visual_matrix_test_error", error=str(exc)[:200])
+            return TestPhaseResult(
+                phase=TestPhase.BROWSER_TEST,
+                status=TestStatus.SKIPPED,
+                duration_ms=elapsed,
+                output=f"Visual matrix skipped: {_sanitize_error(exc)}",
+            )
+
+    async def _phase_mobile_visual_test(
+        self,
+        pipeline_run_id: str,
+        contract: dict[str, Any],
+        context: dict[str, Any],
+    ) -> TestPhaseResult | None:
+        """Phase 8.5 (Directive 2): Mobile visual testing via emulator.
+
+        Builds APK (if React Native / Flutter), launches Android emulator
+        in Docker, installs APK, runs basic UI flow, captures screenshots.
+        Gracefully degrades to simulation when Docker unavailable.
+        """
+        from app.config import get_settings
+        if not get_settings().visual_testing_enabled:
+            return None
+
+        # Only relevant for mobile projects
+        tech_stack = contract.get("tech_stack", {})
+        mobile_framework = tech_stack.get("mobile", "")
+        if not mobile_framework:
+            return None  # Not a mobile project
+
+        phase_start = time.monotonic()
+
+        try:
+            from app.services.mobile_testing import MobileTestRunner
+
+            runner = MobileTestRunner()
+
+            # Try launching emulator
+            emulator = await runner.launch_emulator(
+                platform="android",
+                api_level=30,
+            )
+
+            if not emulator or not emulator.is_running:
+                elapsed = (time.monotonic() - phase_start) * 1000
+                return TestPhaseResult(
+                    phase=TestPhase.BROWSER_TEST,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    output=(
+                        "Mobile visual test SIMULATED — Docker emulator unavailable. "
+                        "SIMULATED — NOT VERIFIED."
+                    ),
+                )
+
+            # Build APK path from context (Shubham's build artifacts)
+            shubham_output = context.get("shubham", {})
+            apk_path = ""
+            if isinstance(shubham_output, dict):
+                build_artifacts = shubham_output.get("build_artifacts", {})
+                apk_path = build_artifacts.get("apk_path", "")
+
+            # Basic flow: launch app, wait, screenshot
+            from app.services.mobile_testing import MobileFlowStep
+            basic_flow = [
+                MobileFlowStep(action="wait", duration_ms=3000),
+                MobileFlowStep(action="screenshot"),
+                MobileFlowStep(action="tap", x=200, y=400),
+                MobileFlowStep(action="wait", duration_ms=2000),
+                MobileFlowStep(action="screenshot"),
+            ]
+
+            flow_result = await runner.test_mobile_flow(
+                emulator=emulator,
+                apk_path=apk_path,
+                flow_steps=basic_flow,
+            )
+
+            # Cleanup emulator
+            await runner.stop_emulator(emulator)
+
+            elapsed = (time.monotonic() - phase_start) * 1000
+
+            # Honesty enforcement: if simulated, say so
+            if flow_result and flow_result.simulated:
+                return TestPhaseResult(
+                    phase=TestPhase.BROWSER_TEST,
+                    status=TestStatus.SKIPPED,
+                    duration_ms=elapsed,
+                    output=(
+                        "Mobile visual test SIMULATED — NOT VERIFIED. "
+                        "Emulator reported simulation mode."
+                    ),
+                )
+
+            passed = flow_result.passed if flow_result else False
+            return TestPhaseResult(
+                phase=TestPhase.BROWSER_TEST,
+                status=TestStatus.PASSED if passed else TestStatus.FAILED,
+                duration_ms=elapsed,
+                tests_total=len(basic_flow),
+                tests_passed=len(basic_flow) if passed else 0,
+                tests_failed=0 if passed else len(basic_flow),
+                output=(
+                    f"Mobile visual test: {'PASSED' if passed else 'FAILED'} — "
+                    f"{len(flow_result.screenshots) if flow_result else 0} screenshots captured"
+                ),
+            )
+
+        except Exception as exc:
+            from app.services.ai_router import _sanitize_error
+            elapsed = (time.monotonic() - phase_start) * 1000
+            logger.warning("mobile_visual_test_error", error=str(exc)[:200])
+            return TestPhaseResult(
+                phase=TestPhase.BROWSER_TEST,
+                status=TestStatus.SKIPPED,
+                duration_ms=elapsed,
+                output=f"Mobile visual test skipped: {_sanitize_error(exc)}",
+            )
+
+    def _resolve_base_url(
+        self,
+        pipeline_run_id: str,
+        context: dict[str, Any],
+    ) -> str:
+        """Resolve the running frontend URL from sandbox or DevBox context."""
+        # Try DevBox URL first
+        try:
+            from app.engine.k8s_executor import get_devbox_executor
+            devbox_exec = get_devbox_executor()
+            if devbox_exec:
+                url = devbox_exec.get_devbox_url(pipeline_run_id)
+                if url:
+                    return url
+        except Exception as _devbox_exc:
+            logger.debug("devbox_url_resolve_failed", error=str(_devbox_exc)[:200])
+
+        # Try sandbox URL from execution engine state
+        try:
+            from app.engine.execution_engine import get_execution_engine
+            engine = get_execution_engine()
+            sandbox_state = getattr(engine, "_sandbox_states", {}).get(pipeline_run_id, {})
+            port = sandbox_state.get("frontend_port", 3000)
+            if sandbox_state.get("running", False):
+                return f"http://localhost:{port}"
+        except Exception as _sandbox_exc:
+            logger.debug("sandbox_url_resolve_failed", error=str(_sandbox_exc)[:200])
+
+        return ""
+
+    def _collect_visual_report(self, report: SandboxTestReport) -> dict[str, Any]:
+        """Collect visual test data from phase results for checkpoint/Tilotma."""
+        visual_data: dict[str, Any] = {
+            "matrix_tested": False,
+            "mobile_tested": False,
+            "viewports_tested": [],
+            "screenshots_count": 0,
+            "matrix_pass_rate": 0.0,
+        }
+
+        # Check for visual matrix data stored during phase execution
+        matrix_data = getattr(self, "_visual_matrix_data", None)
+        if matrix_data is not None:
+            visual_data["matrix_tested"] = True
+            visual_data["viewports_tested"] = [
+                e.viewport for e in matrix_data.entries
+            ] if hasattr(matrix_data, "entries") else []
+            visual_data["screenshots_count"] = sum(
+                len(e.flow_result.step_screenshots)
+                for e in matrix_data.entries
+                if e.flow_result and hasattr(e.flow_result, "step_screenshots")
+            ) if hasattr(matrix_data, "entries") else 0
+            total = len(matrix_data.entries) if hasattr(matrix_data, "entries") else 0
+            passed = sum(
+                1 for e in matrix_data.entries
+                if e.flow_result and e.flow_result.passed
+            ) if hasattr(matrix_data, "entries") else 0
+            visual_data["matrix_pass_rate"] = (passed / total * 100) if total > 0 else 0.0
+
+        # Check if any mobile tests ran
+        for pr in report.phase_results:
+            if "Mobile visual test" in pr.output and pr.status != TestStatus.SKIPPED:
+                visual_data["mobile_tested"] = True
+
+        return visual_data
+
     # ── Helpers ────────────────────────────────────────────────────
 
     def _parse_build_errors(
@@ -1017,8 +1343,8 @@ class Aarav:
         try:
             sandbox_state = getattr(engine, "_sandbox_states", {}).get(pipeline_run_id, {})
             build_log = sandbox_state.get("build_stderr", "") or sandbox_state.get("build_log", "")
-        except Exception:
-            pass
+        except Exception as _log_exc:
+            logger.debug("build_log_fetch_failed", error=str(_log_exc)[:200])
 
         if not build_log:
             return errors

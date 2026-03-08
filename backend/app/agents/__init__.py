@@ -70,6 +70,7 @@ def register_all_agents() -> int:
         "app.agents.aarav",
         "app.agents.fixer",
         "app.agents.pranav",
+        "app.agents.planner",  # P1-1: Agentic pipeline mode requires planner
     })
 
     imported = 0

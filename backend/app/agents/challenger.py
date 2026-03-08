@@ -27,6 +27,8 @@ from app.agents.base import (
     register_agent,
     run_agent,
     store_output,
+    check_inbox,
+    format_inbox_for_prompt,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -154,6 +156,10 @@ class Challenger:
         Performs rule-based checks first (fast, no AI), then uses AI for
         deeper analysis if available.
         """
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         vikram_output = context.get("vikram")
         if not vikram_output:
             return AgentResult(
@@ -180,6 +186,15 @@ class Challenger:
             # R29-FIX-5: Sanitize error — httpx exceptions contain API keys.
             from app.services.ai_router import _sanitize_error
             logger.warning("challenger_ai_review_failed", error=_sanitize_error(exc))
+            # AUDIT-B2-FIX: Flag AI review failure so downstream agents and
+            # Tilotma know the review was degraded (rule-based only).
+            challenges.append({
+                "severity": "info",
+                "category": "meta",
+                "description": "[AI REVIEW UNAVAILABLE] Architecture review ran with rule-based checks only. "
+                               "AI deep review failed — findings may be incomplete.",
+                "__ai_review_failed__": True,
+            })
 
         # R30-FIX-8: Deduplicate by description (case-insensitive). AI-generated
         # challenges may have same description with different capitalization

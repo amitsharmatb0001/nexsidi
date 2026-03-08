@@ -151,7 +151,7 @@ def _extract_requirements_packages(context: dict[str, Any]) -> set[str]:
                             clean = dep_name.split("/")[-1] if "/" in dep_name else dep_name
                             packages.add(clean)
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    pass  # Expected: type mismatch — fall through to default
 
     return packages
 
@@ -282,7 +282,7 @@ def _check_types_python(path: str, code: str) -> str:
         try:
             os.unlink(temp_path)
         except OSError:
-            pass
+            pass  # Expected: filesystem cleanup — non-critical
 
         if proc.returncode == 0:
             return f"Type check passed for {path}"
@@ -332,7 +332,7 @@ def _check_types_typescript(path: str, code: str) -> str:
         try:
             os.unlink(temp_path)
         except OSError:
-            pass
+            pass  # Expected: filesystem cleanup — non-critical
 
         if proc.returncode == 0:
             return f"Type check passed for {path}"

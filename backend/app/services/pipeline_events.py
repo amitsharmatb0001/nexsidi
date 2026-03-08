@@ -45,6 +45,24 @@ class _NoOpPublisher:
     ) -> None:
         pass
 
+    async def publish_file_write(
+        self, run_id: str, agent: str, file_path: str,
+        content_chunk: str = "", is_final: bool = True, size: int = 0,
+    ) -> None:
+        pass
+
+    async def publish_terminal_output(
+        self, run_id: str, command: str, output_chunk: str,
+        stream_type: str = "stdout",
+    ) -> None:
+        pass
+
+    async def publish_agent_thinking(
+        self, run_id: str, agent: str, phase: str,
+        detail: str = "",
+    ) -> None:
+        pass
+
 
 class PipelineEventPublisher:
     """Publishes pipeline events to Valkey pub-sub channel."""
@@ -80,6 +98,78 @@ class PipelineEventPublisher:
             "agent_name": agent_name,
             "output": output,
             "error": error,
+        })
+
+    # ── Directive 5: Real-Time Observability event publishers ────────
+
+    async def publish_file_write(
+        self,
+        run_id: str,
+        agent: str,
+        file_path: str,
+        content_chunk: str = "",
+        is_final: bool = True,
+        size: int = 0,
+    ) -> None:
+        """Publish a file_writing event when an agent writes/stores a file.
+
+        The frontend IDE can show real-time 'Writing src/app.py...' with
+        incremental content updates. ``is_final=False`` for chunked writes.
+        """
+        await self.publish(run_id, {
+            "type": "file_writing" if not is_final else "file_content_update",
+            "channel": "files",
+            "run_id": run_id,
+            "agent": agent,
+            "file_path": file_path,
+            "content_chunk": content_chunk[:2000],  # Cap chunk size for pub-sub
+            "is_final": is_final,
+            "size": size,
+        })
+
+    async def publish_terminal_output(
+        self,
+        run_id: str,
+        command: str,
+        output_chunk: str,
+        stream_type: str = "stdout",
+    ) -> None:
+        """Publish terminal output (stdout/stderr) from sandbox execution.
+
+        Streams build output, test results, and command execution to
+        the Live AI Studio terminal panel.
+        """
+        from app.config import get_settings
+        buffer_size = get_settings().terminal_stream_buffer_size
+
+        await self.publish(run_id, {
+            "type": "terminal_output",
+            "channel": "terminal",
+            "run_id": run_id,
+            "command": command[:200],
+            "output": output_chunk[:buffer_size],
+            "stream_type": stream_type,  # "stdout" or "stderr"
+        })
+
+    async def publish_agent_thinking(
+        self,
+        run_id: str,
+        agent: str,
+        phase: str,
+        detail: str = "",
+    ) -> None:
+        """Publish an agent_thinking event at key execution points.
+
+        Phases: "start", "tool_call", "file_written", "complete", "error".
+        Enables the Live AI Studio to show real-time agent activity.
+        """
+        await self.publish(run_id, {
+            "type": "agent_thinking",
+            "channel": "agents",
+            "run_id": run_id,
+            "agent": agent,
+            "phase": phase,
+            "detail": detail[:500],
         })
 
 
@@ -140,13 +230,13 @@ class PipelineEventSubscriber:
             try:
                 await self._task
             except asyncio.CancelledError:
-                pass
+                pass  # Expected: task cancelled — clean shutdown
             self._task = None
         if self._pubsub:
             try:
                 await self._pubsub.close()
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             self._pubsub = None
 
     async def _listen_loop(self) -> None:
@@ -187,7 +277,7 @@ class PipelineEventSubscriber:
                 except Exception as e:
                     logger.warning("pipeline_event_dispatch_failed", error=str(e))
         except asyncio.CancelledError:
-            pass
+            pass  # Expected: task cancelled — clean shutdown
         except Exception as e:
             logger.error("pipeline_event_subscriber_died", error=str(e))
 
@@ -263,7 +353,7 @@ async def shutdown_pipeline_events() -> None:
         try:
             await _subscriber._redis.aclose()
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
         _subscriber = None
 
     _publisher = None
@@ -294,3 +384,41 @@ def reset_pipeline_events() -> None:
     global _publisher, _subscriber
     _publisher = None
     _subscriber = None
+
+
+# ── Directive 5: Convenience functions for event publishing ──────────
+
+
+async def publish_file_write_event(
+    run_id: str,
+    agent: str,
+    file_path: str,
+    content_chunk: str = "",
+    is_final: bool = True,
+    size: int = 0,
+) -> None:
+    """Publish a file write event. Called from VFS and agents."""
+    pub = get_pipeline_event_publisher()
+    await pub.publish_file_write(run_id, agent, file_path, content_chunk, is_final, size)
+
+
+async def publish_terminal_event(
+    run_id: str,
+    command: str,
+    output_chunk: str,
+    stream_type: str = "stdout",
+) -> None:
+    """Publish terminal output. Called from execution engine."""
+    pub = get_pipeline_event_publisher()
+    await pub.publish_terminal_output(run_id, command, output_chunk, stream_type)
+
+
+async def publish_agent_thinking_event(
+    run_id: str,
+    agent: str,
+    phase: str,
+    detail: str = "",
+) -> None:
+    """Publish agent thinking event. Called from base.py run_agent()."""
+    pub = get_pipeline_event_publisher()
+    await pub.publish_agent_thinking(run_id, agent, phase, detail)

@@ -47,7 +47,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from jwt.exceptions import PyJWTError as JWTError
 
 from app.services.auth import decode_token, verify_token
-from app.services.pipeline import PipelineRunStatus, get_orchestrator
+from app.services.pipeline import get_orchestrator
 from app.services.pipeline_events import get_pipeline_event_subscriber
 
 logger = structlog.get_logger(__name__)
@@ -60,13 +60,23 @@ class ConnectionManager:
 
     H12-FIX: Enforces limits on total connections and per-run connections
     to prevent DoS via file descriptor exhaustion.
+
+    Directive 5: Supports per-connection channel subscriptions. Clients
+    can subscribe to specific channels (files, terminal, agents) to
+    receive only relevant events. Default: all channels.
     """
 
     MAX_TOTAL_CONNECTIONS = 500
     MAX_PER_RUN_CONNECTIONS = 10
 
+    # Directive 5: Valid subscription channels for filtering
+    VALID_CHANNELS = {"files", "terminal", "agents", "stages", "all"}
+
     def __init__(self) -> None:
         self._connections: dict[str, list[WebSocket]] = {}
+        # Directive 5: Per-connection channel subscriptions
+        # WebSocket id() -> set of subscribed channels
+        self._subscriptions: dict[int, set[str]] = {}
 
     async def connect(self, run_id: str, websocket: WebSocket) -> bool:
         """Register an already-accepted WebSocket connection.
@@ -98,7 +108,41 @@ class ConnectionManager:
             conns.remove(websocket)
         if not conns:
             self._connections.pop(run_id, None)
+        # Directive 5: Cleanup subscription data
+        self._subscriptions.pop(id(websocket), None)
         logger.info("ws_disconnected", run_id=run_id)
+
+    def set_subscriptions(self, websocket: WebSocket, channels: set[str]) -> None:
+        """Directive 5: Set channel subscriptions for a WebSocket connection."""
+        valid = channels & self.VALID_CHANNELS
+        if "all" in valid or not valid:
+            # "all" or empty means receive everything
+            self._subscriptions.pop(id(websocket), None)
+        else:
+            self._subscriptions[id(websocket)] = valid
+
+    def _should_deliver(self, websocket: WebSocket, message: dict[str, Any]) -> bool:
+        """Directive 5: Check if a message should be delivered to this connection."""
+        subs = self._subscriptions.get(id(websocket))
+        if subs is None:
+            return True  # No filter = receive all
+
+        # Determine message channel from event type or explicit channel field
+        msg_channel = message.get("channel", "")
+        msg_type = message.get("type", "")
+
+        # Map event types to channels
+        if not msg_channel:
+            if msg_type in ("file_created", "file_writing", "file_content_update"):
+                msg_channel = "files"
+            elif msg_type == "terminal_output":
+                msg_channel = "terminal"
+            elif msg_type == "agent_thinking":
+                msg_channel = "agents"
+            else:
+                msg_channel = "stages"  # Default: stage events always delivered
+
+        return msg_channel in subs or "stages" in subs and msg_channel == "stages"
 
     async def broadcast(self, run_id: str, message: dict[str, Any]) -> None:
         """Send a message to all connections for a pipeline run.
@@ -107,6 +151,9 @@ class ConnectionManager:
         TCP connection from blocking ALL event delivery. Previously, serial
         send_json() would hang up to 60s (OS TCP timeout) on a dead mobile
         client, blocking every other subscriber from receiving events.
+
+        Directive 5: Respects per-connection channel subscriptions — only
+        delivers messages matching the client's subscribed channels.
         """
         # R38-FIX: Snapshot the list. await ws.send_json() yields to event loop,
         # during which connect()/disconnect() can mutate the live list.
@@ -116,6 +163,9 @@ class ConnectionManager:
         disconnected: list[WebSocket] = []
 
         for ws in conns:
+            # Directive 5: Skip if client didn't subscribe to this channel
+            if not self._should_deliver(ws, message):
+                continue
             try:
                 await asyncio.wait_for(ws.send_json(message), timeout=5.0)
             except Exception:
@@ -378,6 +428,41 @@ async def pipeline_websocket(
                         "type": "pong",
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                     })
+
+                # Directive 5: Client subscription filter
+                elif data.get("type") == "subscribe":
+                    channels = set(data.get("channels", []))
+                    manager.set_subscriptions(websocket, channels)
+                    await websocket.send_json({
+                        "type": "subscribed",
+                        "channels": list(channels & manager.VALID_CHANNELS),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+
+                # Directive 7: Live steering messages during generation
+                elif data.get("type") == "steer":
+                    try:
+                        from app.services.steering_service import get_steering_service
+                        _steer_svc = get_steering_service()
+                        _steer_result = await _steer_svc.send_user_message(
+                            run_id=run_id,
+                            user_id=claims["user_id"],
+                            message=data.get("message", "")[:1000],
+                            action=data.get("action", "feedback"),
+                        )
+                        await websocket.send_json({
+                            "type": "steer_ack",
+                            "run_id": run_id,
+                            "result": _steer_result,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                    except Exception as _steer_exc:
+                        await websocket.send_json({
+                            "type": "steer_error",
+                            "run_id": run_id,
+                            "error": str(_steer_exc)[:200],
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
             except asyncio.TimeoutError:
                 # M10-FIX: Send heartbeat INSIDE the loop — don't break out
                 try:
@@ -391,7 +476,7 @@ async def pipeline_websocket(
             except (ValueError, _json.JSONDecodeError):
                 pass  # Malformed JSON from client — ignore, keep connection
     except WebSocketDisconnect:
-        pass
+        pass  # Expected: client disconnected — cleanup handled
     except Exception as exc:
         # R19-FIX: Sanitize exception before logging. Raw exception strings
         # from downstream httpx calls can contain API keys in headers.

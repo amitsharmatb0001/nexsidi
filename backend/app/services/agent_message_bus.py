@@ -44,7 +44,12 @@ import structlog
 # ── Constants ────────────────────────────────────────────────────────
 
 _MSG_TTL_SECONDS = 3600          # 1 hour — all message keys expire automatically
-_DEFAULT_ASK_TIMEOUT = 30.0      # seconds before ask() raises AgentMessageTimeout
+_DEFAULT_ASK_TIMEOUT = 180.0     # P2-3: 3 min default (was 30s — too short for Shubham/Aanya LLM calls)
+_AGENT_TIMEOUTS: dict[str, float] = {
+    "shubham": 300.0,  # 5 min — large code generation
+    "aanya": 300.0,    # 5 min — large frontend generation
+    "fixer": 240.0,    # 4 min — iterative fix loops
+}
 _MAX_PENDING_SCAN = 5            # default max questions returned by get_pending_questions
 
 
@@ -67,6 +72,36 @@ class AgentBusUnavailable(Exception):
     """
 
 
+# ── Phase 1A: Agent Group Definitions ────────────────────────────────
+
+AGENT_GROUPS: dict[str, list[str]] = {
+    "design_team": ["vikram", "dhruv", "vanya"],
+    "build_team": ["shubham", "aanya"],
+    "quality_team": ["karan", "navya", "deepika", "attack_tester", "aarav"],
+    "leadership": ["tilotma", "vikram"],
+}
+
+# ── Phase 1A: Run Key Registry ────────────────────────────────────
+# Maps pipeline_run_id → decrypted per-run Fernet key bytes.
+# Populated by pipeline.py at run start, purged at terminal state.
+_RUN_KEYS: dict[str, bytes] = {}
+
+
+def register_run_key(run_id: str, run_key: bytes) -> None:
+    """Store a per-run encryption key (called by pipeline at start)."""
+    _RUN_KEYS[run_id] = run_key
+
+
+def purge_run_key(run_id: str) -> None:
+    """Remove a per-run encryption key (called by pipeline at end)."""
+    _RUN_KEYS.pop(run_id, None)
+
+
+def get_run_key(run_id: str) -> bytes | None:
+    """Retrieve the per-run encryption key, or None if not set."""
+    return _RUN_KEYS.get(run_id)
+
+
 # ── Core class ───────────────────────────────────────────────────────
 
 
@@ -75,6 +110,10 @@ class AgentMessageBus:
 
     Agents send questions to each other via ask(), answer pending questions
     via answer(), and inspect their inbound queue via get_pending_questions().
+
+    Phase 1A: All message payloads are encrypted with per-run Fernet keys
+    before storage in Valkey. Even if Valkey is compromised, message contents
+    are unreadable without the run key.
 
     Thread safety: This class is designed for a single asyncio event loop.
     All public methods are coroutines and must be awaited.
@@ -108,6 +147,55 @@ class AgentMessageBus:
         self._redis = redis_client
         self._logger = structlog.get_logger(__name__)
 
+    # ── Phase 1A: Encryption Helpers ─────────────────────────────────
+
+    def _encrypt_field(self, value: str, run_id: str) -> str:
+        """Encrypt a message field if encryption is enabled and key exists.
+
+        Falls back to plaintext if encryption is disabled or key missing
+        (graceful degradation — never break message delivery).
+        """
+        try:
+            from app.config import get_settings
+            if not get_settings().agent_message_encryption:
+                return value
+        except Exception:
+            return value
+
+        run_key = get_run_key(run_id)
+        if not run_key:
+            return value
+
+        try:
+            from app.services.encryption import get_message_encryptor
+            return get_message_encryptor().encrypt(value, run_key)
+        except Exception as exc:
+            self._logger.debug("encrypt_field_failed", error=str(exc)[:100])
+            return value  # Graceful fallback
+
+    def _decrypt_field(self, value: str, run_id: str) -> str:
+        """Decrypt a message field if it appears to be encrypted.
+
+        Falls back to returning as-is if decryption fails or value is plaintext.
+        """
+        try:
+            from app.services.encryption import MessageEncryptor
+            if not MessageEncryptor.is_encrypted(value):
+                return value
+        except Exception:
+            return value
+
+        run_key = get_run_key(run_id)
+        if not run_key:
+            return value
+
+        try:
+            from app.services.encryption import get_message_encryptor
+            return get_message_encryptor().decrypt(value, run_key)
+        except Exception as exc:
+            self._logger.debug("decrypt_field_failed", error=str(exc)[:100])
+            return value  # Return as-is on failure
+
     # ── Key builders ─────────────────────────────────────────────────
 
     @staticmethod
@@ -134,7 +222,7 @@ class AgentMessageBus:
         pipeline_run_id: str,
         question: str,
         context: dict[str, Any] | None = None,
-        timeout: float = _DEFAULT_ASK_TIMEOUT,
+        timeout: float | None = None,
     ) -> str:
         """Send a question to another agent and block until an answer arrives.
 
@@ -152,7 +240,8 @@ class AgentMessageBus:
             question:   Free-text question for the receiving agent.
             context:    Optional dict of additional context for the question
                         (e.g. relevant artifacts, constraints). Stored as JSON.
-            timeout:    Seconds to wait for an answer (default 30s).
+            timeout:    Seconds to wait for an answer. If None, uses per-agent
+                        default from _AGENT_TIMEOUTS or _DEFAULT_ASK_TIMEOUT.
 
         Returns:
             The answer string provided by the receiving agent.
@@ -162,18 +251,28 @@ class AgentMessageBus:
                                   The message status in Valkey is set to "timed_out".
             AgentBusUnavailable:  Valkey is not reachable (ConnectionError).
         """
+        # P2-3: Per-agent timeout resolution
+        if timeout is None:
+            timeout = _AGENT_TIMEOUTS.get(to_agent, _DEFAULT_ASK_TIMEOUT)
+
         import orjson  # Local import — keeps top-level imports minimal
 
         message_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
+
+        # Phase 1A: Encrypt sensitive payload fields before Valkey storage
+        _enc_question = self._encrypt_field(question, pipeline_run_id)
+        _enc_context = self._encrypt_field(
+            orjson.dumps(context or {}).decode("utf-8"), pipeline_run_id
+        )
 
         msg_data: dict[str, str] = {
             "message_id": message_id,
             "from_agent": from_agent,
             "to_agent": to_agent,
             "pipeline_run_id": pipeline_run_id,
-            "question": question,
-            "context": orjson.dumps(context or {}).decode("utf-8"),
+            "question": _enc_question,
+            "context": _enc_context,
             "asked_at": now,
             "answer": "",
             "answered_at": "",
@@ -194,6 +293,10 @@ class AgentMessageBus:
             pipe.expire(msg_key, _MSG_TTL_SECONDS)
             pipe.rpush(queue_key, message_id)
             pipe.expire(queue_key, _MSG_TTL_SECONDS)
+            # PHASE-3: Track in transcript for oversight
+            transcript_key = f"agent_bus:{pipeline_run_id}:transcript"
+            pipe.rpush(transcript_key, message_id)
+            pipe.expire(transcript_key, _MSG_TTL_SECONDS)
             await pipe.execute()
         except Exception as exc:
             # Distinguish connection failures from other errors.
@@ -240,8 +343,15 @@ class AgentMessageBus:
             raise
 
         if blpop_result is None:
-            # Timeout — mark the message and raise.
+            # AUDIT-T2-9: Check for late answer before declaring timeout.
+            # If answer arrived just after BLPOP expired, recover it to avoid
+            # duplicate/stale answers sitting in Valkey for the next retry.
             try:
+                late = await self._redis.lpop(answer_key)
+                if late:
+                    self._logger.info("ask_late_answer_recovered", message_id=message_id)
+                    _late_text = late.decode("utf-8") if isinstance(late, bytes) else late
+                    return self._decrypt_field(_late_text, pipeline_run_id)
                 await self._redis.hset(msg_key, "status", "timed_out")
             except Exception:
                 pass  # Best-effort status update; TTL will clean up regardless.
@@ -264,6 +374,8 @@ class AgentMessageBus:
         answer_text = (
             raw_answer.decode("utf-8") if isinstance(raw_answer, bytes) else raw_answer
         )
+        # Phase 1A: Decrypt the answer payload
+        answer_text = self._decrypt_field(answer_text, pipeline_run_id)
         self._logger.info(
             "agent_question_answered",
             message_id=message_id,
@@ -350,16 +462,24 @@ class AgentMessageBus:
             )
 
         try:
+            # Phase 1A: Encrypt the answer payload
+            # Need pipeline_run_id for encryption — fetch from the message hash
+            _run_id_raw = await self._redis.hget(msg_key, "pipeline_run_id")
+            _run_id = (
+                _run_id_raw.decode("utf-8") if isinstance(_run_id_raw, bytes) else (_run_id_raw or pipeline_run_id)
+            )
+            _enc_answer = self._encrypt_field(answer, _run_id)
+
             # RPUSH to the answer rendezvous List FIRST — this is what wakes the
             # BLPOP in ask(). Then update the hash in the same pipeline for audit.
             # Even if the hash update fails, the answer is delivered (RPUSH ran first).
             pipe = self._redis.pipeline(transaction=True)
-            pipe.rpush(answer_key, answer)
+            pipe.rpush(answer_key, _enc_answer)
             pipe.expire(answer_key, _MSG_TTL_SECONDS)
             pipe.hset(
                 msg_key,
                 mapping={
-                    "answer": answer,
+                    "answer": _enc_answer,
                     "answered_at": now,
                     "status": "answered",
                 },
@@ -490,15 +610,25 @@ class AgentMessageBus:
             if decoded.get("status") != "pending":
                 continue  # Already answered or timed out — skip.
 
+            # Phase 1A: Decrypt encrypted fields
+            _msg_run_id = decoded.get("pipeline_run_id", pipeline_run_id)
+            if decoded.get("question"):
+                decoded["question"] = self._decrypt_field(decoded["question"], _msg_run_id)
+
             # Parse the context JSON string back to a dict.
             raw_context = decoded.get("context", "{}")
+            # Phase 1A: Decrypt context if encrypted
+            raw_context = self._decrypt_field(raw_context, _msg_run_id)
             try:
                 decoded["context"] = orjson.loads(raw_context)
             except (ValueError, TypeError):
                 decoded["context"] = {}
 
             # Normalise optional fields that may be empty strings.
-            decoded["answer"] = decoded.get("answer") or None
+            _raw_answer = decoded.get("answer") or None
+            if _raw_answer:
+                _raw_answer = self._decrypt_field(_raw_answer, _msg_run_id)
+            decoded["answer"] = _raw_answer
             decoded["answered_at"] = decoded.get("answered_at") or None
 
             pending.append(decoded)
@@ -511,6 +641,337 @@ class AgentMessageBus:
             scanned=len(message_ids),
         )
         return pending
+
+    # ── PHASE-3: Broadcast, Transcript, Priority ─────────────────────
+
+    async def broadcast(
+        self,
+        from_agent: str,
+        pipeline_run_id: str,
+        message: str,
+        to_agents: list[str] | None = None,
+        cc_agents: list[str] | None = None,
+        priority: str = "NORMAL",
+    ) -> list[str]:
+        """Broadcast a message to multiple agents (+ CC oversight agents).
+
+        Unlike ask(), broadcast is fire-and-forget — no blocking wait for answers.
+        Returns list of message_ids sent.
+
+        Args:
+            from_agent: Sending agent name.
+            pipeline_run_id: Pipeline run ID.
+            message: The message content.
+            to_agents: List of agents to send to. If None, sends to all known agents.
+            cc_agents: Additional agents to CC (e.g., ["tilotma"] for oversight).
+            priority: "CRITICAL", "NORMAL", or "INFO".
+        """
+        import orjson
+
+        _ALL_AGENTS = [
+            "tilotma", "vikram", "saanvi", "vanya", "dhruv",
+            "shubham", "aanya", "karan", "fixer", "pranav",
+        ]
+
+        # PHASE-3: Always CC both tilotma (Chief AI Official) and vikram
+        # (second-in-command) on ALL broadcasts — they must be in the loop.
+        _OVERSIGHT_AGENTS = ["tilotma", "vikram"]
+
+        recipients = list(to_agents or _ALL_AGENTS)
+        if cc_agents:
+            for cc in cc_agents:
+                if cc not in recipients:
+                    recipients.append(cc)
+        # Ensure oversight agents are ALWAYS included
+        for oversight in _OVERSIGHT_AGENTS:
+            if oversight not in recipients:
+                recipients.append(oversight)
+
+        # Remove sender from recipients
+        recipients = [a for a in recipients if a != from_agent]
+
+        message_ids: list[str] = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Phase 1A: Pre-encrypt the shared payload once (same for all recipients)
+        _enc_message = self._encrypt_field(message, pipeline_run_id)
+        _enc_broadcast_ctx = self._encrypt_field(
+            orjson.dumps({"priority": priority, "type": "broadcast"}).decode(),
+            pipeline_run_id,
+        )
+
+        for to_agent in recipients:
+            message_id = str(uuid.uuid4())
+            msg_data = {
+                "message_id": message_id,
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "pipeline_run_id": pipeline_run_id,
+                "question": _enc_message,
+                "context": _enc_broadcast_ctx,
+                "asked_at": now,
+                "answer": "",
+                "answered_at": "",
+                "status": "broadcast",
+                "priority": priority,
+            }
+
+            msg_key = self._msg_key(message_id)
+            queue_key = self._queue_key(pipeline_run_id, to_agent)
+
+            try:
+                pipe = self._redis.pipeline(transaction=True)
+                pipe.hset(msg_key, mapping=msg_data)
+                pipe.expire(msg_key, _MSG_TTL_SECONDS)
+                pipe.rpush(queue_key, message_id)
+                pipe.expire(queue_key, _MSG_TTL_SECONDS)
+                # Also add to transcript
+                transcript_key = f"agent_bus:{pipeline_run_id}:transcript"
+                pipe.rpush(transcript_key, message_id)
+                pipe.expire(transcript_key, _MSG_TTL_SECONDS)
+                await pipe.execute()
+                message_ids.append(message_id)
+            except Exception as exc:
+                if _is_connection_error(exc):
+                    self._logger.warning("broadcast_failed", to_agent=to_agent, error=str(exc)[:100])
+                    continue
+                raise
+
+        self._logger.info(
+            "agent_broadcast_sent",
+            from_agent=from_agent,
+            recipients=len(message_ids),
+            priority=priority,
+            pipeline_run_id=pipeline_run_id,
+        )
+        return message_ids
+
+    async def get_transcript(
+        self,
+        pipeline_run_id: str,
+        max_messages: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get full message transcript for a pipeline run (for oversight).
+
+        Returns all messages in chronological order.
+        """
+        import orjson
+
+        transcript_key = f"agent_bus:{pipeline_run_id}:transcript"
+
+        try:
+            raw_ids = await self._redis.lrange(transcript_key, 0, max_messages - 1)
+        except Exception as exc:
+            if _is_connection_error(exc):
+                return []
+            raise
+
+        if not raw_ids:
+            return []
+
+        message_ids = [
+            raw_id.decode("utf-8") if isinstance(raw_id, bytes) else raw_id
+            for raw_id in raw_ids
+        ]
+
+        try:
+            pipe = self._redis.pipeline(transaction=False)
+            for mid in message_ids:
+                pipe.hgetall(self._msg_key(mid))
+            results = await pipe.execute()
+        except Exception:
+            return []
+
+        transcript: list[dict[str, Any]] = []
+        for mid, raw_hash in zip(message_ids, results):
+            if not raw_hash:
+                continue
+            decoded = {
+                (k.decode("utf-8") if isinstance(k, bytes) else k): (
+                    v.decode("utf-8") if isinstance(v, bytes) else v
+                )
+                for k, v in raw_hash.items()
+            }
+            # Phase 1A: Decrypt encrypted fields
+            _t_run_id = decoded.get("pipeline_run_id", pipeline_run_id)
+            if decoded.get("question"):
+                decoded["question"] = self._decrypt_field(decoded["question"], _t_run_id)
+            if decoded.get("answer"):
+                decoded["answer"] = self._decrypt_field(decoded["answer"], _t_run_id)
+
+            raw_ctx = decoded.get("context", "{}")
+            raw_ctx = self._decrypt_field(raw_ctx, _t_run_id)
+            try:
+                decoded["context"] = orjson.loads(raw_ctx)
+            except (ValueError, TypeError):
+                decoded["context"] = {}
+            transcript.append(decoded)
+
+        return transcript
+
+    async def report_error(
+        self,
+        from_agent: str,
+        to_agent: str,
+        pipeline_run_id: str,
+        error_type: str,
+        file_path: str,
+        description: str,
+        severity: str = "CRITICAL",
+    ) -> str:
+        """Report an error found by one agent to another (e.g., Aanya → Shubham).
+
+        This is a convenience wrapper around ask() for structured error reports.
+        Returns the response from the target agent.
+        """
+        question = (
+            f"[ERROR REPORT — {severity}]\n"
+            f"Type: {error_type}\n"
+            f"File: {file_path}\n"
+            f"Description: {description}\n\n"
+            f"Please fix this issue."
+        )
+
+        # CC both tilotma AND vikram for oversight (PHASE-3 enforcement)
+        try:
+            await self.broadcast(
+                from_agent=from_agent,
+                pipeline_run_id=pipeline_run_id,
+                message=f"{from_agent} reported {severity} error to {to_agent}: {description[:200]}",
+                to_agents=["tilotma", "vikram"],
+                priority=severity,
+            )
+        except Exception:
+            pass  # Best-effort CC
+
+        return await self.ask(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            pipeline_run_id=pipeline_run_id,
+            question=question,
+            context={"error_type": error_type, "file_path": file_path, "severity": severity},
+        )
+
+    # ── PHASE-3: Authority Messages ──────────────────────────────────
+
+    async def send_authority_message(
+        self,
+        from_agent: str,
+        pipeline_run_id: str,
+        message: str,
+        to_agents: list[str] | None = None,
+    ) -> list[str]:
+        """Send an AUTHORITY-level message from Tilotma or Vikram.
+
+        AUTHORITY messages are the highest priority and CANNOT be ignored
+        by any agent. Only Tilotma (Chief AI Official) and Vikram
+        (second-in-command) can send these.
+
+        Args:
+            from_agent: Must be "tilotma" or "vikram".
+            pipeline_run_id: Pipeline run ID.
+            message: The authority directive.
+            to_agents: Specific agents, or None for all agents.
+
+        Returns:
+            List of message_ids sent.
+
+        Raises:
+            ValueError: If from_agent is not tilotma or vikram.
+        """
+        if from_agent not in ("tilotma", "vikram"):
+            raise ValueError(
+                f"Only tilotma or vikram can send AUTHORITY messages, not '{from_agent}'"
+            )
+
+        self._logger.info(
+            "authority_message_sent",
+            from_agent=from_agent,
+            pipeline_run_id=pipeline_run_id,
+            message_preview=message[:100],
+        )
+
+        return await self.broadcast(
+            from_agent=from_agent,
+            pipeline_run_id=pipeline_run_id,
+            message=f"[AUTHORITY — {from_agent.upper()}] {message}",
+            to_agents=to_agents,
+            priority="AUTHORITY",
+        )
+
+    async def get_unread_authority_messages(
+        self,
+        agent_name: str,
+        pipeline_run_id: str,
+    ) -> list[dict[str, Any]]:
+        """Check if an agent has unread AUTHORITY messages.
+
+        Used by pipeline to enforce that agents don't ignore authority
+        messages from Tilotma/Vikram.
+        """
+        messages = await self.get_pending_questions(agent_name, pipeline_run_id, max_questions=20)
+        authority: list[dict[str, Any]] = []
+        for msg in messages:
+            priority = msg.get("priority", "")
+            from_agent = msg.get("from_agent", "")
+            # Check both explicit AUTHORITY priority and messages from oversight agents
+            if priority == "AUTHORITY" or from_agent in ("tilotma", "vikram"):
+                ctx = msg.get("context", {})
+                if isinstance(ctx, str):
+                    try:
+                        import orjson
+                        ctx = orjson.loads(ctx)
+                    except Exception:
+                        ctx = {}
+                if ctx.get("priority") == "AUTHORITY" or priority == "AUTHORITY":
+                    authority.append(msg)
+        return authority
+
+    # ── Phase 1A: Group Channels ─────────────────────────────────────
+
+    async def send_group(
+        self,
+        from_agent: str,
+        pipeline_run_id: str,
+        group_name: str,
+        message: str,
+        priority: str = "NORMAL",
+    ) -> list[str]:
+        """Send a message to a predefined agent group.
+
+        Resolves the group name to a list of agents using AGENT_GROUPS,
+        then broadcasts to all members. If the sender is in the group,
+        they are excluded from recipients.
+
+        Args:
+            from_agent: Sending agent name.
+            pipeline_run_id: Pipeline run ID.
+            group_name: One of: "design_team", "build_team", "quality_team", "leadership".
+            message: The message content.
+            priority: Message priority level.
+
+        Returns:
+            List of message_ids sent.
+
+        Raises:
+            ValueError: If group_name is not a known group.
+        """
+        if group_name not in AGENT_GROUPS:
+            raise ValueError(
+                f"Unknown agent group '{group_name}'. "
+                f"Valid groups: {', '.join(sorted(AGENT_GROUPS.keys()))}"
+            )
+
+        recipients = AGENT_GROUPS[group_name]
+        group_message = f"[GROUP:{group_name.upper()}] {message}"
+
+        return await self.broadcast(
+            from_agent=from_agent,
+            pipeline_run_id=pipeline_run_id,
+            message=group_message,
+            to_agents=recipients,
+            priority=priority,
+        )
 
 
 # ── Internal helper ──────────────────────────────────────────────────
@@ -531,7 +992,7 @@ def _is_connection_error(exc: Exception) -> bool:
         if isinstance(exc, (_redis_exc.ConnectionError, _redis_exc.TimeoutError)):
             return True
     except ImportError:
-        pass
+        pass  # Expected: optional dependency not installed
     return isinstance(exc, (ConnectionError, TimeoutError))
 
 

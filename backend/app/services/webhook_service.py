@@ -56,6 +56,19 @@ def _http_client() -> httpx.AsyncClient:
     return _client
 
 
+def _validate_webhook_url(url: str) -> bool:
+    """AUDIT-T3-6: SSRF validation — block internal/loopback URLs."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = (parsed.hostname or "").lower()
+    _blocked = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"}
+    if hostname in _blocked or hostname.startswith("10.") or hostname.startswith("172.") or hostname.startswith("192.168."):
+        return False
+    return True
+
+
 async def deliver_webhook(
     url: str,
     secret: str | None,
@@ -64,6 +77,10 @@ async def deliver_webhook(
     timeout: float = 10.0,
 ) -> bool:
     """Deliver a single webhook event. Returns True on success."""
+    # AUDIT-T3-6: SSRF validation
+    if not _validate_webhook_url(url):
+        logger.warning("webhook_ssrf_blocked", url=url, event=event)
+        return False
     body = _safe_json_dumps({"event": event, "timestamp": int(time.time()), "data": payload})
     headers = {"Content-Type": "application/json", "X-NexSidi-Event": event}
     if secret:
@@ -101,7 +118,16 @@ async def broadcast_webhook_event(
             webhooks = rows.fetchall()
 
         import asyncio
-        tasks = [deliver_webhook(row.url, row.secret, event, payload) for row in webhooks]
+
+        # AUDIT-T2-4: Wrap each delivery with 5s timeout to prevent hanging on unreachable URLs
+        async def _deliver_with_timeout(url: str, secret: str, evt: str, data: dict) -> bool:
+            try:
+                return await asyncio.wait_for(deliver_webhook(url, secret, evt, data), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("webhook_delivery_timeout", url=url[:100])
+                return False
+
+        tasks = [_deliver_with_timeout(row.url, row.secret, event, payload) for row in webhooks]
         if tasks:
             # FIX: Log individual failures instead of silently swallowing via return_exceptions.
             results = await asyncio.gather(*tasks, return_exceptions=True)

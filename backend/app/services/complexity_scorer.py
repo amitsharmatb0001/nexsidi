@@ -149,14 +149,16 @@ def _get_pricing_config() -> tuple[float, float]:
     except Exception:
         return (5.0, 2.5)
 
-_COST_PER_MILLION_TOKENS = 5.0  # Default; overridden at call time via _get_pricing_config
+# AUDIT-T1-8: Actually call _get_pricing_config() so config overrides work.
+# Previously hardcoded 5.0/2.5 even when admin set different values in config.
+_COST_PER_MILLION_TOKENS, _AVG_MINUTES_PER_STAGE = _get_pricing_config()
 _COMPLEXITY_COST_MULTIPLIER = {
     "basic": 0.5,
     "standard": 1.0,
     "professional": 2.0,
     "enterprise": 4.0,
 }
-_AVG_MINUTES_PER_STAGE = 2.5  # Default; overridden at call time via _get_pricing_config
+# _AVG_MINUTES_PER_STAGE set above via _get_pricing_config()
 
 
 # ── Scoring Functions ────────────────────────────────────────────────
@@ -316,16 +318,19 @@ def score_complexity(
             pricing_inr = price
             break
 
+    # AUDIT-B3-FIX: Reload pricing config at call time (was frozen at import)
+    _cost_per_m, _avg_mins = _get_pricing_config()
+
     # Estimate AI cost
     multiplier = _COMPLEXITY_COST_MULTIPLIER.get(tier, 1.0)
     total_tokens = _AVG_TOKENS_PER_STAGE * _PIPELINE_STAGES * multiplier
     estimated_cost = max(
         _BASE_AI_COST_USD,
-        (total_tokens / 1_000_000) * _COST_PER_MILLION_TOKENS,
+        (total_tokens / 1_000_000) * _cost_per_m,
     )
 
     # Estimate duration
-    estimated_duration = int(_AVG_MINUTES_PER_STAGE * _PIPELINE_STAGES * multiplier)
+    estimated_duration = int(_avg_mins * _PIPELINE_STAGES * multiplier)
 
     return ComplexityResult(
         overall_score=overall,

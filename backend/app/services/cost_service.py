@@ -7,6 +7,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+
+import structlog
+
+logger = structlog.get_logger(__name__)
 # Pricing per million tokens (as of 2026-03) — USD
 _ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-6": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
@@ -21,6 +25,18 @@ _GEMINI_PRICING: dict[str, dict[str, float]] = {
     "gemini-3.1-pro-preview": {"input": 1.75, "output": 7.0, "cache_read": 0.0, "cache_write": 0.0},
 }
 _ALL_PRICING = {**_ANTHROPIC_PRICING, **_GEMINI_PRICING}
+
+# AUDIT-T3-10: Allow config overrides for pricing (e.g., negotiated rates)
+try:
+    from app.config import get_settings as _get_cost_settings
+    _pricing_overrides = getattr(_get_cost_settings(), "pricing_overrides", None)
+    if isinstance(_pricing_overrides, dict):
+        for model_name, model_pricing in _pricing_overrides.items():
+            if isinstance(model_pricing, dict):
+                _ALL_PRICING[model_name] = model_pricing
+except Exception:
+    pass  # Config not available at import time — use defaults
+
 _USD_TO_INR = 84.0  # approximate
 
 
@@ -49,16 +65,37 @@ class PipelineCost:
     estimated_savings_usd: float = 0.0  # From cache hits
 
 
+def _reload_pricing_overrides() -> dict[str, dict[str, float]]:
+    """AUDIT-B3-FIX: Reload pricing overrides from config at call time.
+
+    Previously overrides were loaded once at import — config changes were ignored.
+    """
+    pricing = {**_ANTHROPIC_PRICING, **_GEMINI_PRICING}
+    try:
+        from app.config import get_settings as _get_cost_settings
+        overrides = getattr(_get_cost_settings(), "pricing_overrides", None)
+        if isinstance(overrides, dict):
+            for model_name, model_pricing in overrides.items():
+                if isinstance(model_pricing, dict):
+                    pricing[model_name] = model_pricing
+    except Exception:
+        pass
+    return pricing
+
+
 def calculate_pipeline_cost(run_id: str, steps_data: list[dict[str, Any]]) -> PipelineCost:
     """Calculate cost from pipeline step records.
 
     COST-FIX: Reads token counts from pipeline.steps table rows and
     calculates estimated API cost in USD and INR per agent/stage.
+    AUDIT-B3-FIX: Now reloads pricing overrides at call time.
     """
+    # AUDIT-B3-FIX: Reload pricing each call so config changes take effect
+    current_pricing = _reload_pricing_overrides()
     result = PipelineCost(run_id=run_id)
     for step in steps_data:
         model = step.get("model_used", "")
-        pricing = _ALL_PRICING.get(
+        pricing = current_pricing.get(
             model,
             {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
         )

@@ -18,9 +18,16 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
+    ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    call_ai_with_tools,
+    handle_web_tool,
     register_agent,
     run_agent,
     store_output,
+    check_inbox,
+    format_inbox_for_prompt,
 )
 from app.services.ai_router import TaskComplexity
 
@@ -98,6 +105,94 @@ All endpoints require Bearer token authentication unless marked as public.
 """
 
 
+WRITE_FILE_TOOL = ToolDefinition(
+    name="write_file",
+    description=(
+        "Write a documentation file. Use this to create or overwrite "
+        "generated documentation files (README.md, API docs, setup guides, etc.)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path relative to project root (e.g., 'README.md', 'docs/API_REFERENCE.md').",
+            },
+            "content": {
+                "type": "string",
+                "description": "The full content to write to the file.",
+            },
+        },
+        "required": ["path", "content"],
+    },
+)
+
+READ_FILE_TOOL = ToolDefinition(
+    name="read_file",
+    description=(
+        "Read a generated code file from the pipeline context. Use this to "
+        "inspect generated source code when writing documentation that needs "
+        "to reference actual implementation details."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path to read (e.g., 'backend/app/main.py').",
+            },
+        },
+        "required": ["path"],
+    },
+)
+
+
+class DocsToolHandler:
+    """Handles tool calls for DocsAgent's agentic documentation loop."""
+
+    def __init__(self, context: dict[str, Any]) -> None:
+        self._context = context
+        self._documents: dict[str, str] = {}
+        self._complete: bool = False  # Signals call_ai_with_tools to stop
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        # Delegate web tools first
+        web_result = await handle_web_tool(tool_name, tool_input)
+        if web_result is not None:
+            return web_result
+
+        if tool_name == "write_file":
+            return self._write_file(tool_input["path"], tool_input["content"])
+        elif tool_name == "read_file":
+            return self._read_file(tool_input["path"])
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _write_file(self, path: str, content: str) -> str:
+        """Write a documentation file to the output documents dict."""
+        self._documents[path] = content
+        return f"File written: {path} ({len(content)} chars)"
+
+    def _read_file(self, path: str) -> str:
+        """Read a generated code file from the pipeline context."""
+        # Check all agents' file_contents for the requested path
+        for agent_name in ("shubham", "aanya", "dhruv"):
+            agent_output = self._context.get(agent_name, {})
+            file_contents = agent_output.get("file_contents", {})
+            if path in file_contents:
+                content = file_contents[path]
+                # Cap at 5000 chars to avoid token bloat
+                if len(content) > 5000:
+                    return content[:5000] + "\n... [truncated]"
+                return content
+
+        # Also check documents already written in this session
+        if path in self._documents:
+            return self._documents[path]
+
+        return f"File not found: {path}"
+
+
 class DocsAgent:
     """Documentation Agent — generates API docs, user guide, README."""
 
@@ -107,9 +202,14 @@ class DocsAgent:
     default_model: str | None = None
 
     @property
-    def tools(self) -> list:
-        """No tools — DocsAgent is a template engine, no AI calls."""
-        return []
+    def tools(self) -> list[ToolDefinition]:
+        """Tools for documentation generation with web research capabilities."""
+        return [
+            WEB_SEARCH_TOOL,
+            WEB_SCRAPE_TOOL,
+            WRITE_FILE_TOOL,
+            READ_FILE_TOOL,
+        ]
 
     async def run(
         self,
@@ -125,6 +225,10 @@ class DocsAgent:
         context: dict[str, Any],
     ) -> AgentResult:
         """Generate project documentation from pipeline context."""
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         contract = context.get("vikram", {}).get("contract", {})
         if not contract:
             return AgentResult(
@@ -135,22 +239,84 @@ class DocsAgent:
 
         project_name = contract.get("project_name", "Project")
 
-        # Generate README
+        # Generate base documents from templates (preserved from original)
         readme = self._generate_readme(contract, context)
-
-        # Generate API docs
         api_docs = self._generate_api_docs(contract, context)
-
-        # Generate setup guide
         setup_guide = self._generate_setup_guide(contract, context)
 
+        # Initialize tool handler with template-generated docs as starting point
+        handler = DocsToolHandler(context)
+        handler._documents = {
+            "README.md": readme,
+            "docs/API_REFERENCE.md": api_docs,
+            "docs/SETUP_GUIDE.md": setup_guide,
+        }
+
+        # Build system prompt for AI-enhanced documentation
+        import json as _json_mod
+        tech_stack = contract.get("tech_stack", {})
+        endpoints = contract.get("api", {}).get("endpoints", [])
+        endpoint_summary = _json_mod.dumps(endpoints[:10], default=str)[:2000] if endpoints else "[]"
+
+        system_prompt = (
+            "You are the Documentation Agent at NexSidi. Your job is to generate "
+            "comprehensive, accurate project documentation.\n\n"
+            "Template-generated base documents have already been written to:\n"
+            "- README.md\n"
+            "- docs/API_REFERENCE.md\n"
+            "- docs/SETUP_GUIDE.md\n\n"
+            "## Your capabilities:\n"
+            "- **web_search**: Research best practices, framework docs, or library usage\n"
+            "- **web_scrape**: Read specific documentation pages found via search\n"
+            "- **read_file**: Inspect generated source code files for accuracy\n"
+            "- **write_file**: Update or create documentation files\n\n"
+            "## Your workflow:\n"
+            "1. Review the base documents already generated\n"
+            "2. Optionally use web_search to research framework-specific setup or best practices\n"
+            "3. Optionally use read_file to inspect generated code for accuracy\n"
+            "4. Use write_file to improve or add documentation as needed\n"
+            "5. When satisfied with all docs, stop calling tools\n\n"
+            "Focus on accuracy and completeness. Keep existing template content if it's correct."
+        )
+
+        user_content = (
+            f"Project: {project_name}\n"
+            f"Tech Stack: {_json_mod.dumps(tech_stack, default=str)[:1000]}\n"
+            f"Endpoints ({len(endpoints)} total): {endpoint_summary}\n\n"
+            "Base documentation has been generated from templates. "
+            "Review and enhance the docs. Use web_search if you need to research "
+            "framework-specific setup instructions or best practices. "
+            "Use read_file to check generated code for accuracy in API docs."
+        )
+
+        # Inject inbox context if present
+        if inbox_context:
+            user_content = f"{inbox_context}\n\n{user_content}"
+
+        try:
+            response = await call_ai_with_tools(
+                agent=self,
+                messages=[{"role": "user", "content": user_content}],
+                system_prompt=system_prompt,
+                task_type="general",
+                tool_handler=handler,
+                max_tool_rounds=10,
+            )
+        except Exception as exc:
+            # Fallback to template-generated docs if AI call fails
+            from app.services.ai_router import _sanitize_error
+            logger.warning(
+                "docs_ai_enhancement_failed",
+                error=_sanitize_error(exc),
+                fallback="using template docs",
+            )
+
+        # Use handler's documents (may have been enhanced by AI, or still template originals)
+        documents = handler._documents
+
         output = {
-            "documents": {
-                "README.md": readme,
-                "docs/API_REFERENCE.md": api_docs,
-                "docs/SETUP_GUIDE.md": setup_guide,
-            },
-            "total_docs": 3,
+            "documents": documents,
+            "total_docs": len(documents),
             "project_name": project_name,
         }
 
@@ -159,7 +325,7 @@ class DocsAgent:
         logger.info(
             "docs_generated",
             project=project_name,
-            total_docs=3,
+            total_docs=len(documents),
         )
 
         return AgentResult(

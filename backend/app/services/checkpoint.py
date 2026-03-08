@@ -63,6 +63,13 @@ class CheckpointData:
     design_specs: dict[str, Any] | None = None
     test_results: dict[str, Any] | None = None
     security_report: dict[str, Any] | None = None
+    # PHASE-6: UI preview screenshots (base64 PNGs)
+    ui_previews: list[str] = field(default_factory=list)
+    responsive_results: list[dict[str, Any]] = field(default_factory=list)
+    # Directive 2: Visual matrix test results (multi-viewport screenshots)
+    visual_matrix_results: list[dict[str, Any]] = field(default_factory=list)
+    # Directive 5A: SDD document (Markdown, generated from contract)
+    sdd_document: str | None = None
 
     # Approval tracking
     status: ApprovalStatus = ApprovalStatus.PENDING
@@ -116,6 +123,19 @@ class CheckpointService:
             "validation_errors": vikram.get("validation_errors", []),
         }
 
+        # Directive 5A: Generate SDD document from contract
+        sdd_markdown: str | None = None
+        try:
+            from app.services.sdd_generator import get_sdd_generator
+            _sdd_gen = get_sdd_generator()
+            _sdd_doc = _sdd_gen.generate_sdd(contract, context)
+            sdd_markdown = _sdd_doc.markdown
+            summary["sdd_generated"] = True
+            summary["sdd_sections"] = len(_sdd_doc.sections)
+        except Exception as _sdd_exc:
+            logger.warning("sdd_generation_failed", error=str(_sdd_exc)[:200])
+            summary["sdd_generated"] = False
+
         from datetime import timedelta
 
         checkpoint = CheckpointData(
@@ -128,6 +148,7 @@ class CheckpointService:
             architecture_contract=contract,
             database_schema=dhruv.get("database_artifacts"),
             design_specs=vanya.get("design_spec"),
+            sdd_document=sdd_markdown,
             expires_at=datetime.now(timezone.utc) + timedelta(days=7),
         )
 
@@ -143,7 +164,7 @@ class CheckpointService:
 
         return checkpoint
 
-    def create_testing_checkpoint(
+    async def create_testing_checkpoint(
         self,
         pipeline_run_id: str,
         project_id: str,
@@ -151,8 +172,56 @@ class CheckpointService:
         user_id: str,
         context: dict[str, Any],
     ) -> CheckpointData:
-        """Create CHECKPOINT 2 from test and security context."""
+        """Create CHECKPOINT 2 from test and security context.
+
+        PHASE-6: Also captures UI preview screenshots if browser testing available.
+        """
         from datetime import timedelta
+
+        # PHASE-6: Capture UI preview screenshots
+        ui_previews: list[str] = []
+        responsive: list[dict[str, Any]] = []
+        try:
+            from app.services.browser_testing import BrowserTestRunner
+            runner = BrowserTestRunner()
+            # If a frontend server URL is available from agent sandbox results
+            aanya_output = context.get("aanya", {})
+            if isinstance(aanya_output, dict):
+                _self_test = aanya_output.get("self_test_results", {})
+                if _self_test.get("server_started"):
+                    # Capture preview of the running frontend
+                    preview_url = f"http://localhost:{_self_test.get('port', 3000)}"
+                    preview_b64 = await runner.capture_preview(preview_url)
+                    if preview_b64:
+                        ui_previews.append(preview_b64)
+                    # Also run responsive tests
+                    resp_results = await runner.test_responsive(preview_url)
+                    for r in resp_results:
+                        responsive.append({
+                            "viewport": r.viewport_name,
+                            "width": r.width,
+                            "height": r.height,
+                            "loaded": r.page_result.loaded if r.page_result else False,
+                        })
+        except Exception as _bt_exc:
+            logger.debug("browser_preview_skipped", error=str(_bt_exc)[:200])
+
+        # Directive 2: Pull visual matrix test results from Aarav's output
+        visual_matrix: list[dict[str, Any]] = []
+        aarav_output = context.get("aarav", {})
+        if isinstance(aarav_output, dict):
+            _visual_report = aarav_output.get("visual_test_report", {})
+            if isinstance(_visual_report, dict) and _visual_report.get("matrix_tested"):
+                visual_matrix.append(_visual_report)
+                # Also count viewport screenshots in the summary
+                _ss_count = _visual_report.get("screenshots_count", 0)
+                if _ss_count > 0:
+                    logger.info(
+                        "visual_matrix_evidence_captured",
+                        screenshots=_ss_count,
+                        viewports=len(_visual_report.get("viewports_tested", [])),
+                        pipeline_run_id=pipeline_run_id,
+                    )
 
         checkpoint = CheckpointData(
             checkpoint_type=CheckpointType.TESTING,
@@ -163,9 +232,17 @@ class CheckpointService:
             summary={
                 "test_status": "See test results",
                 "security_status": "See security report",
+                "ui_previews_count": len(ui_previews),
+                "visual_matrix_tested": bool(visual_matrix),
+                "visual_screenshots_count": sum(
+                    v.get("screenshots_count", 0) for v in visual_matrix
+                ),
             },
-            test_results=context.get("aarav", {}),
+            test_results=aarav_output,
             security_report=context.get("karan", {}),
+            ui_previews=ui_previews,
+            responsive_results=responsive,
+            visual_matrix_results=visual_matrix,
             expires_at=datetime.now(timezone.utc) + timedelta(days=7),
         )
 
@@ -196,9 +273,16 @@ class CheckpointService:
         for k, _ in candidates[:to_remove]:
             del self._checkpoints[k]
 
-    def get_checkpoint(self, checkpoint_id: str) -> CheckpointData | None:
-        """Get a checkpoint by ID."""
-        return self._checkpoints.get(checkpoint_id)
+    def get_checkpoint(self, checkpoint_id: str, org_id: str | None = None) -> CheckpointData | None:
+        """Get a checkpoint by ID.
+
+        AUDIT-T2-18: Added org_id validation to prevent cross-tenant data leaks.
+        """
+        cp = self._checkpoints.get(checkpoint_id)
+        if cp and org_id and cp.organization_id != org_id:
+            logger.warning("checkpoint_access_denied", checkpoint_id=checkpoint_id, requested_org=org_id)
+            return None
+        return cp
 
     def get_pipeline_checkpoints(self, pipeline_run_id: str) -> list[CheckpointData]:
         """Get all checkpoints for a pipeline run."""
@@ -228,6 +312,8 @@ class CheckpointService:
         # Check expiry
         if cp.expires_at and datetime.now(timezone.utc) > cp.expires_at:
             cp.status = ApprovalStatus.EXPIRED
+            # AUDIT-T3-2: Evict expired checkpoint from memory to prevent leak
+            del self._checkpoints[checkpoint_id]
             raise ValueError(f"Checkpoint {checkpoint_id} has expired")
 
         cp.status = ApprovalStatus.APPROVED
@@ -261,6 +347,8 @@ class CheckpointService:
 
         if cp.expires_at and datetime.now(timezone.utc) > cp.expires_at:
             cp.status = ApprovalStatus.EXPIRED
+            # AUDIT-T3-2: Evict expired checkpoint from memory to prevent leak
+            del self._checkpoints[checkpoint_id]
             raise ValueError(f"Checkpoint {checkpoint_id} has expired")
 
         cp.status = ApprovalStatus.REJECTED
@@ -291,6 +379,8 @@ class CheckpointService:
 
         if cp.expires_at and datetime.now(timezone.utc) > cp.expires_at:
             cp.status = ApprovalStatus.EXPIRED
+            # AUDIT-T3-2: Evict expired checkpoint from memory to prevent leak
+            del self._checkpoints[checkpoint_id]
             raise ValueError(f"Checkpoint {checkpoint_id} has expired")
 
         cp.status = ApprovalStatus.CHANGES_REQUESTED

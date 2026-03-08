@@ -70,6 +70,28 @@ class VirtualFileSystem:
         await self._redis.set(
             manifest_key, orjson.dumps(manifest), ex=self._ttl,
         )
+
+        # PHASE-5: Dual-write to disk-backed workspace if available
+        try:
+            from app.services.project_workspace import get_workspace
+            _ws = get_workspace(run_id)
+            _ws.write_file(path, content, agent=agent)
+        except Exception as _ws_exc:
+            logger.debug("vfs_dual_write_failed", error=str(_ws_exc)[:100])
+
+        # Directive 5: Publish file_write event for real-time streaming
+        try:
+            from app.services.pipeline_events import publish_file_write_event
+            await publish_file_write_event(
+                run_id=run_id,
+                agent=agent,
+                file_path=path,
+                is_final=True,
+                size=len(content),
+            )
+        except Exception:
+            pass  # Non-fatal: event publishing failure must not block VFS writes
+
         return entry
 
     async def store_files(
@@ -103,6 +125,16 @@ class VirtualFileSystem:
         pipe.set(manifest_key, orjson.dumps(manifest), ex=self._ttl)
 
         await pipe.execute()
+
+        # PHASE-5: Dual-write to disk-backed workspace if available
+        try:
+            from app.services.project_workspace import get_workspace
+            _ws = get_workspace(run_id)
+            for path, content in files.items():
+                _ws.write_file(path, content, agent=agent)
+        except Exception as _ws_exc:
+            logger.debug("vfs_dual_write_failed", error=str(_ws_exc)[:100])
+
         logger.debug(
             "vfs_files_stored",
             run_id=run_id,
@@ -113,13 +145,27 @@ class VirtualFileSystem:
 
     # ── Read Operations ─────────────────────────────────────────────
 
-    async def read_file(self, run_id: str, path: str) -> str | None:
-        """Read a file from VFS.  Returns None if not found."""
+    async def read_file(self, run_id: str, path: str, *, verify: bool = False) -> str | None:
+        """Read a file from VFS.  Returns None if not found.
+
+        P1-5: When ``verify=True``, checks the SHA-256 hash of the content
+        against the VFS manifest.  Raises ``ValueError`` on mismatch.
+        """
         key = f"vfs:{run_id}:file:{path}"
         data = await self._redis.get(key)
         if data is None:
             return None
-        return data.decode("utf-8") if isinstance(data, bytes) else data
+        content = data.decode("utf-8") if isinstance(data, bytes) else data
+        if verify:
+            import hashlib
+            manifest = await self._load_manifest(run_id)
+            expected_hash = manifest.get(path, {}).get("hash", "")
+            if expected_hash:
+                actual_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+                if actual_hash != expected_hash:
+                    logger.error("vfs_integrity_error", path=path, expected=expected_hash, actual=actual_hash)
+                    raise ValueError(f"VFS integrity error: hash mismatch for {path}")
+        return content
 
     async def get_manifest(self, run_id: str) -> dict[str, dict[str, Any]]:
         """Get the file manifest (paths + metadata, no content)."""
@@ -211,7 +257,10 @@ class VirtualFileSystem:
             return {}
         try:
             return orjson.loads(raw)
-        except (orjson.JSONDecodeError, Exception):
+        except (orjson.JSONDecodeError, Exception) as exc:
+            # AUDIT-T1-4: Log manifest corruption at ERROR level for monitoring.
+            # Previously silent — agents thought no files existed → empty ZIP.
+            logger.error("vfs_manifest_corrupt", run_id=run_id, error=str(exc)[:200])
             return {}
 
 

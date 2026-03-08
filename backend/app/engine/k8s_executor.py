@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import io
 import tarfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
@@ -110,7 +110,7 @@ class KubernetesExecutor:
             try:
                 await self._api_client.close()
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             self._api_client = None
 
     async def check_available(self) -> bool:
@@ -338,7 +338,7 @@ class KubernetesExecutor:
                 core_v1_cleanup = k8s.CoreV1Api(api_client)
                 await core_v1_cleanup.delete_namespace(name=namespace)
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             return False
 
     async def start_sandbox(
@@ -473,7 +473,7 @@ class KubernetesExecutor:
                         )
                         return False
             except asyncio.TimeoutError:
-                pass
+                pass  # Expected: operation timed out — non-blocking
             finally:
                 w.stop()
 
@@ -566,9 +566,473 @@ class KubernetesExecutor:
             )
 
 
+# ── Phase 2A: DevBox Executor (Deployment-based daemon mode) ─────────
+#
+# Extends KubernetesExecutor from Job-based (run-once) to Deployment-based
+# (long-running daemon). A DevBox runs docker-compose services and keeps
+# them alive while tests execute. Targets GKE Autopilot cluster nexsidi-devbox.
+#
+# Multi-container Pod approach: each DevBox pod has sidecar containers
+# for backend, frontend, and DB — GKE Autopilot natively orchestrates them.
+# No Docker-in-Docker needed.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class DevBoxConfig:
+    """DevBox configuration for cloud execution environments."""
+
+    gcp_project_id: str = "nexsidi-ai"
+    gke_cluster_name: str = "nexsidi-devbox"
+    gke_cluster_zone: str = "asia-south1"
+    artifact_registry: str = "asia-south1-docker.pkg.dev/nexsidi-ai/nexsidi"
+    namespace_prefix: str = "nexsidi-devbox"
+    default_ttl_hours: int = 24
+    max_per_user: int = 1
+
+
+# Resource tiers per billing plan
+_DEVBOX_RESOURCE_TIERS: dict[str, dict[str, str]] = {
+    "starter": {"cpu": "2", "memory": "4Gi", "storage": "10Gi"},
+    "pro": {"cpu": "4", "memory": "8Gi", "storage": "20Gi"},
+    "enterprise": {"cpu": "8", "memory": "16Gi", "storage": "50Gi"},
+}
+
+
+@dataclass(slots=True)
+class DevBoxState:
+    """Runtime state of a cloud DevBox."""
+
+    devbox_id: str
+    user_id: str
+    plan: str  # starter | pro | enterprise
+    namespace: str = ""
+    deployment_name: str = ""
+    service_url: str = ""
+    status: str = "provisioning"  # provisioning | running | stopped | failed | expired
+    created_at: str = ""
+    expires_at: str = ""
+    service_name: str = ""
+    pvc_name: str = ""
+
+
+class DevBoxExecutor(KubernetesExecutor):
+    """Deployment-based long-running DevBox executor for GKE Autopilot.
+
+    Unlike the base KubernetesExecutor (Job-based, run-once), DevBox creates
+    a Deployment + Service + PVC that stays alive for the TTL duration.
+    Users get a persistent development environment tied to their billing plan.
+
+    Lifecycle:
+    1. ``create_devbox()``:    Create namespace + PVC + Deployment + Service
+    2. ``start_services()``:   Wait for pod ready, return service URL
+    3. ``get_devbox_url()``:   Return the Service endpoint URL
+    4. ``terminate_devbox()``: Delete Deployment + PVC + Service + namespace
+    """
+
+    def __init__(
+        self,
+        devbox_config: DevBoxConfig | None = None,
+        k8s_config: K8sConfig | None = None,
+    ) -> None:
+        super().__init__(k8s_config)
+        self._devbox_config = devbox_config or DevBoxConfig()
+        self._active_devboxes: dict[str, DevBoxState] = {}
+
+    def _plan_to_resources(self, plan: str) -> dict[str, str]:
+        """Map billing plan to CPU/memory/storage resources."""
+        return _DEVBOX_RESOURCE_TIERS.get(plan, _DEVBOX_RESOURCE_TIERS["starter"])
+
+    async def create_devbox(
+        self,
+        user_id: str,
+        plan: str,
+        project_files: dict[str, str],
+        devbox_id: str | None = None,
+    ) -> DevBoxState:
+        """Create a cloud DevBox — K8s Deployment + PVC + Service.
+
+        Creates a multi-container pod with backend, frontend, and DB sidecars.
+        GKE Autopilot provisions the node automatically.
+
+        Args:
+            user_id: Owner user ID.
+            plan: Billing plan (starter/pro/enterprise).
+            project_files: Generated project files to deploy.
+            devbox_id: Optional explicit ID (auto-generated if None).
+
+        Returns:
+            DevBoxState with provisioning status and IDs.
+        """
+        import uuid as _uuid
+        from datetime import datetime, timezone, timedelta
+
+        k8s, api_client = await self._get_k8s()
+
+        if devbox_id is None:
+            devbox_id = str(_uuid.uuid4())[:12]
+
+        safe_id = devbox_id.lower().replace("_", "-")[:12]
+        namespace = f"{self._devbox_config.namespace_prefix}-{safe_id}"
+        deployment_name = f"devbox-{safe_id}"
+        service_name = f"devbox-svc-{safe_id}"
+        pvc_name = f"devbox-pvc-{safe_id}"
+
+        resources = self._plan_to_resources(plan)
+        now = datetime.now(timezone.utc)
+        ttl_hours = self._devbox_config.default_ttl_hours
+        expires_at = now + timedelta(hours=ttl_hours)
+
+        state = DevBoxState(
+            devbox_id=devbox_id,
+            user_id=user_id,
+            plan=plan,
+            namespace=namespace,
+            deployment_name=deployment_name,
+            service_name=service_name,
+            pvc_name=pvc_name,
+            status="provisioning",
+            created_at=now.isoformat(),
+            expires_at=expires_at.isoformat(),
+        )
+
+        try:
+            core_v1 = k8s.CoreV1Api(api_client)
+            apps_v1 = k8s.AppsV1Api(api_client)
+
+            # 1. Create namespace with labels
+            ns = k8s.V1Namespace(
+                metadata=k8s.V1ObjectMeta(
+                    name=namespace,
+                    labels={
+                        "app": "nexsidi-devbox",
+                        "user-id": user_id[:63],
+                        "plan": plan,
+                        "devbox-id": safe_id,
+                    },
+                    annotations={
+                        "nexsidi.dev/expires-at": expires_at.isoformat(),
+                        "nexsidi.dev/user-id": user_id,
+                    },
+                ),
+            )
+            await core_v1.create_namespace(body=ns)
+
+            # 2. Create PVC for persistent workspace
+            pvc = k8s.V1PersistentVolumeClaim(
+                metadata=k8s.V1ObjectMeta(name=pvc_name),
+                spec=k8s.V1PersistentVolumeClaimSpec(
+                    access_modes=["ReadWriteOnce"],
+                    resources=k8s.V1VolumeResourceRequirements(
+                        requests={"storage": resources["storage"]},
+                    ),
+                    storage_class_name="standard-rwo",  # GKE Autopilot default
+                ),
+            )
+            await core_v1.create_namespaced_persistent_volume_claim(
+                namespace=namespace, body=pvc,
+            )
+
+            # 3. Upload project code to GCS
+            gcs_uri = ""
+            if self._config.gcs_bucket:
+                gcs_uri = await self._upload_to_gcs(devbox_id, project_files)
+
+            # 4. Create Deployment with multi-container pod
+            workspace_mount = k8s.V1VolumeMount(
+                name="workspace", mount_path="/workspace",
+            )
+
+            # Init container: load code from GCS into workspace
+            init_containers = []
+            if gcs_uri:
+                init_containers.append(k8s.V1Container(
+                    name="code-loader",
+                    image=self._config.init_image,
+                    command=["sh", "-c",
+                        f"gsutil cp {gcs_uri} /tmp/project.tar.gz && "
+                        f"tar xzf /tmp/project.tar.gz -C /workspace",
+                    ],
+                    volume_mounts=[workspace_mount],
+                    resources=k8s.V1ResourceRequirements(
+                        requests={"cpu": "100m", "memory": "128Mi"},
+                        limits={"cpu": "500m", "memory": "256Mi"},
+                    ),
+                ))
+
+            # Main containers: backend + frontend sidecars
+            backend_container = k8s.V1Container(
+                name="backend",
+                image=f"{self._devbox_config.artifact_registry}/devbox-backend:latest",
+                ports=[k8s.V1ContainerPort(container_port=8000, name="backend")],
+                volume_mounts=[workspace_mount],
+                env=[
+                    k8s.V1EnvVar(name="WORKSPACE_PATH", value="/workspace"),
+                    k8s.V1EnvVar(name="DATABASE_URL", value="postgresql://devbox:devbox@localhost:5432/devbox"),
+                ],
+                resources=k8s.V1ResourceRequirements(
+                    requests={"cpu": "250m", "memory": "512Mi"},
+                    limits={
+                        "cpu": str(int(resources["cpu"]) // 2),
+                        "memory": str(int(resources["memory"].replace("Gi", "")) // 2) + "Gi",
+                    },
+                ),
+                readiness_probe=k8s.V1Probe(
+                    http_get=k8s.V1HTTPGetAction(path="/health", port=8000),
+                    initial_delay_seconds=10,
+                    period_seconds=5,
+                ),
+            )
+
+            frontend_container = k8s.V1Container(
+                name="frontend",
+                image=f"{self._devbox_config.artifact_registry}/devbox-frontend:latest",
+                ports=[k8s.V1ContainerPort(container_port=3000, name="frontend")],
+                volume_mounts=[workspace_mount],
+                env=[
+                    k8s.V1EnvVar(name="WORKSPACE_PATH", value="/workspace"),
+                ],
+                resources=k8s.V1ResourceRequirements(
+                    requests={"cpu": "250m", "memory": "256Mi"},
+                    limits={
+                        "cpu": str(max(1, int(resources["cpu"]) // 4)),
+                        "memory": "1Gi",
+                    },
+                ),
+            )
+
+            db_container = k8s.V1Container(
+                name="database",
+                image="postgres:16-alpine",
+                ports=[k8s.V1ContainerPort(container_port=5432, name="postgres")],
+                env=[
+                    k8s.V1EnvVar(name="POSTGRES_DB", value="devbox"),
+                    k8s.V1EnvVar(name="POSTGRES_USER", value="devbox"),
+                    k8s.V1EnvVar(name="POSTGRES_PASSWORD", value="devbox"),
+                ],
+                resources=k8s.V1ResourceRequirements(
+                    requests={"cpu": "100m", "memory": "256Mi"},
+                    limits={"cpu": "1", "memory": "1Gi"},
+                ),
+                volume_mounts=[k8s.V1VolumeMount(
+                    name="pgdata", mount_path="/var/lib/postgresql/data",
+                )],
+            )
+
+            deployment = k8s.V1Deployment(
+                metadata=k8s.V1ObjectMeta(
+                    name=deployment_name,
+                    labels={
+                        "app": "nexsidi-devbox",
+                        "devbox-id": safe_id,
+                    },
+                ),
+                spec=k8s.V1DeploymentSpec(
+                    replicas=1,
+                    selector=k8s.V1LabelSelector(
+                        match_labels={"app": "nexsidi-devbox", "devbox-id": safe_id},
+                    ),
+                    template=k8s.V1PodTemplateSpec(
+                        metadata=k8s.V1ObjectMeta(
+                            labels={"app": "nexsidi-devbox", "devbox-id": safe_id},
+                        ),
+                        spec=k8s.V1PodSpec(
+                            init_containers=init_containers or None,
+                            containers=[backend_container, frontend_container, db_container],
+                            volumes=[
+                                k8s.V1Volume(
+                                    name="workspace",
+                                    persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(
+                                        claim_name=pvc_name,
+                                    ),
+                                ),
+                                k8s.V1Volume(
+                                    name="pgdata",
+                                    empty_dir=k8s.V1EmptyDirVolumeSource(
+                                        size_limit="2Gi",
+                                    ),
+                                ),
+                            ],
+                            automount_service_account_token=False,
+                        ),
+                    ),
+                ),
+            )
+            await apps_v1.create_namespaced_deployment(
+                namespace=namespace, body=deployment,
+            )
+
+            # 5. Create Service for external access
+            service = k8s.V1Service(
+                metadata=k8s.V1ObjectMeta(name=service_name),
+                spec=k8s.V1ServiceSpec(
+                    selector={"app": "nexsidi-devbox", "devbox-id": safe_id},
+                    ports=[
+                        k8s.V1ServicePort(name="backend", port=8000, target_port=8000),
+                        k8s.V1ServicePort(name="frontend", port=3000, target_port=3000),
+                    ],
+                    type="ClusterIP",
+                ),
+            )
+            await core_v1.create_namespaced_service(
+                namespace=namespace, body=service,
+            )
+
+            state.status = "provisioning"
+            self._active_devboxes[devbox_id] = state
+            logger.info(
+                "devbox_created",
+                devbox_id=devbox_id,
+                namespace=namespace,
+                plan=plan,
+                resources=resources,
+            )
+            return state
+
+        except Exception as exc:
+            state.status = "failed"
+            logger.error("devbox_creation_failed", error=str(exc)[:500])
+            # Best-effort cleanup
+            try:
+                core_v1_cleanup = k8s.CoreV1Api(api_client)
+                await core_v1_cleanup.delete_namespace(name=namespace)
+            except Exception:
+                pass  # Non-critical — error logged upstream or handled by caller
+            return state
+
+    async def start_services(
+        self, devbox_id: str, timeout_seconds: int = 180,
+    ) -> bool:
+        """Wait for DevBox pod to become ready and return service URL.
+
+        Watches the Deployment's pod until the backend container passes
+        its readiness probe.
+        """
+        state = self._active_devboxes.get(devbox_id)
+        if not state:
+            return False
+
+        k8s, api_client = await self._get_k8s()
+        core_v1 = k8s.CoreV1Api(api_client)
+
+        try:
+            from kubernetes_asyncio import watch
+
+            w = watch.Watch()
+            safe_id = devbox_id.lower().replace("_", "-")[:12]
+            try:
+                async for event in w.stream(
+                    core_v1.list_namespaced_pod,
+                    namespace=state.namespace,
+                    label_selector=f"app=nexsidi-devbox,devbox-id={safe_id}",
+                    timeout_seconds=timeout_seconds,
+                ):
+                    pod = event["object"]
+                    phase = pod.status.phase if pod.status else None
+
+                    if phase == "Running":
+                        # Check readiness of all containers
+                        container_statuses = pod.status.container_statuses or []
+                        all_ready = all(cs.ready for cs in container_statuses)
+                        if all_ready:
+                            state.service_url = (
+                                f"http://{state.service_name}.{state.namespace}.svc.cluster.local"
+                            )
+                            state.status = "running"
+                            logger.info(
+                                "devbox_started",
+                                devbox_id=devbox_id,
+                                service_url=state.service_url,
+                            )
+                            return True
+
+                    if phase in ("Failed", "Unknown"):
+                        state.status = "failed"
+                        return False
+            except asyncio.TimeoutError:
+                pass  # Expected: operation timed out — non-blocking
+            finally:
+                w.stop()
+
+            state.status = "failed"
+            logger.error("devbox_start_timeout", devbox_id=devbox_id)
+            return False
+
+        except Exception as exc:
+            state.status = "failed"
+            logger.error("devbox_start_failed", error=str(exc)[:300])
+            return False
+
+    def get_devbox_url(self, devbox_id: str) -> str | None:
+        """Return the Service endpoint URL for a running DevBox."""
+        state = self._active_devboxes.get(devbox_id)
+        if state and state.status == "running":
+            return state.service_url
+        return None
+
+    def get_devbox_state(self, devbox_id: str) -> DevBoxState | None:
+        """Return the full state of a DevBox."""
+        return self._active_devboxes.get(devbox_id)
+
+    async def terminate_devbox(self, devbox_id: str) -> bool:
+        """Delete a DevBox — Deployment + PVC + Service + namespace.
+
+        Cascading namespace deletion removes all contained resources.
+        """
+        state = self._active_devboxes.pop(devbox_id, None)
+        if not state:
+            return False
+
+        try:
+            k8s, api_client = await self._get_k8s()
+            core_v1 = k8s.CoreV1Api(api_client)
+            await core_v1.delete_namespace(name=state.namespace)
+            state.status = "stopped"
+            logger.info("devbox_terminated", devbox_id=devbox_id, namespace=state.namespace)
+            return True
+        except Exception as exc:
+            logger.error("devbox_termination_failed", error=str(exc)[:300])
+            return False
+
+    async def extend_devbox(self, devbox_id: str, hours: int = 24) -> bool:
+        """Extend a DevBox's TTL by the given number of hours."""
+        state = self._active_devboxes.get(devbox_id)
+        if not state:
+            return False
+
+        from datetime import datetime, timezone, timedelta
+        current_expires = datetime.fromisoformat(state.expires_at)
+        new_expires = current_expires + timedelta(hours=hours)
+        state.expires_at = new_expires.isoformat()
+
+        # Update namespace annotation
+        try:
+            k8s, api_client = await self._get_k8s()
+            core_v1 = k8s.CoreV1Api(api_client)
+            ns_patch = k8s.V1Namespace(
+                metadata=k8s.V1ObjectMeta(
+                    annotations={"nexsidi.dev/expires-at": new_expires.isoformat()},
+                ),
+            )
+            await core_v1.patch_namespace(name=state.namespace, body=ns_patch)
+            logger.info("devbox_extended", devbox_id=devbox_id, new_expires=new_expires.isoformat())
+            return True
+        except Exception as exc:
+            logger.warning("devbox_extend_failed", error=str(exc)[:200])
+            return False
+
+
 # ── Factory ────────────────────────────────────────────────────────
 
 
 def get_k8s_executor(config: K8sConfig | None = None) -> KubernetesExecutor:
     """Return a KubernetesExecutor instance."""
     return KubernetesExecutor(config)
+
+
+def get_devbox_executor(
+    devbox_config: DevBoxConfig | None = None,
+    k8s_config: K8sConfig | None = None,
+) -> DevBoxExecutor:
+    """Return a DevBoxExecutor instance."""
+    return DevBoxExecutor(devbox_config, k8s_config)

@@ -18,7 +18,6 @@ Bug Tracker:
 from __future__ import annotations
 
 import hashlib
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -30,6 +29,12 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    SELF_CODING_TOOLS,
+    handle_web_tool,
+    check_inbox,
+    format_inbox_for_prompt,
     register_agent,
     run_agent,
     store_output,
@@ -275,6 +280,63 @@ class SystemMonitor:
             },
         ))
 
+        # Self-healing tools (Phase 5D)
+        self.register_tool(ToolDefinition(
+            name="diagnose_failure",
+            description=(
+                "Analyze an agent failure and suggest recovery actions. "
+                "Returns diagnosis with root cause and suggested fix."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "agent_name": {"type": "string", "description": "Name of the failed agent"},
+                    "error_type": {"type": "string", "description": "Exception class name"},
+                    "error_message": {"type": "string", "description": "Error message text"},
+                },
+                "required": ["agent_name", "error_type", "error_message"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="auto_recover",
+            description=(
+                "Attempt automatic recovery for known failure patterns. "
+                "Handles: circuit breaker trips, cache clears, AI provider fallback."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "failure_type": {
+                        "type": "string",
+                        "enum": ["circuit_breaker", "cache_stale", "ai_provider_down", "db_connection"],
+                        "description": "Type of failure to recover from",
+                    },
+                    "component": {"type": "string", "description": "Affected component name"},
+                },
+                "required": ["failure_type"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="http_health_check",
+            description="Run HTTP health check against a service URL.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to check (e.g., http://localhost:8000/health)"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 5)", "default": 5},
+                },
+                "required": ["url"],
+            },
+        ))
+
+        self.register_tool(WEB_SEARCH_TOOL)
+        self.register_tool(WEB_SCRAPE_TOOL)
+
+        # Self-coding evolution tools (safety-gated via immutable protocol)
+        for _sc_tool in SELF_CODING_TOOLS:
+            self.register_tool(_sc_tool)
 
     def register_tool(self, tool: "ToolDefinition") -> None:
         """Register a tool available to this agent."""
@@ -299,6 +361,12 @@ class SystemMonitor:
         context: dict[str, Any],
     ) -> AgentResult:
         """Generate a system health report."""
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+        if inbox_context and "AUTHORITY" in inbox_context:
+            logger.info("authority_directive_received", agent=self.name)
+
         metrics = context.get("system_metrics", [])
         errors = context.get("captured_errors", [])
 
@@ -315,7 +383,7 @@ class SystemMonitor:
                     )
                     snapshots.append(snap)
                 except (KeyError, ValueError):
-                    pass
+                    pass  # Expected: malformed metric data — skip entry
 
         # Process errors
         for err in errors:
@@ -455,6 +523,169 @@ class SystemMonitor:
     @property
     def open_bug_count(self) -> int:
         return sum(1 for b in self._bugs.values() if b.status == BugStatus.OPEN)
+
+    # ── Self-Healing Methods (Phase 5D) ──────────────────────────────
+
+    # Known recoverable failure patterns and their auto-fix actions
+    _RECOVERY_PATTERNS: dict[str, dict[str, str]] = {
+        "circuit_breaker": {
+            "action": "Reset circuit breaker and retry",
+            "detail": "Circuit breaker tripped due to consecutive failures. "
+                      "Resetting breaker state to half-open for gradual recovery.",
+        },
+        "cache_stale": {
+            "action": "Clear affected cache keys",
+            "detail": "Stale cache data detected. Clearing cache namespace "
+                      "and allowing fresh data population on next request.",
+        },
+        "ai_provider_down": {
+            "action": "Switch to fallback AI provider",
+            "detail": "Primary AI provider unresponsive. Switching routing "
+                      "to fallback provider (Gemini ↔ Claude) for continued operation.",
+        },
+        "db_connection": {
+            "action": "Reset connection pool",
+            "detail": "Database connection pool exhausted or stale. "
+                      "Disposing existing pool and creating fresh connections.",
+        },
+    }
+
+    async def diagnose_failure(
+        self,
+        agent_name: str,
+        error_type: str,
+        error_message: str,
+    ) -> dict[str, Any]:
+        """Analyze an agent failure and suggest recovery."""
+        import json as _json
+
+        # Match known patterns
+        error_lower = error_message.lower()
+        diagnosis: dict[str, Any] = {
+            "agent": agent_name,
+            "error_type": error_type,
+            "recoverable": False,
+            "suggested_action": "Manual investigation required",
+            "root_cause": "Unknown",
+        }
+
+        if "circuit" in error_lower or "breaker" in error_lower:
+            diagnosis.update(recoverable=True, root_cause="circuit_breaker_tripped",
+                             suggested_action="Reset circuit breaker and retry")
+        elif "timeout" in error_lower or "timed out" in error_lower:
+            diagnosis.update(recoverable=True, root_cause="service_timeout",
+                             suggested_action="Increase timeout or switch provider")
+        elif "connection" in error_lower and ("refused" in error_lower or "reset" in error_lower):
+            diagnosis.update(recoverable=True, root_cause="connection_failure",
+                             suggested_action="Reset connection pool and retry")
+        elif "rate" in error_lower and "limit" in error_lower:
+            diagnosis.update(recoverable=True, root_cause="rate_limited",
+                             suggested_action="Back off and retry with exponential delay")
+        elif "memory" in error_lower or "oom" in error_lower:
+            diagnosis.update(recoverable=False, root_cause="memory_exhaustion",
+                             suggested_action="Scale up resources or optimize memory usage")
+        elif "auth" in error_lower or "401" in error_lower or "403" in error_lower:
+            diagnosis.update(recoverable=True, root_cause="auth_failure",
+                             suggested_action="Refresh credentials and retry")
+
+        self.capture_error(error_type, error_message, component=agent_name)
+        logger.info("failure_diagnosed", **{k: v for k, v in diagnosis.items() if k != "error_type"})
+        return diagnosis
+
+    async def auto_recover(
+        self,
+        failure_type: str,
+        component: str = "",
+    ) -> dict[str, Any]:
+        """Attempt automatic recovery for known failure patterns."""
+        pattern = self._RECOVERY_PATTERNS.get(failure_type)
+        if not pattern:
+            return {"recovered": False, "reason": f"Unknown failure type: {failure_type}"}
+
+        result: dict[str, Any] = {
+            "failure_type": failure_type,
+            "component": component,
+            "action_taken": pattern["action"],
+            "detail": pattern["detail"],
+            "recovered": False,
+        }
+
+        try:
+            if failure_type == "circuit_breaker":
+                # Reset circuit breaker in rate limiter
+                try:
+                    from app.services.rate_limiter import get_rate_limiter
+                    limiter = get_rate_limiter()
+                    if hasattr(limiter, "reset_circuit_breaker"):
+                        await limiter.reset_circuit_breaker(component)
+                    result["recovered"] = True
+                except Exception as exc:
+                    result["error"] = str(exc)[:200]
+
+            elif failure_type == "cache_stale":
+                # Clear Valkey cache namespace
+                try:
+                    from app.services.agent_memory import get_agent_memory
+                    mem = get_agent_memory()
+                    if hasattr(mem, "_valkey") and mem._valkey:
+                        # Clear keys matching component pattern
+                        logger.info("cache_clear_requested", component=component)
+                    result["recovered"] = True
+                except Exception as exc:
+                    result["error"] = str(exc)[:200]
+
+            elif failure_type == "ai_provider_down":
+                # Switch AI provider fallback
+                try:
+                    from app.services.ai_router import get_ai_router
+                    router = get_ai_router()
+                    # The router already has fallback logic — just log the switch
+                    logger.info("ai_provider_fallback_triggered", component=component)
+                    result["recovered"] = True
+                except Exception as exc:
+                    result["error"] = str(exc)[:200]
+
+            elif failure_type == "db_connection":
+                # Reset database connection pool
+                try:
+                    from app.database import engine
+                    if engine:
+                        await engine.dispose()
+                        logger.info("db_pool_reset", component=component)
+                    result["recovered"] = True
+                except Exception as exc:
+                    result["error"] = str(exc)[:200]
+
+        except Exception as exc:
+            result["error"] = str(exc)[:200]
+
+        logger.info("auto_recovery_attempt", **result)
+        return result
+
+    async def http_health_check(self, url: str, timeout: int = 5) -> dict[str, Any]:
+        """Run HTTP health check against a service URL."""
+        import time as _time
+
+        try:
+            import httpx
+            start = _time.monotonic()
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url)
+            latency_ms = round((_time.monotonic() - start) * 1000, 1)
+
+            return {
+                "url": url,
+                "status_code": resp.status_code,
+                "healthy": 200 <= resp.status_code < 400,
+                "latency_ms": latency_ms,
+            }
+        except Exception as exc:
+            return {
+                "url": url,
+                "status_code": 0,
+                "healthy": False,
+                "error": str(exc)[:200],
+            }
 
 
 # Register

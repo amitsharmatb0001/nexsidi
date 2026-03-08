@@ -28,11 +28,15 @@ from app.agents.base import (
     AgentInterruptRequest,
     AgentResult,
     AgentStatus,
+    ASK_AGENT_TOOL,
     INTERRUPT_TOOL,
     ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
     call_ai_with_tools,
     clamp_completeness,
     estimate_file_complexity,
+    handle_web_tool,
     register_agent,
     run_agent,
     store_output,
@@ -522,7 +526,13 @@ def compute_parallel_levels(
                 ready.append(name)
 
         if not ready:
-            # Safety: break cycle — just add all remaining sequentially
+            # P2-2: Log cycle details before breaking it.
+            logger.warning(
+                "dependency_cycle_detected",
+                remaining=sorted(remaining),
+                completed=sorted(completed),
+                cycle_broken_by="alphabetical_fallback",
+            )
             ready = sorted(remaining)
 
         level = [step_map[n] for n in ready if n in step_map]
@@ -826,6 +836,10 @@ SHUBHAM_TOOLS: list[ToolDefinition] = [
     ),
     # I1-FIX: Dynamic agent re-dispatch
     INTERRUPT_TOOL,
+    # AGENTIC-FIX: Inter-agent communication + web research
+    ASK_AGENT_TOOL,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
 ]
 
 
@@ -859,8 +873,8 @@ class ShubhamToolHandler:
             self._verification_rules = mistake_memory.build_validation_rules(
                 "shubham", "backend_generation", ""
             )
-        except Exception:
-            pass  # Non-fatal — proceed without extra rules
+        except Exception as _mm_exc:
+            logger.debug("mistake_memory_init_failed", error=str(_mm_exc)[:200])
 
         # CHANGE-2: Persistent gate instance (loop detection history preserved)
         # + rejection counter for max-rejection cap.
@@ -925,6 +939,11 @@ class ShubhamToolHandler:
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         """Route tool calls to the appropriate handler method."""
+        # AGENTIC-FIX: Delegate shared tools (web_search, web_scrape, ask_agent)
+        shared_result = await handle_web_tool(tool_name, tool_input)
+        if shared_result is not None:
+            return shared_result
+
         if tool_name == "write_file":
             return await self._write_file(**tool_input)
         elif tool_name == "read_file":
@@ -999,7 +1018,7 @@ class ShubhamToolHandler:
                                 names.add(target.id)
                 self._export_registry[path] = names
             except SyntaxError:
-                pass  # Already validated by gate — shouldn't happen
+                pass  # Expected: AST parse failed on generated code — validated by gate
 
         msg = f"Written {path} ({len(content)} chars)"
         if result.warnings:
@@ -1083,7 +1102,7 @@ class ShubhamToolHandler:
             try:
                 os.unlink(temp_path)
             except OSError:
-                pass
+                pass  # Expected: temp file cleanup — non-critical
 
             if proc.returncode == 0:
                 return "OK — ruff check passed (syntax + imports + common bugs)"
@@ -1099,12 +1118,11 @@ class ShubhamToolHandler:
             )
 
         except FileNotFoundError:
-            # ruff not installed — fall back to ast.parse
-            pass
+            pass  # Expected: ruff not installed — fall back to ast.parse
         except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
+            logger.debug("ruff_check_timeout", path=path)
+        except Exception as _ruff_exc:
+            logger.debug("ruff_check_failed", path=path, error=str(_ruff_exc)[:200])
 
         # Fallback: ast.parse (syntax only)
         try:
@@ -1219,10 +1237,10 @@ class ShubhamToolHandler:
         )
 
         try:
-            from app.services.ai_router import AIRouter, AIRequest, AIMessage
+            from app.services.ai_router import get_ai_router, AIRequest, AIMessage
             from app.agents.base import TaskComplexity
-
-            router = AIRouter()
+            # AUDIT-T1-10: Use singleton — AIRouter() creates orphaned instances
+            router = get_ai_router()
             response = await router.call(AIRequest(
                 messages=[AIMessage(role="user", content=review_prompt)],
                 complexity=TaskComplexity.LOW,  # Cheapest model
@@ -1476,6 +1494,16 @@ class Shubham:
             )
 
         contract = vikram_output.get("contract", {})
+        # AUDIT-T2-11: Validate contract has minimum required structure before code gen
+        if not contract or not isinstance(contract, dict):
+            return AgentResult(
+                agent_name=self.name,
+                status=AgentStatus.FAILED,
+                error="Architecture contract is empty or invalid — cannot generate backend code",
+            )
+        _api_section = contract.get("api", {})
+        if not isinstance(_api_section, dict) or not _api_section.get("endpoints"):
+            logger.warning("shubham_contract_no_endpoints", contract_keys=list(contract.keys()))
         dhruv_output = context.get("dhruv", {})
         generated_files: dict[str, str] = {}
 
@@ -1571,6 +1599,43 @@ class Shubham:
             template_file_paths=list(generated_files.keys()),
             user_feedback=(user_feedback + _rejection_ctx) if _rejection_ctx else user_feedback,
         )
+
+        # PHASE-3: Check inbox for messages from other agents
+        _prev_outputs = {
+            "vikram": f"Contract for {contract.get('project_name', 'project')}",
+            "dhruv": f"Database artifacts: {len(dhruv_output.get('file_contents', {}))} files",
+        }
+        try:
+            from app.agents.base import check_inbox, format_inbox_for_prompt
+            _inbox_msgs = await check_inbox(self.name, pipeline_run_id)
+            if _inbox_msgs:
+                _inbox_text = format_inbox_for_prompt(_inbox_msgs)
+                _prev_outputs["_agent_messages"] = _inbox_text
+                # AUTHORITY directives from Tilotma/Vikram override normal flow
+                if "AUTHORITY" in _inbox_text:
+                    system_prompt += (
+                        "\n\n⚠ AUTHORITY DIRECTIVE RECEIVED — you MUST comply:\n"
+                        + _inbox_text
+                    )
+        except Exception as _ib_exc:
+            logger.debug("shubham_inbox_failed", error=str(_ib_exc)[:100])
+
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "backend_generation",
+                    "framework": backend_framework,
+                    "task_summary": f"Generate {backend_framework} backend ({len(generation_order)} files)",
+                    "previous_agent_outputs": _prev_outputs,
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
 
         tool_handler = ShubhamToolHandler(
             pipeline_run_id=pipeline_run_id,
@@ -1734,8 +1799,8 @@ class Shubham:
                         )
                         if _lessons:
                             guidance_parts.append(_lessons[:500])
-                    except Exception:
-                        pass
+                    except Exception as _mm_exc:
+                        logger.debug("mistake_memory_lookup_failed", error=str(_mm_exc)[:200])
                     system_prompt = system_prompt + "\n".join(guidance_parts)
 
             logger.warning(
@@ -1786,6 +1851,68 @@ class Shubham:
             "goal_tracker": goal_tracker.summary(),  # PHASE-H
             "adaptive_complexity": adaptive.summary(),  # PHASE-I
         }
+
+        # PHASE-2: Agent self-testing — start backend server and test endpoints
+        try:
+            from app.services.agent_sandbox import AgentSandbox
+            from app.services.project_workspace import get_workspace
+            _ws = get_workspace(pipeline_run_id)
+            # Write generated files to workspace so sandbox can mount them
+            for _fp, _fc in generated_files.items():
+                _ws.write_file(_fp, _fc, agent=self.name)
+            _sandbox = AgentSandbox(run_id=pipeline_run_id, workspace_path=_ws.get_docker_bind_mount())
+            _start = await _sandbox.start_backend(framework=backend_framework)
+            if _start.get("status") in ("running", "simulated", "started_unhealthy"):
+                # Test each endpoint from the contract
+                _endpoints = contract.get("api", {}).get("endpoints", [])
+                _test_results = []
+                for _ep in _endpoints[:10]:  # Test first 10 endpoints
+                    _method = _ep.get("method", "GET").upper()
+                    _path = _ep.get("path", "/")
+                    _tr = await _sandbox.test_endpoint(method=_method, path=_path)
+                    _test_results.append({
+                        "method": _method, "path": _path,
+                        "status": _tr.status_code, "passed": _tr.passed,
+                    })
+                output["self_test_results"] = {
+                    "server_started": True,
+                    "simulated": _start.get("status") == "simulated",
+                    "endpoints_tested": len(_test_results),
+                    "endpoints_passed": sum(1 for t in _test_results if t["passed"]),
+                    "details": _test_results,
+                }
+                logger.info(
+                    "backend_self_test_complete",
+                    tested=len(_test_results),
+                    passed=sum(1 for t in _test_results if t["passed"]),
+                    simulated=_start.get("status") == "simulated",
+                )
+            else:
+                output["self_test_results"] = {
+                    "server_started": False,
+                    "error": _start.get("error", "Backend start failed"),
+                }
+                logger.warning("backend_self_test_server_failed", status=_start.get("status"))
+            await _sandbox.cleanup()
+        except Exception as _st_exc:
+            logger.warning("backend_self_test_skipped", error=str(_st_exc)[:200])
+
+        # PHASE-3: Notify other agents about backend completion
+        try:
+            from app.agents.base import notify_agents
+            _endpoint_count = len(contract.get("api", {}).get("endpoints", []))
+            await notify_agents(
+                from_agent=self.name,
+                pipeline_run_id=pipeline_run_id,
+                message=(
+                    f"Backend generation complete: {len(generated_files)} files, "
+                    f"{backend_framework} framework, {_endpoint_count} endpoints. "
+                    f"Self-test: {output.get('self_test_results', {}).get('endpoints_passed', 'N/A')} passed."
+                ),
+                to_agents=["aanya", "karan", "aarav"],
+            )
+        except Exception as _notify_exc:
+            logger.debug("shubham_notify_failed", error=str(_notify_exc)[:100])
 
         await store_output(self, pipeline_run_id, output)
 
@@ -2476,8 +2603,8 @@ class Shubham:
                     "Pay EXTRA attention to avoiding these error types."
                 )
                 prompt_parts.append("\n".join(warning_parts))
-        except Exception:
-            pass  # Non-fatal — proceed without lessons
+        except Exception as _mm_exc:
+            logger.debug("mistake_memory_prompt_failed", error=str(_mm_exc)[:200])
 
         return "\n".join(prompt_parts)
 

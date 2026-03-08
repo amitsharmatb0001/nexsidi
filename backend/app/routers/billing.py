@@ -201,10 +201,44 @@ async def razorpay_webhook(
                             rec.status = "paid"
                             rec.razorpay_payment_id = razorpay_payment_id
                             logger.info("billing_record_paid", order_id=razorpay_order_id, payment_id=razorpay_payment_id)
+
+                            # Phase 2A: Provision Cloud DevBox on successful payment
+                            try:
+                                from app.config import get_settings as _get_cfg
+                                if _get_cfg().devbox_enabled:
+                                    from app.services.devbox_manager import get_devbox_manager
+                                    _devbox_mgr = get_devbox_manager()
+                                    _devbox_id = await _devbox_mgr.provision_on_payment(
+                                        billing_record_id=str(rec.id),
+                                        user_id=str(rec.organization_id),  # org as user context
+                                        org_id=str(rec.organization_id),
+                                        plan=rec.plan or "starter",
+                                    )
+                                    if _devbox_id:
+                                        logger.info(
+                                            "devbox_provisioned_on_payment",
+                                            devbox_id=_devbox_id,
+                                            plan=rec.plan,
+                                            order_id=razorpay_order_id,
+                                        )
+                            except Exception as _devbox_exc:
+                                # DevBox provisioning failure must NOT fail the webhook.
+                                # Payment is already recorded; DevBox can be manually
+                                # provisioned later via the /api/v2/devbox endpoint.
+                                logger.error(
+                                    "devbox_provisioning_failed_on_payment",
+                                    error=str(_devbox_exc)[:200],
+                                    order_id=razorpay_order_id,
+                                )
                         elif rec is not None:
                             logger.info("billing_webhook_duplicate_ignored", order_id=razorpay_order_id)
             except Exception as exc:
                 logger.error("webhook_db_error", error=str(exc)[:200])
+    elif event_type == "payment.failed":
+        payment = event.get("payload", {}).get("payment", {}).get("entity", {})
+        razorpay_order_id = payment.get("order_id", "")
+        logger.warning("razorpay_payment_failed", order_id=razorpay_order_id)
+
     return {"status": "ok"}
 
 

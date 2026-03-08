@@ -39,7 +39,7 @@ def parse_json(text: str, *, fallback: Any = None) -> Any:
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        pass
+        pass  # Expected: invalid value — fall through to default
 
     # Strategy 2: Strip markdown code fences
     stripped = _strip_markdown_fences(text)
@@ -47,7 +47,7 @@ def parse_json(text: str, *, fallback: Any = None) -> Any:
         try:
             return json.loads(stripped)
         except (json.JSONDecodeError, ValueError):
-            pass
+            pass  # Expected: invalid value — fall through to default
 
     # Strategy 3: Extract first balanced JSON object/array
     extracted = _extract_balanced_json(stripped)
@@ -60,14 +60,14 @@ def parse_json(text: str, *, fallback: Any = None) -> Any:
             try:
                 return json.loads(repaired)
             except (json.JSONDecodeError, ValueError):
-                pass
+                pass  # Expected: invalid value — fall through to default
 
     # Strategy 4b: Repair on the stripped text directly
     repaired = _repair_json(stripped)
     try:
         return json.loads(repaired)
     except (json.JSONDecodeError, ValueError):
-        pass
+        pass  # Expected: invalid value — fall through to default
 
     logger.debug("json_parse_failed", text_len=len(text), preview=text[:100])
     return fallback

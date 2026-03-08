@@ -20,7 +20,16 @@ from typing import Any
 
 import structlog
 
-from app.agents.base import TaskComplexity
+from app.agents.base import (
+    TaskComplexity,
+    ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    call_ai_with_tools,
+    check_inbox,
+    format_inbox_for_prompt,
+    handle_web_tool,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -71,6 +80,22 @@ class PlannerDecision:
     skip_stages: list[str] = field(default_factory=list)
 
 
+class PlannerToolHandler:
+    """Handles tool calls for PlannerAgent's AI planning loop."""
+
+    def __init__(self) -> None:
+        self._decision: dict[str, Any] | None = None
+        self._complete: bool = False  # Signals call_ai_with_tools to stop
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        # Delegate web tools first
+        web_result = await handle_web_tool(tool_name, tool_input)
+        if web_result is not None:
+            return web_result
+
+        return f"Unknown tool: {tool_name}"
+
+
 class PlannerAgent:
     """AI-driven pipeline planner.
 
@@ -79,6 +104,14 @@ class PlannerAgent:
     """
 
     name = "planner"
+    display_name = "Planner Agent"
+    default_complexity = TaskComplexity.LOW
+    default_model: str | None = None
+
+    @property
+    def tools(self) -> list[ToolDefinition]:
+        """Web research tools for informed pipeline planning."""
+        return [WEB_SEARCH_TOOL, WEB_SCRAPE_TOOL]
 
     async def plan_next(
         self,
@@ -98,6 +131,13 @@ class PlannerAgent:
         Returns:
             PlannerDecision with next actions.
         """
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        # AUDIT-B2-FIX: pipeline_run_id was undefined here — use run_id from
+        # project_state if available, else empty string to avoid NameError.
+        _run_id = project_state.get("run_id", "")
+        inbox_messages = await check_inbox(self.name, _run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         # Find all stages whose dependencies are satisfied
         eligible = self._find_eligible_stages(completed_stages, failed_stages)
 
@@ -206,14 +246,20 @@ class PlannerAgent:
         )
 
         try:
-            from app.services.ai_router import get_ai_router, AIRequest, AIMessage
-            router = get_ai_router()  # CHANGE-13: Use singleton
-            response = await router.call(AIRequest(
-                messages=[AIMessage(role="user", content=prompt)],
-                complexity=TaskComplexity.LOW,  # Cheapest model
-                max_tokens=300,
-                agent_name="planner",
-            ))
+            handler = PlannerToolHandler()
+            response = await call_ai_with_tools(
+                agent=self,
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt=(
+                    "You are a pipeline planner for a code generation system. "
+                    "You can use web_search to research best practices for pipeline "
+                    "ordering or framework-specific build requirements. "
+                    "Respond with a JSON plan after your research (if any)."
+                ),
+                task_type="general",
+                tool_handler=handler,
+                max_tool_rounds=3,
+            )
 
             from app.utils.json_parser import parse_json
             result = parse_json(response.content, fallback={})
@@ -234,10 +280,18 @@ class PlannerAgent:
                             skip_stages=result.get("skip", []),
                         )
         except Exception as exc:
-            logger.warning("planner_ai_call_failed", error=str(exc)[:200])
+            # AUDIT-B2-FIX: Escalate from warning to error — silent fallback to
+            # sequential was invisible to users and downstream agents.
+            logger.error(
+                "planner_ai_call_failed: FALLING BACK to sequential execution",
+                error=str(exc)[:200],
+            )
 
         # Fallback: run first eligible stage sequentially
+        # AUDIT-B2-FIX: Added __planner_degraded__ flag so Tilotma and pipeline
+        # logs can detect that dynamic planning was not used.
         return PlannerDecision(
-            next_actions=[PlannedAction(stage=eligible[0], reason="fallback")],
-            reasoning="AI planner failed — falling back to first eligible stage.",
+            next_actions=[PlannedAction(stage=eligible[0], reason="fallback_sequential")],
+            reasoning="[PLANNER DEGRADED] AI planner failed — falling back to sequential execution. "
+                      "Dynamic stage routing was NOT used for this run.",
         )

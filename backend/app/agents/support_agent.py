@@ -23,6 +23,10 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    check_inbox,
+    format_inbox_for_prompt,
     register_agent,
     run_agent,
     store_output,
@@ -148,6 +152,8 @@ class SupportAgent:
             },
         ))
 
+        self.register_tool(WEB_SEARCH_TOOL)
+        self.register_tool(WEB_SCRAPE_TOOL)
 
     def register_tool(self, tool: "ToolDefinition") -> None:
         """Register a tool available to this agent."""
@@ -175,6 +181,12 @@ class SupportAgent:
 
         Looks for issues in context['support_requests'] list.
         """
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+        if inbox_context and "AUTHORITY" in inbox_context:
+            logger.info("authority_directive_received", agent=self.name)
+
         requests = context.get("support_requests", [])
 
         if not requests:

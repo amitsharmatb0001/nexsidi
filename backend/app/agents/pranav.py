@@ -20,8 +20,13 @@ Supported providers (10 via CloudConfig registry):
 - Render (PaaS -- full-stack)
 - Heroku (PaaS -- full-stack)
 
+Agentic Tools:
+- deploy_to_cloud_run: Trigger GCP Cloud Run deployment via gcloud CLI
+- run_smoke_test: HTTP request to verify a live endpoint
+- check_deployment_status: Poll Cloud Run service status via gcloud
+- web_search / web_scrape: Research provider docs and troubleshoot issues
+
 Security (AUDIT FIX #17):
-- No AI calls — pure template-based config generation
 - No secrets in generated configs -- secrets are injected at deploy time
 - Deployment logs are sanitized (no tokens/keys)
 """
@@ -38,6 +43,14 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
+    ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    call_ai_with_tools,
+    handle_web_tool,
+    check_inbox,
+    format_inbox_for_prompt,
+    notify_agents,
     register_agent,
     run_agent,
     store_output,
@@ -46,6 +59,24 @@ from app.agents.cloud_configs import CloudConfig, get_cloud_config, list_clouds
 from app.services.ai_router import TaskComplexity
 
 logger = structlog.get_logger(__name__)
+
+
+def _get_railway_api_url() -> str:
+    """Railway GraphQL API URL from config."""
+    try:
+        from app.config import get_settings
+        return get_settings().railway_api_url
+    except Exception:
+        return _get_railway_api_url()
+
+
+def _get_vercel_api_base() -> str:
+    """Vercel API base URL from config."""
+    try:
+        from app.config import get_settings
+        return get_settings().vercel_api_base_url
+    except Exception:
+        return "https://api.vercel.com"
 
 
 # -- Deployment Provider (legacy enum -- kept for backward compatibility) ------
@@ -122,6 +153,12 @@ class DeployConfig:
         try:
             legacy_provider = DeployProvider(provider_name)
         except ValueError:
+            # AUDIT-T2-6: Log warning when unknown provider silently falls back
+            logger.warning(
+                "deploy_provider_unknown_fallback",
+                requested=provider_name,
+                fallback="railway",
+            )
             legacy_provider = DeployProvider.RAILWAY
 
         return cls(
@@ -156,25 +193,372 @@ class DeployResult:
     is_simulation: bool = True
 
 
+# -- Pranav Tool Handler -------------------------------------------------------
+
+
+class PranavToolHandler:
+    """Handles tool calls for Pranav's agentic deployment loop.
+
+    Supports:
+    - deploy_to_cloud_run: Trigger GCP Cloud Run deployment via gcloud CLI
+    - run_smoke_test: HTTP request to verify a live endpoint
+    - check_deployment_status: Poll Cloud Run service status via gcloud
+    - web_search / web_scrape: Delegated to shared handle_web_tool
+    """
+
+    def __init__(self, config: DeployConfig | None = None) -> None:
+        self._config = config
+        self._deploy_results: list[dict[str, Any]] = []
+
+    async def __call__(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        """Route tool calls to the appropriate handler."""
+        # Delegate web tools first (web_search, web_scrape)
+        web_result = await handle_web_tool(tool_name, tool_input)
+        if web_result is not None:
+            return web_result
+
+        if tool_name == "deploy_to_cloud_run":
+            return await self._deploy_to_cloud_run(tool_input)
+        elif tool_name == "run_smoke_test":
+            return await self._run_smoke_test(tool_input)
+        elif tool_name == "check_deployment_status":
+            return await self._check_deployment_status(tool_input)
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    async def _deploy_to_cloud_run(self, tool_input: dict[str, Any]) -> str:
+        """Trigger a GCP Cloud Run deployment via gcloud CLI.
+
+        Executes: gcloud run deploy <service_name> --source <workspace_path>
+        Uses the project's default region and settings. Requires gcloud CLI
+        and GCP authentication to be configured on the host.
+        """
+        import json as _json
+        import os
+        import subprocess
+
+        service_name = tool_input["service_name"]
+        workspace_path = tool_input["workspace_path"]
+
+        # Determine region from config or default
+        region = self._config.region if self._config else "asia-south1"
+        project_id = self._config.project_id if self._config else "nexsidi"
+
+        logger.info(
+            "deploy_to_cloud_run_start",
+            service=service_name,
+            workspace=workspace_path,
+            region=region,
+        )
+
+        try:
+            cmd = [
+                "gcloud", "run", "deploy", service_name,
+                "--source", workspace_path,
+                "--region", region,
+                "--project", project_id,
+                "--allow-unauthenticated",
+                "--format", "json",
+                "--quiet",
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                env={**os.environ},
+            )
+
+            if proc.returncode == 0:
+                try:
+                    output = _json.loads(proc.stdout)
+                    url = output.get("status", {}).get("url", "")
+                    result = {
+                        "status": "deployed",
+                        "service_name": service_name,
+                        "url": url,
+                        "region": region,
+                    }
+                except (_json.JSONDecodeError, AttributeError):
+                    # Parse URL from text output
+                    url = ""
+                    for line in proc.stdout.splitlines():
+                        if ".run.app" in line:
+                            for part in line.split():
+                                if part.startswith("https://"):
+                                    url = part.strip()
+                                    break
+                    result = {
+                        "status": "deployed",
+                        "service_name": service_name,
+                        "url": url,
+                        "region": region,
+                        "raw_output": _sanitize_log(proc.stdout[:2000]),
+                    }
+            else:
+                result = {
+                    "status": "failed",
+                    "service_name": service_name,
+                    "error": _sanitize_log(proc.stderr[:2000]),
+                    "returncode": proc.returncode,
+                }
+
+            self._deploy_results.append(result)
+            return _json.dumps(result)
+
+        except FileNotFoundError:
+            result = {
+                "status": "error",
+                "error": "gcloud CLI not found. Install Google Cloud SDK: https://cloud.google.com/sdk/docs/install",
+            }
+            return _json.dumps(result)
+        except subprocess.TimeoutExpired:
+            result = {
+                "status": "error",
+                "error": "Deployment timed out after 600 seconds",
+            }
+            return _json.dumps(result)
+        except OSError as exc:
+            result = {
+                "status": "error",
+                "error": f"OS error running gcloud: {str(exc)[:200]}",
+            }
+            return _json.dumps(result)
+
+    async def _run_smoke_test(self, tool_input: dict[str, Any]) -> str:
+        """Hit a live endpoint and verify the response status code.
+
+        Makes an HTTP GET request to the given URL and compares the
+        response status against the expected status code.
+        """
+        import json as _json
+
+        import httpx
+
+        url = tool_input["url"]
+        expected_status = tool_input["expected_status"]
+
+        logger.info("smoke_test_start", url=url, expected_status=expected_status)
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0, follow_redirects=True, verify=True
+            ) as client:
+                resp = await client.get(url)
+                passed = resp.status_code == expected_status
+                latency_ms = int(resp.elapsed.total_seconds() * 1000)
+
+                result = {
+                    "url": url,
+                    "status_code": resp.status_code,
+                    "expected_status": expected_status,
+                    "passed": passed,
+                    "latency_ms": latency_ms,
+                }
+                return _json.dumps(result)
+
+        except httpx.RequestError as exc:
+            result = {
+                "url": url,
+                "passed": False,
+                "error": f"Request failed: {str(exc)[:200]}",
+            }
+            return _json.dumps(result)
+
+    async def _check_deployment_status(self, tool_input: dict[str, Any]) -> str:
+        """Poll a GCP Cloud Run service to check current deployment status.
+
+        Executes: gcloud run services describe <service_name>
+        Returns serving status, latest revision, and URL.
+        """
+        import json as _json
+        import os
+        import subprocess
+
+        service_name = tool_input["service_name"]
+        region = self._config.region if self._config else "asia-south1"
+        project_id = self._config.project_id if self._config else "nexsidi"
+
+        logger.info(
+            "check_deployment_status_start",
+            service=service_name,
+            region=region,
+        )
+
+        try:
+            cmd = [
+                "gcloud", "run", "services", "describe", service_name,
+                "--region", region,
+                "--project", project_id,
+                "--format", "json",
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ},
+            )
+
+            if proc.returncode == 0:
+                try:
+                    output = _json.loads(proc.stdout)
+                    status = output.get("status", {})
+                    conditions = status.get("conditions", [])
+                    url = status.get("url", "")
+                    latest_revision = status.get("latestReadyRevisionName", "")
+
+                    # Determine overall serving status from conditions
+                    serving = any(
+                        c.get("type") == "Ready" and c.get("status") == "True"
+                        for c in conditions
+                    )
+
+                    result = {
+                        "service_name": service_name,
+                        "serving": serving,
+                        "url": url,
+                        "latest_revision": latest_revision,
+                        "conditions": [
+                            {
+                                "type": c.get("type", ""),
+                                "status": c.get("status", ""),
+                                "message": c.get("message", ""),
+                            }
+                            for c in conditions[:5]
+                        ],
+                    }
+                except (_json.JSONDecodeError, AttributeError):
+                    result = {
+                        "service_name": service_name,
+                        "raw_output": _sanitize_log(proc.stdout[:2000]),
+                    }
+            else:
+                result = {
+                    "service_name": service_name,
+                    "error": _sanitize_log(proc.stderr[:1000]),
+                    "returncode": proc.returncode,
+                }
+
+            return _json.dumps(result)
+
+        except FileNotFoundError:
+            result = {
+                "error": "gcloud CLI not found. Install Google Cloud SDK.",
+            }
+            return _json.dumps(result)
+        except subprocess.TimeoutExpired:
+            result = {
+                "error": "Status check timed out after 60 seconds",
+            }
+            return _json.dumps(result)
+        except OSError as exc:
+            result = {
+                "error": f"OS error running gcloud: {str(exc)[:200]}",
+            }
+            return _json.dumps(result)
+
+
 # -- Pranav Agent --------------------------------------------------------------
 
 
 class Pranav:
     """Deployment Agent -- deploys to any of 10 cloud providers via CloudConfig.
 
-    Pure automation agent — no AI calls. Generates deploy configs from templates.
+    Agentic deployment agent with real deployment tools: GCP Cloud Run
+    deployment, smoke testing, deployment status polling, and web
+    search/scrape for researching provider docs and troubleshooting.
     """
 
     name = "pranav"
     display_name = "Pranav -- Deployment Engineer"
     default_complexity = TaskComplexity.HIGH
-    # AUDIT-FIX: Removed model override — Pranav makes zero AI calls.
     default_model: str | None = None
 
+    def __init__(self) -> None:
+        self._tools: dict[str, ToolDefinition] = {}
+
+        # -- Deployment tools ---------------------------------------------------
+
+        self.register_tool(ToolDefinition(
+            name="deploy_to_cloud_run",
+            description=(
+                "Trigger a GCP Cloud Run deployment for a service. Builds a "
+                "container image, pushes it to GCR/Artifact Registry, and "
+                "deploys it to Cloud Run. Returns the deployment URL and status."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "service_name": {
+                        "type": "string",
+                        "description": "Cloud Run service name (e.g., 'my-app-backend')",
+                    },
+                    "workspace_path": {
+                        "type": "string",
+                        "description": "Path to the workspace directory containing the Dockerfile",
+                    },
+                },
+                "required": ["service_name", "workspace_path"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="run_smoke_test",
+            description=(
+                "Hit a live endpoint and verify the HTTP response status code. "
+                "Use this after deployment to confirm the service is responding "
+                "correctly. Returns status code, latency, and pass/fail result."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL to test (e.g., 'https://my-app.run.app/health')",
+                    },
+                    "expected_status": {
+                        "type": "integer",
+                        "description": "Expected HTTP status code (e.g., 200)",
+                    },
+                },
+                "required": ["url", "expected_status"],
+            },
+        ))
+
+        self.register_tool(ToolDefinition(
+            name="check_deployment_status",
+            description=(
+                "Poll a GCP Cloud Run service to check its current deployment "
+                "status. Returns whether the service is serving, the latest "
+                "revision, and any error conditions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "service_name": {
+                        "type": "string",
+                        "description": "Cloud Run service name to check",
+                    },
+                },
+                "required": ["service_name"],
+            },
+        ))
+
+        # -- Web research tools (from base.py) ---------------------------------
+        self.register_tool(WEB_SEARCH_TOOL)
+        self.register_tool(WEB_SCRAPE_TOOL)
+
+    def register_tool(self, tool: ToolDefinition) -> None:
+        """Register a tool available to this agent."""
+        self._tools[tool.name] = tool
+
     @property
-    def tools(self) -> list:
-        """No tools — Pranav is pure automation, no AI tool loop."""
-        return []
+    def tools(self) -> list[ToolDefinition]:
+        """All registered deployment and web research tools."""
+        return list(self._tools.values())
 
     async def run(
         self,
@@ -218,6 +602,10 @@ class Pranav:
         5. Verify health
         6. Return deployment URL + logs
         """
+        # PHASE-3: Check inbox for messages from other agents
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         contract = context.get("vikram", {}).get("contract", {})
         if not contract:
             return AgentResult(
@@ -249,6 +637,8 @@ class Pranav:
         try:
             ai_deploy_guidance = await self._run_ai_deployment_analysis(
                 contract, resolved_name, cloud_config,
+                config=config,
+                inbox_context=inbox_context,
             )
             # LLM may recommend a different provider — log but don't auto-switch
             if ai_deploy_guidance.get("recommended_provider"):
@@ -382,7 +772,7 @@ class Pranav:
         # ── LLM self-evaluation: deployment config completeness ──
         try:
             llm_eval = await self._run_llm_self_evaluation(
-                output, contract,
+                output, contract, config=config,
             )
             output["llm_evaluation"] = llm_eval
             output["ai_deploy_guidance"] = ai_deploy_guidance
@@ -404,6 +794,20 @@ class Pranav:
             if result.status == DeployStatus.LIVE
             else AgentStatus.FAILED
         )
+
+        # PHASE-3: Notify all agents (especially Tilotma/Vikram) of deploy results
+        try:
+            deploy_summary = (
+                f"Deployment {result.status.value} — provider: {resolved_name}, "
+                f"URL: {result.deployment_url or 'N/A'}, "
+                f"health: {'passed' if result.health_check_passed else 'failed'}"
+            )
+            if frontend_url:
+                deploy_summary += f", frontend: {frontend_url}"
+            await notify_agents(self, pipeline_run_id, deploy_summary)
+        except Exception:
+            logger.debug("pranav_notify_failed", exc_info=True)
+
         return AgentResult(
             agent_name=self.name,
             status=agent_status,
@@ -653,7 +1057,7 @@ class Pranav:
                 )
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(
-                        "https://backboard.railway.app/graphql/v2",
+                        _get_railway_api_url(),
                         headers={
                             "Authorization": f"Bearer {railway_token}",
                             "Content-Type": "application/json",
@@ -722,7 +1126,7 @@ class Pranav:
                             headers["x-vercel-team-id"] = vercel_org_id
 
                         resp = await client.post(
-                            "https://api.vercel.com/v13/deployments",
+                            f"{_get_vercel_api_base()}/v13/deployments",
                             headers=headers,
                             json=vercel_body,
                         )
@@ -743,7 +1147,7 @@ class Pranav:
                                 for _poll in range(24):  # 24 * 5s = 120s
                                     await _asyncio.sleep(5)
                                     poll_resp = await client.get(
-                                        f"https://api.vercel.com/v13/deployments/{deploy_id}",
+                                        f"{_get_vercel_api_base()}/v13/deployments/{deploy_id}",
                                         headers={"Authorization": f"Bearer {vercel_token}"},
                                     )
                                     if poll_resp.status_code == 200:
@@ -861,20 +1265,38 @@ class Pranav:
         contract: dict[str, Any],
         provider_name: str,
         cloud_config: CloudConfig,
+        config: DeployConfig | None = None,
+        inbox_context: str = "",
     ) -> dict[str, Any]:
         """LLM analyzes project needs and recommends deployment strategy.
 
+        Uses call_ai_with_tools so the LLM can deploy_to_cloud_run,
+        run_smoke_test, check_deployment_status, and web_search/web_scrape
+        during its analysis. This enables real deployment actions driven
+        by AI reasoning rather than hard-coded logic.
+
         Evaluates: WebSocket support, background jobs, database needs,
         file storage, expected traffic, and whether the selected provider fits.
-        Uses cheapest model (~$0.002/call).
         """
         tech_stack = contract.get("tech_stack", {})
         features = contract.get("features", [])
         database = contract.get("database", {})
         deployment = contract.get("deployment", {})
 
+        system_prompt = (
+            "You are Pranav, NexSidi's Deployment Engineer. You have access to "
+            "real deployment tools: deploy_to_cloud_run, run_smoke_test, "
+            "check_deployment_status, web_search, and web_scrape.\n\n"
+            "Use these tools when needed to:\n"
+            "- Research provider documentation (web_search/web_scrape)\n"
+            "- Deploy services to GCP Cloud Run (deploy_to_cloud_run)\n"
+            "- Verify deployments are healthy (run_smoke_test)\n"
+            "- Check service status (check_deployment_status)\n\n"
+            "When you finish your analysis, respond with your final JSON result."
+        )
+
         eval_prompt = (
-            "You are analyzing a project's deployment needs. Be specific.\n\n"
+            "Analyze this project's deployment needs. Be specific.\n\n"
             f"## Selected Provider: {cloud_config.display_name} ({cloud_config.category})\n"
             f"## Tech Stack: {tech_stack}\n"
             f"## Features: {features[:10]}\n"
@@ -887,6 +1309,8 @@ class Pranav:
             "3. Does it need file storage? (Need S3/GCS integration)\n"
             "4. Database requirements match provider's offerings?\n"
             "5. Any provider-specific limitations that affect this project?\n\n"
+            "You may use web_search to research provider-specific limitations "
+            "if you are unsure about a provider's capabilities.\n\n"
             "Respond in JSON:\n"
             "{\n"
             '  "recommended_provider": "railway" or "vercel" or same,\n'
@@ -897,15 +1321,35 @@ class Pranav:
             "}\n"
         )
 
-        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "deployment_analysis",
+                    "task_summary": f"Analyze deployment for {cloud_config.display_name}",
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
 
-        router = get_ai_router()
-        resp = await router.call(AIRequest(
-            messages=[AIMessage(role="user", content=eval_prompt)],
+        # PHASE-3: Inject inbox messages (AUTHORITY directives) into prompt
+        if inbox_context:
+            eval_prompt += f"\n\n{inbox_context}"
+
+        tool_handler = PranavToolHandler(config=config)
+        resp = await call_ai_with_tools(
+            self,
+            messages=[{"role": "user", "content": eval_prompt}],
+            system_prompt=system_prompt,
+            task_type="deployment_analysis",
             complexity=TaskComplexity.LOW,
-            max_tokens=800,
-            agent_name=f"{self.name}_deploy_analysis",
-        ))
+            tool_handler=tool_handler,
+            max_tool_rounds=10,
+        )
 
         from app.utils.json_parser import parse_json
         result = parse_json(resp.content, fallback={})
@@ -917,26 +1361,40 @@ class Pranav:
         self,
         output: dict[str, Any],
         contract: dict[str, Any],
+        config: DeployConfig | None = None,
     ) -> dict[str, Any]:
         """LLM reviews its own deployment config for completeness.
 
+        Uses call_ai_with_tools so the LLM can run_smoke_test to verify
+        the deployed service, check_deployment_status to confirm it is live,
+        and web_search/web_scrape for troubleshooting.
+
         Checks: env vars present, resource limits appropriate, health check configured,
         CI/CD integration, database connection, scaling settings.
-        Uses cheapest model (~$0.002/call).
         """
-        import json as json_mod
-
         config_files = output.get("config_files", {})
         config_list = ", ".join(config_files.keys()) if config_files else "(none)"
         is_sim = output.get("is_simulation_deploy", False)
         provider = output.get("provider", "unknown")
+        deployment_url = output.get("deployment_url", "")
+
+        system_prompt = (
+            "You are Pranav, NexSidi's Deployment Engineer, reviewing your own "
+            "deployment output. You have tools available: run_smoke_test, "
+            "check_deployment_status, web_search, web_scrape.\n\n"
+            "Use run_smoke_test to verify the deployed URL is healthy. "
+            "Use check_deployment_status to confirm the service is serving. "
+            "Use web_search if you need to troubleshoot any issues.\n\n"
+            "After your review, respond with your final JSON evaluation."
+        )
 
         eval_prompt = (
-            "You are reviewing deployment config YOU just generated. Be brutally honest.\n\n"
+            "Review the deployment config you just generated. Be brutally honest.\n\n"
             f"## Provider: {provider}\n"
             f"## Simulation: {'YES' if is_sim else 'NO'}\n"
             f"## Config Files Generated: {config_list}\n"
-            f"## Health Check Passed: {output.get('health_check_passed', 'N/A')}\n\n"
+            f"## Health Check Passed: {output.get('health_check_passed', 'N/A')}\n"
+            f"## Deployment URL: {deployment_url}\n\n"
             "## Your Task\n"
             "Check your deployment config for completeness:\n"
             "1. Are all required env vars documented? (DATABASE_URL, SECRET_KEY, CORS_ORIGINS, etc.)\n"
@@ -951,6 +1409,17 @@ class Pranav:
             "   - Without this, frontend will call localhost:8000 in production!\n"
             "8. Is database migration included in the deployment steps? (alembic upgrade head)\n"
             "9. Is there a seed data script or initial admin setup?\n\n"
+        )
+
+        # If there is a real deployment URL and it's not a simulation, prompt
+        # the LLM to use run_smoke_test to verify it
+        if deployment_url and not is_sim:
+            eval_prompt += (
+                f"The deployment URL is {deployment_url}. Use run_smoke_test "
+                "to verify it is responding (expected_status=200 on /health).\n\n"
+            )
+
+        eval_prompt += (
             "Respond in JSON:\n"
             "{\n"
             '  "missing_env_vars": ["DATABASE_URL", ...],\n'
@@ -961,15 +1430,16 @@ class Pranav:
             "}\n"
         )
 
-        from app.services.ai_router import get_ai_router, AIRequest, AIMessage
-
-        router = get_ai_router()
-        resp = await router.call(AIRequest(
-            messages=[AIMessage(role="user", content=eval_prompt)],
+        tool_handler = PranavToolHandler(config=config)
+        resp = await call_ai_with_tools(
+            self,
+            messages=[{"role": "user", "content": eval_prompt}],
+            system_prompt=system_prompt,
+            task_type="deployment_self_eval",
             complexity=TaskComplexity.LOW,
-            max_tokens=800,
-            agent_name=f"{self.name}_self_eval",
-        ))
+            tool_handler=tool_handler,
+            max_tool_rounds=5,
+        )
 
         from app.utils.json_parser import parse_json
         result = parse_json(resp.content, fallback={})

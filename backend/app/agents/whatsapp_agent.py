@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -34,6 +33,10 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    check_inbox,
+    format_inbox_for_prompt,
     register_agent,
     run_agent,
     store_output,
@@ -184,6 +187,8 @@ class WhatsAppAgent:
             },
         ))
 
+        self.register_tool(WEB_SEARCH_TOOL)
+        self.register_tool(WEB_SCRAPE_TOOL)
 
     def register_tool(self, tool: "ToolDefinition") -> None:
         """Register a tool available to this agent."""
@@ -208,6 +213,12 @@ class WhatsAppAgent:
         context: dict[str, Any],
     ) -> AgentResult:
         """Process WhatsApp-originated project requests."""
+        # Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+        if inbox_context and "AUTHORITY" in inbox_context:
+            logger.info("authority_directive_received", agent=self.name)
+
         whatsapp_input = context.get("whatsapp_input")
         if not whatsapp_input:
             return AgentResult(

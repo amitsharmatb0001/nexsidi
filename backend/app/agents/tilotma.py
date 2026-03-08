@@ -12,10 +12,11 @@ Capabilities:
 - Final validation with deep analysis (GO/NO-GO before user checkpoint)
 - Auto-detects compliance needs (DPDP, payments, healthcare)
 - Hindi/English bilingual support
+- Agentic tool use: plan_stages, assign_priority, web_search, web_scrape
 
 Architecture:
 - Stateless singleton (state flows through context_engine via TilotmaMemory)
-- Uses call_ai() from base.py (not ai_router directly)
+- Uses call_ai_with_tools() from base.py for agentic execution
 - Persists memory via pipeline_run_id-keyed context entries
 """
 
@@ -30,8 +31,17 @@ import structlog
 from app.agents.base import (
     AgentResult,
     AgentStatus,
+    ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    SELF_CODING_TOOLS,
     call_ai,
+    call_ai_with_tools,
+    handle_web_tool,
+    check_inbox,
+    format_inbox_for_prompt,
     get_step_context,
+    notify_agents,
     register_agent,
     run_agent,
     store_output,
@@ -92,6 +102,150 @@ _CANNOT_BUILD = [
 ]
 
 
+# ── Tilotma Tool Definitions ──────────────────────────────────────
+
+PLAN_STAGES_TOOL = ToolDefinition(
+    name="plan_stages",
+    description=(
+        "Dynamically decide which pipeline stages to run or skip based on "
+        "the project requirements. Use this to tailor the pipeline — e.g., "
+        "skip mobile testing for a pure API project, or skip visual testing "
+        "for a CLI tool. Provide the stages to SKIP and a reason for each."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "stages_to_skip": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "List of stage names to skip (e.g., 'mobile_testing', "
+                    "'visual_testing', 'performance_audit')"
+                ),
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why these stages should be skipped",
+            },
+        },
+        "required": ["stages_to_skip", "reason"],
+    },
+)
+
+ASSIGN_PRIORITY_TOOL = ToolDefinition(
+    name="assign_priority",
+    description=(
+        "Set execution priority for a specific agent in the pipeline. "
+        "High-priority agents get more resources (better model, more tokens). "
+        "Use this to allocate resources wisely — e.g., set security agent to "
+        "'high' for a payments project, or backend agent to 'high' for an API project."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "agent_name": {
+                "type": "string",
+                "description": "Name of the agent (e.g., 'shubham', 'karan', 'aanya')",
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["high", "medium", "low"],
+                "description": "Execution priority level",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why this priority was assigned",
+            },
+        },
+        "required": ["agent_name", "priority", "reason"],
+    },
+)
+
+
+# ── Tilotma Tool Handler ─────────────────────────────────────────
+
+
+class TilotmaToolHandler:
+    """Handles tool calls from Tilotma's agentic planning loop.
+
+    Supports:
+    - plan_stages: dynamically skip pipeline stages
+    - assign_priority: set agent execution priorities
+    - web_search / web_scrape: delegated to shared handle_web_tool
+    """
+
+    def __init__(self) -> None:
+        self._skipped_stages: list[dict[str, Any]] = []
+        self._priorities: list[dict[str, Any]] = []
+
+    @property
+    def skipped_stages(self) -> list[dict[str, Any]]:
+        """All stage-skip decisions made during the tool loop."""
+        return self._skipped_stages
+
+    @property
+    def priorities(self) -> list[dict[str, Any]]:
+        """All priority assignments made during the tool loop."""
+        return self._priorities
+
+    async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        """Route tool calls to the appropriate handler method."""
+        # Delegate web tools first (shared handler returns None if not a web tool)
+        web_result = await handle_web_tool(tool_name, tool_input)
+        if web_result is not None:
+            return web_result
+
+        if tool_name == "plan_stages":
+            return self._handle_plan_stages(tool_input)
+        elif tool_name == "assign_priority":
+            return self._handle_assign_priority(tool_input)
+        else:
+            return f"Unknown tool: {tool_name}"
+
+    def _handle_plan_stages(self, tool_input: dict) -> str:
+        """Handle plan_stages tool: record which stages to skip."""
+        stages = tool_input.get("stages_to_skip", [])
+        reason = tool_input.get("reason", "")
+
+        if not stages:
+            return "Error: stages_to_skip must contain at least one stage name."
+
+        entry = {
+            "stages_to_skip": stages,
+            "reason": reason,
+        }
+        self._skipped_stages.append(entry)
+
+        return (
+            f"Acknowledged: will skip stages {stages}. "
+            f"Reason: {reason}"
+        )
+
+    def _handle_assign_priority(self, tool_input: dict) -> str:
+        """Handle assign_priority tool: record agent priority."""
+        agent_name = tool_input.get("agent_name", "")
+        priority = tool_input.get("priority", "medium")
+        reason = tool_input.get("reason", "")
+
+        if not agent_name:
+            return "Error: agent_name is required."
+
+        if priority not in ("high", "medium", "low"):
+            priority = "medium"
+
+        entry = {
+            "agent_name": agent_name,
+            "priority": priority,
+            "reason": reason,
+        }
+        self._priorities.append(entry)
+
+        return (
+            f"Priority for '{agent_name}' set to {priority.upper()}. "
+            f"Reason: {reason}"
+        )
+
+
 # ── Tilotma Agent ─────────────────────────────────────────────────
 
 
@@ -114,8 +268,14 @@ class Tilotma:
 
     @property
     def tools(self) -> list:
-        """No tools — Tilotma uses pure AI calls."""
-        return []
+        """Tilotma's agentic planning tools + self-coding evolution tools."""
+        return [
+            PLAN_STAGES_TOOL,
+            ASSIGN_PRIORITY_TOOL,
+            WEB_SEARCH_TOOL,
+            WEB_SCRAPE_TOOL,
+            *SELF_CODING_TOOLS,
+        ]
 
     async def run(
         self,
@@ -156,6 +316,10 @@ class Tilotma:
         """
         from app.services.tilotma_memory import TilotmaMemory
 
+        # PHASE-3: Check inbox for messages from other agents
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         # Load memory (restores conversation state if pipeline was paused/resumed)
         memory = TilotmaMemory(pipeline_run_id)
         await memory.load()
@@ -191,24 +355,64 @@ class Tilotma:
         context["__user_persona__"] = persona
         logger.info("persona_detected", persona=persona, input_preview=user_input[:60])
 
+        # --- PHASE-9: Zero Trust scan of user input ---
+        try:
+            from app.services.zero_trust import get_zero_trust_gate
+            _zt_result = await get_zero_trust_gate().scan_user_input(user_input)
+            if _zt_result.is_blocked():
+                logger.warning("zero_trust_input_blocked", findings=_zt_result.findings[:5])
+                return AgentResult(
+                    agent_name=self.name,
+                    status=AgentStatus.FAILED,
+                    error=f"Input blocked by security scan: {'; '.join(_zt_result.findings[:3])}",
+                )
+            if _zt_result.threat_level.value == "suspicious":
+                logger.warning("zero_trust_input_suspicious", findings=_zt_result.findings[:5])
+                context["__security_warnings__"] = _zt_result.findings[:5]
+        except Exception as _zt_exc:
+            logger.warning("zero_trust_scan_failed", error=str(_zt_exc)[:200])
+
         # --- Step 2: Requirements Extraction ---
         system_prompt = self._build_requirements_prompt()
 
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "requirements_extraction",
+                    "task_summary": f"Extract requirements from user input ({len(user_input)} chars)",
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
+
         # AUDIT-FIX: Wrap user input in XML delimiters to prevent prompt injection.
-        messages = [{"role": "user", "content": (
-            "<user_project_description>\n"
-            f"{user_input}\n"
-            "</user_project_description>\n\n"
-            "Extract structured requirements from the project description above."
-        )}]
+        _user_msg_parts = [
+            "<user_project_description>\n",
+            f"{user_input}\n",
+            "</user_project_description>\n\n",
+            "Extract structured requirements from the project description above.",
+        ]
+        # PHASE-3: Inject inbox messages into prompt context
+        if inbox_context:
+            _user_msg_parts.insert(0, f"{inbox_context}\n\n")
+        messages = [{"role": "user", "content": "".join(_user_msg_parts)}]
+
+        # Create tool handler for agentic planning loop
+        tool_handler = TilotmaToolHandler()
 
         try:
-            response = await call_ai(
-                self,
+            response = await call_ai_with_tools(
+                agent=self,
                 messages=messages,
                 system_prompt=system_prompt,
                 task_type="general",
-                temperature=0.3,
+                tool_handler=tool_handler,
+                max_tool_rounds=15,
             )
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
@@ -255,7 +459,7 @@ class Tilotma:
         # Save memory
         await memory.save()
 
-        # Build output
+        # Build output (includes agentic tool handler decisions)
         output = {
             "raw_input": user_input,
             "ai_analysis": ai_analysis,
@@ -269,6 +473,10 @@ class Tilotma:
                 "input": response.input_tokens,
                 "output": response.output_tokens,
             },
+            "planning_decisions": {
+                "skipped_stages": tool_handler.skipped_stages,
+                "agent_priorities": tool_handler.priorities,
+            },
         }
 
         # ── LLM self-evaluation: requirements completeness ──
@@ -281,6 +489,22 @@ class Tilotma:
             logger.warning("tilotma_req_self_eval_failed", exc_info=True)
 
         await store_output(self, pipeline_run_id, output)
+
+        # PHASE-3: Notify all agents that requirements are ready (as AUTHORITY)
+        try:
+            from app.services.agent_message_bus import get_agent_message_bus
+            bus = get_agent_message_bus()
+            await bus.send_authority_message(
+                from_agent=self.name,
+                pipeline_run_id=pipeline_run_id,
+                message=(
+                    f"Requirements gathered for project. "
+                    f"Key features: {', '.join((parsed or {}).get('key_features', [])[:5])}. "
+                    f"All agents must align with these requirements."
+                ),
+            )
+        except Exception as _notify_exc:
+            logger.debug("tilotma_notify_failed", error=str(_notify_exc)[:100])
 
         return AgentResult(
             agent_name=self.name,
@@ -306,6 +530,24 @@ class Tilotma:
         Deterministic checks first, then AI judgment for nuance.
         """
         from app.services.tilotma_memory import TilotmaMemory
+
+        # PHASE-3: Check inbox — may contain error reports from agents
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+
+        # Directive 7: Check for steering messages from user
+        steering_messages: list[dict[str, Any]] = []
+        try:
+            from app.services.steering_service import get_steering_service
+            _steer_svc = get_steering_service()
+            steering_messages = await _steer_svc.get_history(pipeline_run_id)
+            if steering_messages:
+                logger.info(
+                    "tilotma_review_steering_messages",
+                    count=len(steering_messages),
+                    pipeline_run_id=pipeline_run_id,
+                )
+        except Exception:
+            pass  # Non-critical — error logged upstream or handled by caller
 
         memory = TilotmaMemory(pipeline_run_id)
         await memory.load()
@@ -375,8 +617,17 @@ class Tilotma:
             f"  Errors remaining: {errors_remaining}\n\n"
             f"TILOTMA MONITORING LOG:\n"
             f"  Interventions made: {len(memory.intervention_history)}\n"
-            f"  Quality concerns: {len(memory.project_understanding.quality_concerns) if memory.project_understanding else 0}\n"
+            f"  Quality concerns: {len(memory.project_understanding.quality_concerns) if memory.project_understanding else 0}\n\n"
+            f"VERIFICATION MATRIX (Directive 6):\n"
+            + "\n".join(
+                f"  [{cell_name}] {'PASS' if cell.get('passed') else 'FAIL'}: {cell.get('reason', 'n/a')}"
+                for cell_name, cell in verification_matrix.items()
+            )
+            + "\n"
         )
+
+        # --- Directive 6: Build Comprehensive Verification Matrix ---
+        verification_matrix = self._build_verification_matrix(context)
 
         # --- Auto-Reject on Hard Failures ---
         auto_reject_reasons: list[str] = []
@@ -387,6 +638,13 @@ class Tilotma:
         if tests_failed > total_tests * 0.5 and total_tests > 0:
             auto_reject_reasons.append(f"{tests_failed}/{total_tests} tests failing (>50%)")
 
+        # Directive 6: Matrix-based rejection checks
+        for cell_name, cell in verification_matrix.items():
+            if cell.get("required") and not cell.get("passed"):
+                reason = cell.get("reason", f"{cell_name} verification failed")
+                if reason not in auto_reject_reasons:
+                    auto_reject_reasons.append(reason)
+
         if auto_reject_reasons:
             # Hard reject — no AI needed
             decision = "rejected"
@@ -396,14 +654,19 @@ class Tilotma:
             )
             confidence = 1.0
         else:
-            # --- AI Review for Nuanced Judgment ---
+            # --- AI Review for Nuanced Judgment (with tools) ---
+            review_tool_handler = TilotmaToolHandler()
             try:
-                review_response = await call_ai(
-                    self,
+                review_response = await call_ai_with_tools(
+                    agent=self,
                     messages=[{"role": "user", "content": summary}],
                     system_prompt=(
                         "You are Tilotma, Chief AI Officer at NexSidi, performing FINAL VALIDATION.\n\n"
                         "Review these quality reports and decide: APPROVE or REJECT.\n\n"
+                        "You have access to tools:\n"
+                        "- plan_stages: Skip stages that are irrelevant for the next iteration\n"
+                        "- assign_priority: Set agent priorities for the next iteration\n"
+                        "- web_search / web_scrape: Research best practices if needed\n\n"
                         "APPROVE if:\n"
                         "- All critical checks pass (no critical security issues, no critical logic errors)\n"
                         "- Tests are mostly passing (>80% pass rate is acceptable)\n"
@@ -414,30 +677,44 @@ class Tilotma:
                         "- Core functionality is broken (auth, CRUD, data validation)\n"
                         "- More than 3 high-severity issues across all reports\n"
                         "- Error count is rising (fixer making things worse)\n\n"
-                        "Respond EXACTLY in this format:\n"
+                        "After using any tools you need, respond EXACTLY in this format:\n"
                         "DECISION: APPROVE or REJECT\n"
                         "CONFIDENCE: 0.0-1.0\n"
                         "REASONING: <your detailed reasoning>"
                     ),
                     task_type="critical_validation",
                     complexity=TaskComplexity.COMPLEX,
-                    temperature=0.2,
+                    tool_handler=review_tool_handler,
+                    max_tool_rounds=10,
                 )
 
                 response_text = review_response.content.upper()
-                if "APPROVE" in response_text and "REJECT" not in response_text.split("APPROVE")[0]:
-                    decision = "approved"
+                # P0-3: Structured parsing first, fail-safe string fallback.
+                # Old code: "REJECT the earlier plan. APPROVE this." → parsed as APPROVED.
+                import re as _re
+                decision_match = _re.search(r"DECISION:\s*(APPROVE|REJECT)", response_text)
+                if decision_match:
+                    decision = "approved" if decision_match.group(1) == "APPROVE" else "rejected"
                 else:
-                    decision = "rejected"
+                    # Fallback: any REJECT = reject (fail-safe)
+                    reject_count = response_text.count("REJECT")
+                    approve_count = response_text.count("APPROVE")
+                    if reject_count > 0:
+                        decision = "rejected"
+                    elif approve_count > 0:
+                        decision = "approved"
+                    else:
+                        decision = "rejected"  # No clear signal = reject (fail-safe)
 
                 # Extract confidence
-                confidence = 0.7  # default
+                # AUDIT-T2-5: Default to 0.5 (neutral) instead of 0.7 (artificially optimistic)
+                confidence = 0.5
                 for line in review_response.content.split("\n"):
                     if "CONFIDENCE:" in line.upper():
                         try:
                             confidence = float(line.split(":")[-1].strip())
                         except ValueError:
-                            pass
+                            pass  # Expected: invalid value — fall through to default
 
                 reasoning = review_response.content
 
@@ -476,6 +753,7 @@ class Tilotma:
                 "passed": tests_passed,
                 "failed": tests_failed,
             },
+            "verification_matrix": verification_matrix,
         }
 
         # ── LLM self-evaluation: review completeness ──
@@ -497,6 +775,22 @@ class Tilotma:
             critical_security=critical_security,
             errors_remaining=errors_remaining,
         )
+
+        # PHASE-3: Broadcast review decision as AUTHORITY to all agents
+        try:
+            from app.services.agent_message_bus import get_agent_message_bus
+            bus = get_agent_message_bus()
+            await bus.send_authority_message(
+                from_agent=self.name,
+                pipeline_run_id=pipeline_run_id,
+                message=(
+                    f"FINAL REVIEW DECISION: {decision.upper()}. "
+                    f"Confidence: {confidence:.0%}. "
+                    f"{'; '.join(auto_reject_reasons[:3]) if auto_reject_reasons else 'No hard failures.'}"
+                ),
+            )
+        except Exception as _notify_exc:
+            logger.debug("tilotma_review_notify_failed", error=str(_notify_exc)[:100])
 
         return AgentResult(
             agent_name=self.name,
@@ -547,8 +841,163 @@ class Tilotma:
                 severity=issue.get("severity", "unknown"),
             )
 
+            # PHASE-3: Send authority message about the issue to the offending agent
+            if issue.get("severity") in ("critical", "high"):
+                try:
+                    from app.services.agent_message_bus import get_agent_message_bus
+                    bus = get_agent_message_bus()
+                    await bus.send_authority_message(
+                        from_agent=self.name,
+                        pipeline_run_id=pipeline_run_id,
+                        message=(
+                            f"QUALITY ISSUE in {agent_name}: {issue['issue'][:300]}. "
+                            f"Severity: {issue.get('severity', 'unknown')}. "
+                            f"Action required: {issue.get('action', 'Fix immediately')}."
+                        ),
+                        to_agents=[agent_name],
+                    )
+                except Exception as _auth_exc:
+                    logger.debug("tilotma_authority_send_failed", error=str(_auth_exc)[:100])
+
         await memory.save()
         return issue
+
+    # ── Directive 6: Verification Matrix ─────────────────────────────
+
+    def _build_verification_matrix(
+        self,
+        context: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Build comprehensive verification matrix for GO/NO-GO decision.
+
+        Matrix cells:
+        - web_visual: All 4 viewports must pass visual tests
+        - mobile: APK must build + basic flow pass (if mobile project)
+        - security: attack_tester 0 critical, 0 high
+        - authenticity: no stubs, no facades, no dead code
+        - tests: all test phases pass
+        - performance: no critical performance issues
+        """
+        matrix: dict[str, dict[str, Any]] = {}
+
+        # ── Web Visual Matrix ──
+        aarav = context.get("aarav", {})
+        visual_report = aarav.get("visual_test_report", {}) if isinstance(aarav, dict) else {}
+        matrix_tested = visual_report.get("matrix_tested", False) if isinstance(visual_report, dict) else False
+        matrix_pass_rate = visual_report.get("matrix_pass_rate", 0.0) if isinstance(visual_report, dict) else 0.0
+
+        matrix["web_visual"] = {
+            "passed": matrix_pass_rate >= 75.0 if matrix_tested else True,  # Skip if not tested
+            "required": False,  # Required only when visual testing is enabled
+            "reason": (
+                f"Visual matrix: {matrix_pass_rate:.0f}% pass rate across viewports"
+                if matrix_tested
+                else "Visual testing not run (skipped)"
+            ),
+            "data": {"tested": matrix_tested, "pass_rate": matrix_pass_rate},
+        }
+
+        # ── Mobile Matrix ──
+        mobile_tested = visual_report.get("mobile_tested", False) if isinstance(visual_report, dict) else False
+        matrix["mobile"] = {
+            "passed": True,  # Mobile is optional — pass if not tested
+            "required": False,
+            "reason": "Mobile visual tested" if mobile_tested else "Mobile testing not applicable",
+            "data": {"tested": mobile_tested},
+        }
+
+        # ── Security Matrix (attack_tester) ──
+        attack = context.get("attack_tester", {})
+        attack_block_rate = attack.get("block_rate") if isinstance(attack, dict) else None
+        attack_critical = 0
+        attack_high = 0
+        if isinstance(attack, dict):
+            for r in attack.get("results", []):
+                if isinstance(r, dict) and not r.get("blocked", True):
+                    attack_critical += 1
+
+        karan = context.get("karan", {})
+        karan_findings = karan.get("findings", []) if isinstance(karan, dict) else []
+        security_critical = sum(
+            1 for f in karan_findings
+            if isinstance(f, dict) and f.get("severity") in ("critical", "CRITICAL")
+        )
+        security_high = sum(
+            1 for f in karan_findings
+            if isinstance(f, dict) and f.get("severity") in ("high", "HIGH")
+        )
+
+        matrix["security"] = {
+            "passed": security_critical == 0 and security_high == 0,
+            "required": True,
+            "reason": (
+                f"Security: {security_critical} critical, {security_high} high findings"
+                if security_critical > 0 or security_high > 0
+                else "Security clean: 0 critical, 0 high"
+            ),
+            "data": {
+                "critical": security_critical,
+                "high": security_high,
+                "attack_block_rate": attack_block_rate,
+            },
+        }
+
+        # ── Authenticity Matrix (code_authenticity via karan) ──
+        authenticity = karan.get("authenticity", {}) if isinstance(karan, dict) else {}
+        auth_critical = authenticity.get("critical_count", 0) if isinstance(authenticity, dict) else 0
+
+        matrix["authenticity"] = {
+            "passed": auth_critical == 0,
+            "required": True,
+            "reason": (
+                f"Authenticity: {auth_critical} critical finding(s) — stubs/facades/dead code detected"
+                if auth_critical > 0
+                else "Authenticity clean: no stubs, no facades, no dead code"
+            ),
+            "data": authenticity if isinstance(authenticity, dict) else {},
+        }
+
+        # ── Test Matrix ──
+        all_passed = aarav.get("all_passed", False) if isinstance(aarav, dict) else False
+        is_sim = aarav.get("is_simulation_sandbox", True) if isinstance(aarav, dict) else True
+        total_tests = aarav.get("total_tests", 0) if isinstance(aarav, dict) else 0
+
+        matrix["tests"] = {
+            "passed": all_passed is True or (is_sim and total_tests == 0),
+            "required": not is_sim,  # Required only when real tests ran
+            "reason": (
+                f"Tests: all passed ({total_tests} total)"
+                if all_passed
+                else f"Tests: SIMULATED — NOT VERIFIED" if is_sim
+                else f"Tests: FAILED ({aarav.get('total_failed', 0)} failures)"
+            ),
+            "data": {
+                "all_passed": all_passed,
+                "is_simulation": is_sim,
+                "total": total_tests,
+            },
+        }
+
+        # ── Performance Matrix (Deepika) ──
+        deepika = context.get("deepika", {})
+        deepika_findings = deepika.get("findings", []) if isinstance(deepika, dict) else []
+        perf_critical = sum(
+            1 for f in deepika_findings
+            if isinstance(f, dict) and f.get("severity") in ("critical", "CRITICAL")
+        )
+
+        matrix["performance"] = {
+            "passed": perf_critical == 0,
+            "required": False,  # Performance is advisory
+            "reason": (
+                f"Performance: {perf_critical} critical issue(s)"
+                if perf_critical > 0
+                else "Performance: no critical issues"
+            ),
+            "data": {"critical": perf_critical, "total_findings": len(deepika_findings)},
+        }
+
+        return matrix
 
     def _quick_quality_check(
         self,
@@ -819,6 +1268,16 @@ class Tilotma:
             if keyword in input_lower and reason not in beyond_items:
                 beyond_items.append(reason)
 
+        # PHASE-7: Framework capability check — honest detection
+        try:
+            from app.services.capability_registry import detect_frameworks, get_unsupported_warnings
+            detected = detect_frameworks(user_input)
+            framework_warnings = get_unsupported_warnings(detected)
+            if framework_warnings:
+                beyond_items.extend(framework_warnings)
+        except Exception as _cap_exc:
+            logger.warning("capability_check_failed", error=str(_cap_exc)[:200])
+
         if beyond_items:
             return {
                 "beyond_capability": True,
@@ -957,9 +1416,10 @@ class Tilotma:
         )
 
         try:
-            from app.services.ai_router import AIRouter, AIRequest, AIMessage
+            from app.services.ai_router import get_ai_router, AIRequest, AIMessage
             from app.agents.base import TaskComplexity
-            router = AIRouter()
+            # AUDIT-T1-10: Use singleton — AIRouter() creates orphaned instances
+            router = get_ai_router()
 
             response = await router.call(AIRequest(
                 messages=[AIMessage(role="user", content=verify_prompt)],

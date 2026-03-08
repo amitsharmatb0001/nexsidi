@@ -26,7 +26,14 @@ from app.agents.base import (
     AgentResult,
     AgentStatus,
     ToolDefinition,
+    WEB_SEARCH_TOOL,
+    WEB_SCRAPE_TOOL,
+    SELF_CODING_TOOLS,
     call_ai_with_tools,
+    check_inbox,
+    format_inbox_for_prompt,
+    handle_web_tool,
+    notify_agents,
     register_agent,
     run_agent,
     store_output,
@@ -74,12 +81,19 @@ class SaanviToolHandler:
         self._complete: bool = False  # Signals call_ai_with_tools to stop
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
+        # Delegate web tools first
+        web_result = await handle_web_tool(tool_name, tool_input)
+        if web_result is not None:
+            return web_result
+
         if tool_name == "validate_analysis":
             return self._validate_analysis(tool_input["analysis_json"])
         elif tool_name == "score_complexity":
             return self._score_complexity(tool_input["dimensions"])
         elif tool_name == "write_analysis":
             return self._write_analysis(tool_input["analysis"])
+        elif tool_name == "analyze_complexity":
+            return self._analyze_complexity(tool_input["requirements"])
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -200,6 +214,29 @@ class SaanviToolHandler:
         self._complete = True
         return "Analysis written successfully. Task complete."
 
+    def _analyze_complexity(self, requirements: str) -> str:
+        """Score project complexity using the heuristic complexity scorer.
+
+        Delegates to the complexity_scorer service to produce a structured
+        score with tier, dimensions, and overall numeric score.
+        """
+        try:
+            from app.services.complexity_scorer import score_complexity
+            result = score_complexity(requirements)
+            return _json.dumps({
+                "overall_score": result.overall_score,
+                "tier": result.tier,
+                "dimensions": result.dimensions,
+                "model_recommendation": (
+                    "Gemini Flash / Haiku" if result.overall_score <= 3
+                    else "Gemini Pro / Sonnet 4.5" if result.overall_score <= 6
+                    else "Sonnet 4.6" if result.overall_score <= 8
+                    else "Opus 4.6"
+                ),
+            })
+        except Exception as exc:
+            return f"Error analyzing complexity: {str(exc)[:200]}"
+
 
 class Saanvi:
     """Requirements Analyst — structured analysis and complexity scoring."""
@@ -274,6 +311,38 @@ class Saanvi:
             },
         ))
 
+        self.register_tool(ToolDefinition(
+            name="analyze_complexity",
+            description=(
+                "Score project complexity using the heuristic scorer. "
+                "Pass a description of the requirements and get back "
+                "a structured complexity score with tier, dimensions, "
+                "and model recommendation. Use this to cross-check your "
+                "own complexity assessment."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "requirements": {
+                        "type": "string",
+                        "description": (
+                            "A text description of the project requirements "
+                            "to analyze for complexity."
+                        ),
+                    },
+                },
+                "required": ["requirements"],
+            },
+        ))
+
+        # Web research tools
+        self.register_tool(WEB_SEARCH_TOOL)
+        self.register_tool(WEB_SCRAPE_TOOL)
+
+        # Self-coding evolution tools (safety-gated via immutable protocol)
+        for _sc_tool in SELF_CODING_TOOLS:
+            self.register_tool(_sc_tool)
+
     def register_tool(self, tool: ToolDefinition) -> None:
         self._tools[tool.name] = tool
 
@@ -295,6 +364,10 @@ class Saanvi:
         context: dict[str, Any],
     ) -> AgentResult:
         """Analyze Tilotma's requirements output and score complexity."""
+        # PHASE-3: Check inbox for messages from other agents
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         # Get Tilotma's output
         tilotma_output = context.get("tilotma")
         if not tilotma_output:
@@ -335,8 +408,31 @@ class Saanvi:
             "5. If validation fails, fix the issues and re-validate\n"
             "6. Once validation passes, call write_analysis with the final JSON\n\n"
             "Output valid JSON with keys: structured_requirements, complexity, "
-            "model_recommendation, risk_assessment."
+            "model_recommendation, risk_assessment.\n\n"
+            "## CALIBRATION EXAMPLES (use these as reference points):\n"
+            "- Simple CRUD blog (3 entities, no auth): overall = 2\n"
+            "- E-commerce store (8 entities, Stripe payments, auth): overall = 5\n"
+            "- SaaS platform (15 entities, OAuth, Stripe, WebSocket, RBAC): overall = 7\n"
+            "- Healthcare compliance app (20 entities, HIPAA, HL7, MFA, audit trail): overall = 9"
         )
+
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "requirements_analysis",
+                    "task_summary": f"Analyze requirements and score complexity",
+                    "previous_agent_outputs": {
+                        "tilotma": ai_analysis[:300] if ai_analysis else "",
+                    },
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
 
         # PROMPT-INJECTION-FIX: Wrap raw user input in XML-style delimiters
         # and instruct the model to treat it as DATA, not instructions.
@@ -348,6 +444,16 @@ class Saanvi:
             f"## Tilotma's Analysis\n{ai_analysis}\n\n"
             f"## Auto-Detected Compliance\n{compliance_flags}"
         )
+
+        # PHASE-3: Inject inbox messages into prompt context
+        if inbox_context:
+            user_content = f"{inbox_context}\n\n{user_content}"
+            # AUTHORITY directives from Tilotma/Vikram override normal flow
+            if "AUTHORITY" in inbox_context:
+                system_prompt += (
+                    "\n\n⚠ AUTHORITY DIRECTIVE RECEIVED — you MUST comply:\n"
+                    + inbox_context
+                )
 
         handler = SaanviToolHandler()
 
@@ -373,6 +479,10 @@ class Saanvi:
         # raw response content (in case model produced valid output without tools)
         analysis_data = handler._analysis or response.content
         complexity_data = handler._complexity_score
+        # AUDIT-T1-2: Null safety — if LLM didn't call score_complexity tool,
+        # complexity_data is None. Downstream agents call .get() on it → crash.
+        if not isinstance(complexity_data, dict):
+            complexity_data = {"overall": 5, "_fallback": True}
 
         # FIX-43: Unify LLM complexity score with heuristic scorer.
         # If scores differ by >2, take the HIGHER (conservative) score.
@@ -397,6 +507,16 @@ class Saanvi:
                 # Take the higher (more conservative) score
                 if heuristic_overall > llm_overall and isinstance(complexity_data, dict):
                     complexity_data["overall"] = heuristic_overall
+                    # AUDIT-T2-15: Also update tier to match overridden score —
+                    # previously tier stayed stale from LLM's wrong score.
+                    if heuristic_overall <= 3:
+                        complexity_data["tier"] = "basic"
+                    elif heuristic_overall <= 5:
+                        complexity_data["tier"] = "standard"
+                    elif heuristic_overall <= 7.5:
+                        complexity_data["tier"] = "professional"
+                    else:
+                        complexity_data["tier"] = "enterprise"
                     complexity_data["_override_reason"] = (
                         f"Heuristic ({heuristic_overall}) > LLM ({llm_overall}) by >{2}. "
                         "Using conservative (higher) estimate."
@@ -423,7 +543,8 @@ class Saanvi:
 
         # ── LLM self-evaluation: requirements completeness ──
         try:
-            raw_input = context.get("tilotma", {}).get("raw_requirements", "")
+            # AUDIT-T3-17: Tilotma stores as "raw_input", not "raw_requirements"
+            raw_input = context.get("tilotma", {}).get("raw_input", "") or context.get("tilotma", {}).get("raw_requirements", "")
             llm_eval = await self._run_llm_self_evaluation(
                 analysis_data, raw_input,
             )
@@ -432,6 +553,14 @@ class Saanvi:
             logger.warning("saanvi_self_eval_failed", exc_info=True)
 
         await store_output(self, pipeline_run_id, output)
+
+        # PHASE-3: Notify agents that requirements analysis is complete
+        _score = complexity_data.get("overall", "?") if isinstance(complexity_data, dict) else "?"
+        await notify_agents(
+            self.name, pipeline_run_id,
+            f"Requirements analysis complete. Complexity: {_score}/10. "
+            f"Validation: {'PASSED' if handler._validation_passed else 'FAILED'}.",
+        )
 
         return AgentResult(
             agent_name=self.name,

@@ -29,6 +29,9 @@ from app.agents.base import (
     AgentStatus,
     ToolDefinition,
     call_ai_with_tools,
+    check_inbox,
+    format_inbox_for_prompt,
+    notify_agents,
     register_agent,
     resolve_model_override,
     run_agent,
@@ -41,7 +44,9 @@ logger = structlog.get_logger(__name__)
 
 # ── Fixer Configuration ───────────────────────────────────────────
 
-MAX_FIX_ITERATIONS: int = 5
+# PHASE-1: Hardcoded MAX_FIX_ITERATIONS removed — replaced by ProgressState.
+# Safety cap of 200 iterations (effectively unlimited for practical use).
+MAX_FIX_ITERATIONS: int = 200
 
 # Model escalation by iteration number (AUDIT FIX #18)
 # Uses MODELS registry keys (not raw model IDs) — mode-aware.
@@ -207,8 +212,9 @@ def _sanitize_message(message: str) -> str:
     # Remove email addresses
     sanitized = re.sub(r"""\b[\w.+-]+@[\w-]+\.[\w.]+\b""", "[EMAIL_REDACTED]", sanitized)
     # Truncate very long messages (may contain user data)
+    # AUDIT-T2-1: Keep head (file/line info) + tail (error detail) instead of flat truncation
     if len(sanitized) > 500:
-        sanitized = sanitized[:500] + "... [truncated]"
+        sanitized = sanitized[:250] + " ... [truncated] ... " + sanitized[-230:]
     return sanitized
 
 
@@ -318,7 +324,8 @@ class FixerToolHandler:
         self._used_diff = False  # Track if apply_diff was used (for telemetry)
         # CHANGE-18: Pre-fix snapshots for rollback on regression.
         # If a fix introduces MORE errors than the original, we revert.
-        self._snapshots: dict[str, str] = {}
+        # AUDIT-T3-14: Use list of snapshots to preserve multi-iteration rollback history
+        self._snapshots: dict[str, list[str]] = {}
 
     async def __call__(self, tool_name: str, tool_input: dict) -> str:
         if tool_name == "read_file":
@@ -368,8 +375,8 @@ class FixerToolHandler:
                     if len(content) > 50000:
                         return content[:50000] + f"\n...[truncated at 50K, file is {len(content)} chars]"
                     return content
-            except Exception:
-                pass  # VFS unavailable — fall through to inline context
+            except Exception as _vfs_exc:
+                logger.debug("vfs_read_failed", path=path, error=str(_vfs_exc)[:200])
 
         # Fall back to inline context (original generated content)
         for agent in ("shubham", "aanya"):
@@ -389,8 +396,9 @@ class FixerToolHandler:
             return "Error: content too short — must be a complete file"
 
         # CHANGE-18: Snapshot before overwriting for rollback on regression.
+        # AUDIT-T3-14: Append to list so multi-iteration rollback preserves history
         if path in self._written_files:
-            self._snapshots[path] = self._written_files[path]
+            self._snapshots.setdefault(path, []).append(self._written_files[path])
         elif path not in self._snapshots:
             # Try to snapshot from context (original code before any fix)
             for _agent in ("shubham", "aanya"):
@@ -398,14 +406,15 @@ class FixerToolHandler:
                 if isinstance(_agent_out, dict):
                     _fc = _agent_out.get("file_contents", {})
                     if isinstance(_fc, dict) and path in _fc:
-                        self._snapshots[path] = _fc[path]
+                        self._snapshots.setdefault(path, []).append(_fc[path])
                         break
 
         self._written_files[path] = content
 
         # CHANGE-18: Regression check — verify the fix didn't make things worse.
-        if path.endswith(".py") and path in self._snapshots:
+        if path.endswith(".py") and path in self._snapshots and self._snapshots[path]:
             import ast as _ast_rollback
+            _last_snapshot = self._snapshots[path][-1]
             # Count syntax errors in new vs old
             new_has_syntax_error = False
             old_has_syntax_error = False
@@ -414,13 +423,13 @@ class FixerToolHandler:
             except SyntaxError:
                 new_has_syntax_error = True
             try:
-                _ast_rollback.parse(self._snapshots[path])
+                _ast_rollback.parse(_last_snapshot)
             except SyntaxError:
                 old_has_syntax_error = True
 
             if new_has_syntax_error and not old_has_syntax_error:
                 # Fix introduced a NEW syntax error — rollback
-                self._written_files[path] = self._snapshots[path]
+                self._written_files[path] = _last_snapshot
                 logger.warning("fixer_rollback", path=path, reason="new_syntax_error")
                 return (
                     f"ROLLBACK: Your fix introduced a NEW syntax error in {path} "
@@ -999,6 +1008,10 @@ class Fixer:
 
         ONE fix per iteration. Model escalation per iteration.
         """
+        # PHASE-3: Check inbox for messages from other agents (esp. AUTHORITY directives)
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         # Collect all errors from quality gates + Aarav test results
         errors = self._collect_errors(context)
 
@@ -1069,6 +1082,7 @@ class Fixer:
                 enable_thinking=enable_thinking,
                 pipeline_run_id=pipeline_run_id,
                 prior_attempts_summary=prior_summary,  # CHANGE-6
+                inbox_context=inbox_context,  # PHASE-3: authority directives
             )
 
             report.attempts.append(attempt)
@@ -1092,8 +1106,8 @@ class Fixer:
                             iteration=iteration,
                             msg="Fix loop has consumed >$0.50 — consider aborting",
                         )
-            except Exception:
-                pass  # Cost tracking is non-critical
+            except Exception as _cost_exc:
+                logger.debug("cost_tracking_failed", error=str(_cost_exc)[:200])
 
             # CHANGE-6: Detect duplicate fixes — same file + same output = stuck
             if not attempt.success:
@@ -1136,8 +1150,8 @@ class Fixer:
                             "severity": current_error.severity,
                         },
                     )
-                except Exception:
-                    pass  # Mistake memory is non-fatal
+                except Exception as _mm_exc:
+                    logger.debug("mistake_memory_record_failed", error=str(_mm_exc)[:200])
             else:
                 # If fix failed, try next error (don't re-attempt same one immediately)
                 failed = remaining_errors.pop(0)
@@ -1157,6 +1171,8 @@ class Fixer:
         elif report.errors_fixed > 0:
             report.status = FixStatus.PARTIAL
         elif iteration >= MAX_FIX_ITERATIONS:
+            # PHASE-1: This only triggers at safety cap (200), indicating
+            # something is fundamentally wrong — not a normal exit path.
             report.status = FixStatus.MAX_ITERATIONS
         else:
             report.status = FixStatus.FAILED
@@ -1207,6 +1223,18 @@ class Fixer:
             files_modified=report.files_modified,
         )
 
+        # PHASE-3: Notify all agents (especially Tilotma/Vikram) of fix results
+        try:
+            await notify_agents(
+                self,
+                pipeline_run_id,
+                f"Fixer complete — {report.errors_fixed}/{report.errors_received} errors fixed "
+                f"in {report.iterations} iterations, {report.errors_remaining} remaining. "
+                f"Status: {report.status.value}. Files: {', '.join(report.files_modified[:5]) or 'none'}",
+            )
+        except Exception:
+            logger.debug("fixer_notify_failed", exc_info=True)
+
         # R8-FIX: Return COMPLETED for both FIXED and PARTIAL statuses.
         # PARTIAL means some errors were fixed but others remain — the pipeline's
         # fix-retest loop (line 852-870) checks _has_errors_to_fix() and rewinds
@@ -1232,6 +1260,7 @@ class Fixer:
         enable_thinking: bool,
         pipeline_run_id: str = "",
         prior_attempts_summary: str = "",  # CHANGE-6: previous failed fix summaries
+        inbox_context: str = "",  # PHASE-3: authority directives from Tilotma/Vikram
     ) -> FixAttempt:
         """Attempt to fix a single error using the agentic tool loop."""
         # Build error report for read_error_report tool
@@ -1318,6 +1347,25 @@ class Fixer:
             "- For unknown errors: use search_solution before guessing",
         ])
 
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "code_fixing",
+                    "task_summary": f"Fix {error.error_type} in {error.file_path}",
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
+
+        # PHASE-3: Inject inbox messages (AUTHORITY directives) into system prompt
+        if inbox_context:
+            system_prompt += f"\n\n{inbox_context}"
+
         # CHANGE-5: Root-cause backtracking for import/name errors.
         # If the error is in file B but caused by missing export in file A,
         # tell the fixer to fix A (root cause) instead of patching B (symptom).
@@ -1355,7 +1403,7 @@ class Fixer:
                                 f"Fix the ROOT CAUSE first — add the missing class/function to the source file."
                             )
                         except SyntaxError:
-                            pass
+                            pass  # Expected: source has syntax errors — can't extract exports
 
         user_message = (
             f"Fix this error in {error.file_path}: {error.error_type}\n"
@@ -1411,8 +1459,8 @@ class Fixer:
                 tracker = get_run_cost_tracker(pipeline_run_id)
                 if tracker is not None:
                     await tracker.record(response, agent_name=self.name, model_key="high")
-            except Exception:
-                pass  # Cost tracking is non-fatal
+            except Exception as _cost_exc:
+                logger.debug("cost_tracking_failed", error=str(_cost_exc)[:200])
 
         # Check results
         fixed_path = error.file_path

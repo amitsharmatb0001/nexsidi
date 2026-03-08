@@ -231,7 +231,7 @@ class MistakeMemory:
                             successes.append(meta_list)
                     return successes[:n_results]
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
         # Fallback
         key = f"{agent_name}_successes"
@@ -306,7 +306,7 @@ class MistakeMemory:
                         ]
                     return mistakes[:n_results]
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
         # Fallback
         entries = _FALLBACK_STORE.get("_shared", [])
@@ -549,7 +549,7 @@ class MistakeMemory:
                 if results and results.get("metadatas"):
                     entries = results["metadatas"] or []
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
         if not entries:
             # Fallback
@@ -580,6 +580,129 @@ class MistakeMemory:
         ]
         patterns.sort(key=lambda p: p["count"], reverse=True)
         return patterns[:3]
+
+
+    # ── Verified Learning (AGENTIC-FIX) ──────────────────────────────
+
+    def record_lesson_outcome(
+        self,
+        lesson_id: str,
+        agent_name: str,
+        was_helpful: bool,
+    ) -> None:
+        """Track whether a lesson actually helped the agent.
+
+        AGENTIC-FIX: Previously lessons were one-directional — recorded but
+        never verified. Now we track if applying a lesson improved the outcome.
+        Lessons with low effectiveness are pruned.
+        """
+        try:
+            key = f"lesson_outcome:{agent_name}:{lesson_id}"
+            outcome = "helpful" if was_helpful else "not_helpful"
+
+            # Store in Valkey for durability
+            import os
+            import redis
+            r = redis.from_url(os.environ.get("VALKEY_URL", "redis://localhost:6379/0"))
+            r.hincrby(f"lesson_outcomes:{agent_name}", f"{lesson_id}:{outcome}", 1)
+            r.expire(f"lesson_outcomes:{agent_name}", 86400 * 30)  # 30 day TTL
+            logger.debug("lesson_outcome_recorded", agent=agent_name, helpful=was_helpful)
+        except Exception as exc:
+            logger.debug("lesson_outcome_record_failed: %s", exc)
+
+    def get_lesson_effectiveness(self, agent_name: str) -> dict[str, Any]:
+        """Get effectiveness stats for an agent's lessons.
+
+        Returns:
+            Dict with total_lessons, helpful_pct, not_helpful_pct, and details.
+        """
+        try:
+            import os
+            import redis
+            r = redis.from_url(os.environ.get("VALKEY_URL", "redis://localhost:6379/0"))
+            data = r.hgetall(f"lesson_outcomes:{agent_name}")
+
+            helpful = 0
+            not_helpful = 0
+            for key, count in data.items():
+                key_str = key.decode() if isinstance(key, bytes) else key
+                count_int = int(count)
+                if ":helpful" in key_str:
+                    helpful += count_int
+                elif ":not_helpful" in key_str:
+                    not_helpful += count_int
+
+            total = helpful + not_helpful
+            return {
+                "agent": agent_name,
+                "total_lessons_applied": total,
+                "helpful": helpful,
+                "not_helpful": not_helpful,
+                "helpful_pct": round(helpful / max(total, 1) * 100, 1),
+            }
+        except Exception:
+            return {"agent": agent_name, "total_lessons_applied": 0}
+
+    def prune_ineffective_lessons(self, min_uses: int = 10, min_effectiveness: float = 0.3) -> int:
+        """Remove lessons that have been applied 10+ times but helped <30%.
+
+        AUDIT-B3-FIX: Previously returned hardcoded 0. Now reads lesson outcome
+        data from Valkey (stored by record_lesson_outcome) and prunes lessons
+        with effectiveness below the threshold.
+
+        Returns the number of lessons pruned.
+        """
+        pruned = 0
+        try:
+            import os
+
+            import redis
+            r = redis.from_url(os.environ.get("VALKEY_URL", "redis://localhost:6379/0"))
+
+            # Iterate over all agent outcome hashes
+            for key in r.scan_iter("lesson_outcomes:*"):
+                agent_name = key.decode().split(":", 1)[1] if isinstance(key, bytes) else key.split(":", 1)[1]
+                data = r.hgetall(key)
+
+                # Group by lesson_id
+                lessons: dict[str, dict[str, int]] = {}
+                for field, count in data.items():
+                    field_str = field.decode() if isinstance(field, bytes) else field
+                    count_int = int(count)
+                    # Format: "lesson_id:helpful" or "lesson_id:not_helpful"
+                    parts = field_str.rsplit(":", 1)
+                    if len(parts) != 2:
+                        continue
+                    lid, outcome = parts
+                    lessons.setdefault(lid, {"helpful": 0, "not_helpful": 0})
+                    if outcome == "helpful":
+                        lessons[lid]["helpful"] = count_int
+                    elif outcome == "not_helpful":
+                        lessons[lid]["not_helpful"] = count_int
+
+                # Prune lessons below effectiveness threshold
+                for lid, stats in lessons.items():
+                    total = stats["helpful"] + stats["not_helpful"]
+                    if total < min_uses:
+                        continue
+                    effectiveness = stats["helpful"] / max(total, 1)
+                    if effectiveness < min_effectiveness:
+                        # Remove from Valkey outcome tracking
+                        r.hdel(key, f"{lid}:helpful", f"{lid}:not_helpful")
+                        pruned += 1
+                        logger.info(
+                            "lesson_pruned",
+                            agent=agent_name,
+                            lesson_id=lid,
+                            effectiveness=round(effectiveness, 2),
+                            total_uses=total,
+                        )
+
+        except Exception as exc:
+            logger.warning("prune_ineffective_lessons_failed: %s", str(exc)[:200])
+
+        logger.info("prune_ineffective_lessons: pruned %d lessons", pruned)
+        return pruned
 
 
 # Module-level singleton

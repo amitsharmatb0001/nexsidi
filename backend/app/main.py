@@ -316,7 +316,8 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["system"])
     async def health_check() -> dict[str, str]:
         """Liveness check — always responds if the process is alive."""
-        return {"status": "healthy", "version": _VERSION}
+        # AUDIT-T2-7: Don't leak version on unauthenticated endpoint — aids attacker recon
+        return {"status": "healthy"}
 
     @app.get("/health/ready", tags=["system"])
     async def readiness_check() -> dict[str, Any]:
@@ -359,6 +360,7 @@ def create_app() -> FastAPI:
     from app.routers.webhooks import router as webhooks_router
     from app.routers.templates import router as templates_router  # TEMPLATE-FIX
     from app.routers import api_keys, teams, billing
+    from app.routers.v2 import v2_router  # Directive v2 API
 
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["auth"])
     # Password reset + email verification routes share the /api/v1/auth prefix
@@ -375,6 +377,10 @@ def create_app() -> FastAPI:
     app.include_router(api_keys.router, prefix="/api/v1/api-keys", tags=["api-keys"])
     app.include_router(teams.router, prefix="/api/v1/teams", tags=["teams"])
     app.include_router(billing.router, prefix="/api/v1/billing", tags=["billing"])
+
+    # v2 API — new directive features (DevBox, steering, SDD)
+    # v2_router already has prefix="/api/v2" set internally
+    app.include_router(v2_router)
 
     return app
 

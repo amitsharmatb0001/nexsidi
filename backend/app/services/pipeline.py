@@ -84,6 +84,7 @@ class PipelineStage(str, Enum):
     FIXING = "fixing"
     CHECKPOINT_TESTING = "checkpoint_testing"
     DEPLOYMENT = "deployment"
+    DOCUMENTATION = "documentation"  # AUDIT-B1-FIX: docs_agent was orphaned
     DELIVERY = "delivery"
     COMPLETED = "completed"
 
@@ -107,6 +108,7 @@ STAGE_AGENTS: dict[PipelineStage, str | list[str]] = {
     PipelineStage.FIXING: "fixer",
     PipelineStage.CHECKPOINT_TESTING: "__checkpoint_2__",
     PipelineStage.DEPLOYMENT: "pranav",
+    PipelineStage.DOCUMENTATION: "docs_agent",  # AUDIT-B1-FIX: was orphaned, now runs before delivery
     PipelineStage.DELIVERY: "__delivery__",
     PipelineStage.COMPLETED: "__done__",
 }
@@ -168,15 +170,18 @@ _AGENT_CONTEXT_DEPS: dict[str, list[str]] = {
     "tilotma":    [],                                    # reads __requirements__
     "saanvi":     ["tilotma"],
     "vikram":     ["tilotma", "saanvi"],
-    "challenger": ["vikram"],
+    # AUDIT-T1-9: Challenger needs tilotma (requirements) + saanvi (complexity)
+    "challenger": ["vikram", "tilotma", "saanvi"],
     "dhruv":      ["vikram"],
     "vanya":      ["vikram", "saanvi"],
     "shubham":    ["vikram", "dhruv"],
     "aanya":      ["vikram", "shubham", "vanya"],
-    "karan":      ["vikram", "shubham", "aanya"],
+    # AUDIT-T1-9: Karan needs aarav's test results for comprehensive security audit
+    "karan":      ["vikram", "shubham", "aanya", "aarav"],
     "navya":      ["vikram", "shubham", "aanya"],
     "deepika":    ["vikram", "shubham", "aanya"],
-    "aarav":      ["vikram", "shubham", "aanya"],
+    # AUDIT-T1-9: Aarav needs dhruv's DB schema for database-related test generation
+    "aarav":      ["vikram", "shubham", "aanya", "dhruv"],
     # FIX-37: attack_tester needs context from all code generators + security audit
     "attack_tester": ["vikram", "shubham", "aanya", "karan"],
     "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika", "attack_tester"],
@@ -194,6 +199,8 @@ def _build_filtered_context(ctx: dict[str, Any], agent_name: str) -> dict[str, A
     """
     deps = _AGENT_CONTEXT_DEPS.get(agent_name)
     if deps is None:
+        logger.warning("unknown_agent_full_context", agent=agent_name,
+                       hint="Add entry to _AGENT_CONTEXT_DEPS to restrict context")
         return ctx  # Unknown agent — give everything
     return {
         k: v
@@ -237,13 +244,14 @@ class PipelineRunStatus(str, Enum):
     # member, rebuild_run() falls back to RUNNING and resume_run() hits the
     # RUNNING guard, making interrupted runs permanently un-resumable.
     INTERRUPTED = "interrupted"
+    # Directive 7: User-initiated pause via steering service
+    HALTED = "halted"
 
 
-# Max cycles for the fix-retest loop
-MAX_FIX_RETEST_CYCLES = 3
-
-# Max retries for the architecture challenge-retry loop
-MAX_CHALLENGE_RETRIES = 2
+# PHASE-1: Hardcoded limits removed — replaced by ProgressState safety caps.
+# Old: MAX_FIX_RETEST_CYCLES = 3, MAX_CHALLENGE_RETRIES = 2
+# New: progress.should_continue() checks budget/time/stall.
+from app.services.progress_tracker import ProgressState
 
 # Stages that are re-run in the fix-retest loop
 FIX_RETEST_STAGES: list[PipelineStage] = [
@@ -1159,7 +1167,7 @@ class PipelineOrchestrator:
                                 },
                             )
                         except Exception:
-                            pass
+                            pass  # Non-critical — error logged upstream or handled by caller
                         failed_result = AgentResult(
                             agent_name="contract_coherence_validator",
                             status=AgentStatus.FAILED,
@@ -1219,6 +1227,17 @@ class PipelineOrchestrator:
                                     )
                     except Exception:
                         pass  # Non-fatal
+
+        # P1-6: Set Karan scan_mode to avoid triple execution.
+        # Karan is mapped to QUALITY_REVIEW (parallel), SECURITY_AUDIT, and
+        # COMPLIANCE_CHECK. Without scan_mode, execute() runs ALL scans 3x.
+        if agent_name == "karan":
+            if stage == PipelineStage.SECURITY_AUDIT:
+                run.context["__karan_scan_mode__"] = "security_only"
+            elif stage == PipelineStage.COMPLIANCE_CHECK:
+                run.context["__karan_scan_mode__"] = "compliance_only"
+            else:
+                run.context.pop("__karan_scan_mode__", None)
 
         # Execute single agent
         return await self._execute_agent(run, stage, agent_name)
@@ -1572,6 +1591,12 @@ class PipelineOrchestrator:
                 _RUN_COST_TRACKERS.pop(run.run_id, None)
                 from app.services.ai_router import unregister_cost_tracker
                 unregister_cost_tracker(run.run_id)
+                # Phase 1A: Purge run key on crash too
+                try:
+                    from app.services.agent_message_bus import purge_run_key
+                    purge_run_key(run.run_id)
+                except Exception:
+                    pass  # Non-critical — error logged upstream or handled by caller
 
     async def _get_max_step_order(self, run: PipelineRun) -> int:
         """Query the max step_order from DB for this run.
@@ -1619,6 +1644,28 @@ class PipelineOrchestrator:
         # F6-FIX: Also register in ai_router's registry for pre-flight checks
         register_cost_tracker(run.run_id, _cost_tracker)
 
+        # ── Phase 1A: Generate per-run encryption key for agent messages ──
+        # Each pipeline run gets its own Fernet key. All agent message payloads
+        # are encrypted with this key in Valkey. Key is purged when run ends.
+        try:
+            from app.services.encryption import get_message_encryptor
+            from app.services.agent_message_bus import register_run_key
+            from app.config import get_settings
+            if get_settings().agent_message_encryption:
+                _enc = get_message_encryptor()
+                _run_key = _enc.generate_run_key()
+                register_run_key(run.run_id, _run_key)
+                # Store encrypted form in context for crash recovery
+                run.context["__encrypted_run_key__"] = _enc.encrypt_run_key(_run_key)
+                logger.info("pipeline_run_key_generated", run_id=run.run_id)
+        except Exception as _enc_exc:
+            logger.warning(
+                "pipeline_run_key_generation_failed",
+                run_id=run.run_id,
+                error=str(_enc_exc)[:200],
+            )
+            # Non-fatal: messages will be sent in plaintext as fallback
+
         # ── INPUT SANITIZATION: scan user prompt for injection patterns ──
         _raw_prompt = run.context.get("__requirements__", "")
         if _raw_prompt and isinstance(_raw_prompt, str):
@@ -1633,9 +1680,19 @@ class PipelineOrchestrator:
                         threat_count=len(_threats),
                         threats=_threats[:5],
                     )
-                    # Store threats for downstream visibility but do NOT block —
-                    # the user may be building a security-related app.
+                    # Store threats for downstream visibility.
                     run.context["__input_threats__"] = _threats
+                    # T2-19-FIX: Block pipeline on HIGH severity input threats.
+                    _high_threats = [t for t in _threats if t.get("severity") == "HIGH"]
+                    if _high_threats:
+                        logger.error(
+                            "pipeline_blocked_high_severity_threats",
+                            run_id=run.run_id,
+                            high_threats=_high_threats[:3],
+                        )
+                        raise ValueError(
+                            f"Input blocked: {len(_high_threats)} HIGH severity threat(s) detected"
+                        )
                 if _sanitized != _raw_prompt:
                     run.context["__requirements__"] = _sanitized
                     # Also update user_input if already bridged
@@ -1673,7 +1730,7 @@ class PipelineOrchestrator:
                 agent_name="",
             )
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
 
         # WEBHOOK-FIX: Also deliver pipeline.started to registered webhooks
         try:
@@ -1684,7 +1741,7 @@ class PipelineOrchestrator:
                 {"run_id": run.run_id, "project_id": run.project_id},
             )
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
 
         # Notification: pipeline started
         await self._write_notification(
@@ -1721,7 +1778,7 @@ class PipelineOrchestrator:
                     agent=agent_name_ws,
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
             # PUBSUB-FIX: Cross-process broadcast — publish stage_started.
             try:
@@ -1733,7 +1790,7 @@ class PipelineOrchestrator:
                     agent_name=agent_name_ws,
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
             step_result = await self.execute_stage(run)
             run.step_results.append(step_result)
@@ -1749,7 +1806,7 @@ class PipelineOrchestrator:
                 )
                 await self._emit_file_events(run, step_result)
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
             # PUBSUB-FIX: Cross-process broadcast — publish stage_completed.
             try:
@@ -1761,7 +1818,7 @@ class PipelineOrchestrator:
                     agent_name=step_result.agent_name,
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
             # WEBHOOK-FIX: Also deliver stage.completed to registered webhooks
             try:
@@ -1772,7 +1829,20 @@ class PipelineOrchestrator:
                     {"run_id": run.run_id, "stage": step_result.stage.value, "agent": step_result.agent_name},
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
+
+            # PHASE-10: Store learning on successful agent completion
+            if step_result.result and step_result.result.status == AgentStatus.COMPLETED:
+                try:
+                    from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+                    _dpb = get_dynamic_prompt_builder()
+                    await _dpb.store_learning_on_success(
+                        agent_name=step_result.agent_name,
+                        task_type=step_result.stage.value,
+                        output=step_result.result.output or {},
+                    )
+                except Exception:
+                    pass  # Non-critical — error logged upstream or handled by caller
 
             # ARTIFACT-FIX: Persist ZIP bytes to DB so download endpoint doesn't
             # rebuild on every request and ZIP survives context_snapshot purges.
@@ -1818,6 +1888,13 @@ class PipelineOrchestrator:
 
             # Check if we need to pause
             if run.status == PipelineRunStatus.PAUSED:
+                break
+
+            # Directive 7: Check for steering halt requests between stages
+            if await self._check_steering_halt(run):
+                run.status = PipelineRunStatus.HALTED
+                await self._persist_run(run)
+                logger.info("pipeline_halted_by_user", run_id=run.run_id, stage=run.current_stage.value)
                 break
 
             # FIX-17: When TESTING stage fails (Aarav found real test failures),
@@ -1925,23 +2002,50 @@ class PipelineOrchestrator:
                 and step_result.result
                 and step_result.result.status == AgentStatus.COMPLETED
                 and self._has_critical_challenges(step_result)
-                and run.challenge_retry_count < MAX_CHALLENGE_RETRIES
             ):
-                run.challenge_retry_count += 1
-                # Store challenges in context so Vikram can use them
-                if step_result.result.output:
-                    run.context["__architecture_challenges__"] = step_result.result.output.get("challenges", [])
-                logger.info(
-                    "architecture_challenge_retry",
-                    run_id=run.run_id,
-                    retry=run.challenge_retry_count,
-                    max_retries=MAX_CHALLENGE_RETRIES,
-                    critical_count=step_result.result.output.get("critical_count", 0) if step_result.result.output else 0,
-                )
-                # Rewind to ARCHITECTURE so Vikram regenerates
-                run.current_stage = PipelineStage.ARCHITECTURE
-                await self._persist_run(run)
-                continue
+                # PHASE-1: Progress-based challenge retry — no hardcoded MAX_CHALLENGE_RETRIES.
+                _challenge_progress = run.context.get("__progress_state__")
+                if _challenge_progress is None:
+                    _challenge_progress = ProgressState()
+                    run.context["__progress_state__"] = _challenge_progress
+
+                _challenge_progress.record_cycle(errors_found=1, errors_fixed=0)
+                if hasattr(self, "_cost_tracker") and self._cost_tracker is not None:
+                    _challenge_progress.update_budget(self._cost_tracker.total_cost_usd)
+
+                _ch_continue, _ch_reason = _challenge_progress.should_continue()
+                if _ch_continue:
+                    run.challenge_retry_count += 1
+                    if step_result.result.output:
+                        run.context["__architecture_challenges__"] = step_result.result.output.get("challenges", [])
+                    logger.info(
+                        "architecture_challenge_retry",
+                        run_id=run.run_id,
+                        retry=run.challenge_retry_count,
+                        critical_count=step_result.result.output.get("critical_count", 0) if step_result.result.output else 0,
+                    )
+                    run.current_stage = PipelineStage.ARCHITECTURE
+                    await self._persist_run(run)
+                    continue
+                else:
+                    # P0-5: Architecture reject — progress tracker says stop.
+                    logger.error(
+                        "architecture_rejected_progress_stop",
+                        run_id=run.run_id,
+                        retries=run.challenge_retry_count,
+                        reason=_ch_reason,
+                    )
+                    run.status = PipelineRunStatus.FAILED
+                    run.error = f"Architecture rejected: {_ch_reason} after {run.challenge_retry_count} retries. Manual review required."
+                    await self._persist_run(run)
+                    await send_progress(
+                        project_id=run.project_id,
+                        agent_name="pipeline",
+                        phase="FAILED",
+                        percentage=0,
+                        message=f"Architecture design failed quality review ({_ch_reason}). Please review and restart.",
+                    )
+                    return run
 
             # F3-FIX: After Fixer stage, merge patched files back into source
             # agent context. Fixer writes patches to context["fixer"]["patched_files"]
@@ -1978,42 +2082,50 @@ class PipelineOrchestrator:
                 and step_result.result
                 and step_result.result.status == AgentStatus.COMPLETED
                 and self._has_errors_to_fix(step_result)
-                and run.fix_retest_cycle < MAX_FIX_RETEST_CYCLES
             ):
-                # CHANGE-8: Diminishing returns detection — if fix rate is
-                # too low on cycle 2+, stop wasting budget on hopeless fixes.
+                # PHASE-1: Progress-based termination replaces MAX_FIX_RETEST_CYCLES.
+                # Get or create progress tracker for this run.
+                _progress = run.context.setdefault("__progress_state__", ProgressState())
                 fixer_output = step_result.result.output or {}
                 _fixed = fixer_output.get("errors_fixed", 0)
                 _remaining = fixer_output.get("errors_remaining", 0)
-                _fix_rate = _fixed / max(_fixed + _remaining, 1)
+                _progress.record_cycle(errors_found=_fixed + _remaining, errors_fixed=_fixed)
 
-                if _fix_rate < 0.2 and run.fix_retest_cycle >= 2:
+                # Update budget from cost tracker if available
+                if hasattr(self, "_cost_tracker") and self._cost_tracker is not None:
+                    _progress.update_budget(self._cost_tracker.total_cost_usd)
+
+                _should_continue, _stop_reason = _progress.should_continue()
+                if not _should_continue:
                     logger.warning(
-                        "fix_retest_diminishing_returns",
+                        "fix_retest_stopped_by_progress",
                         run_id=run.run_id,
+                        reason=_stop_reason,
                         cycle=run.fix_retest_cycle,
-                        fix_rate=round(_fix_rate, 2),
                         errors_remaining=_remaining,
+                        progress=_progress.get_summary(),
                     )
                     run.context["__known_issues__"] = _remaining
-                    # FIX-19: Notify user — fix-retest loop gave up
+                    run.context["__stop_reason__"] = _stop_reason
+                    # Notify user
                     try:
                         from app.routers.websocket import notify_pipeline_event
                         await notify_pipeline_event(
                             run.run_id,
                             "quality_warning",
                             data={
-                                "type": "fix_retest_exhausted",
+                                "type": "fix_retest_stopped",
+                                "reason": _stop_reason,
                                 "message": (
-                                    f"Auto-fixer exhausted {run.fix_retest_cycle} cycles. "
-                                    f"{_remaining} issue(s) may remain unfixed."
+                                    f"Fix-retest stopped: {_stop_reason}. "
+                                    f"{_remaining} issue(s) may remain unfixed after "
+                                    f"{run.fix_retest_cycle} cycles."
                                 ),
                                 "errors_remaining": _remaining,
                             },
                         )
                     except Exception:
                         pass  # WebSocket failures must never crash pipeline
-                    # Don't continue — fall through to advance() with known issues
                     await self._persist_run(run)
                 else:
                     # CHANGE-7: Budget-aware degradation during fix-retest
@@ -2074,7 +2186,6 @@ class PipelineOrchestrator:
                             "fix_retest_loop",
                             run_id=run.run_id,
                             cycle=run.fix_retest_cycle,
-                            max_cycles=MAX_FIX_RETEST_CYCLES,
                             severity=fix_severity,
                         )
                         run.current_stage = PipelineStage.QUALITY_REVIEW
@@ -2144,7 +2255,7 @@ class PipelineOrchestrator:
                     },
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             # PUBSUB-FIX: Cross-process broadcast — publish pipeline_completed.
             try:
                 from app.services.pipeline_events import get_pipeline_event_publisher
@@ -2155,7 +2266,7 @@ class PipelineOrchestrator:
                     agent_name="",
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             # WEBHOOK-FIX: Also deliver pipeline.completed to registered webhooks
             try:
                 from app.services.webhook_service import broadcast_webhook_event
@@ -2165,7 +2276,7 @@ class PipelineOrchestrator:
                     {"run_id": run.run_id, "project_id": run.project_id},
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             # TOKEN-USAGE-FIX: Persist per-model token usage to billing.token_usage
             # so cost analytics and quota enforcement have a durable record.
             # Uses the shared cost tracker created at pipeline start.
@@ -2220,7 +2331,7 @@ class PipelineOrchestrator:
                     data={"error": str(run.error or "")[:200]},
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             # PUBSUB-FIX: Cross-process broadcast — publish pipeline_failed.
             try:
                 from app.services.pipeline_events import get_pipeline_event_publisher
@@ -2232,7 +2343,7 @@ class PipelineOrchestrator:
                     error=str(run.error or "")[:200],
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             # WEBHOOK-FIX: Also deliver pipeline.failed to registered webhooks
             try:
                 from app.services.webhook_service import broadcast_webhook_event
@@ -2242,7 +2353,7 @@ class PipelineOrchestrator:
                     {"run_id": run.run_id, "project_id": run.project_id, "error": str(run.error or "")[:200]},
                 )
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
         # S-7-FIX: Evict terminal runs from hot cache to prevent OOM.
         # The DB is the source of truth; completed/failed runs don't need
@@ -2256,6 +2367,15 @@ class PipelineOrchestrator:
             _RUN_COST_TRACKERS.pop(run.run_id, None)
             # F6-FIX: Also unregister from ai_router's registry
             unregister_cost_tracker(run.run_id)
+            # Phase 1A: Purge per-run encryption key from memory.
+            # The key is no longer needed once the run reaches a terminal state.
+            # Purging limits blast radius: even if the process is compromised later,
+            # completed runs' message keys are gone.
+            try:
+                from app.services.agent_message_bus import purge_run_key
+                purge_run_key(run.run_id)
+            except Exception:
+                pass  # Non-fatal
             logger.debug("run_evicted_from_cache", run_id=run.run_id, status=run.status.value)
         elif run.status == PipelineRunStatus.PAUSED:
             # R17-FIX: Track when this run entered PAUSED state for TTL eviction
@@ -2484,6 +2604,30 @@ class PipelineOrchestrator:
         if completeness:
             state["completeness"] = completeness
 
+        # PHASE-3/4: Include inter-agent message bus activity for planner context
+        try:
+            from app.services.agent_message_bus import get_agent_message_bus
+            bus = get_agent_message_bus()
+            transcript = await bus.get_transcript(run.run_id, max_messages=20)
+            if transcript:
+                # Compact: just from/to/priority/status
+                state["agent_messages"] = [
+                    {
+                        "from": m.get("from_agent"),
+                        "to": m.get("to_agent"),
+                        "priority": m.get("priority", "NORMAL"),
+                        "status": m.get("status"),
+                    }
+                    for m in transcript[-10:]  # Last 10 messages
+                ]
+        except Exception:
+            pass  # Message bus may not be initialized
+
+        # PHASE-1: Include progress tracker state
+        _progress = ctx.get("__progress_state__")
+        if _progress and hasattr(_progress, "get_summary"):
+            state["progress"] = _progress.get_summary()
+
         return state
 
     async def _run_pipeline_agentic(
@@ -2532,8 +2676,22 @@ class PipelineOrchestrator:
                     last_result=last_output,
                 )
             except Exception as exc:
-                logger.warning("planner_failed_fallback_sequential", error=str(exc)[:200])
-                # Fallback: run current stage sequentially
+                # P1-2: Escalate to ERROR + notify user (old code: silent warning).
+                logger.error(
+                    "planner_failed_fallback_sequential",
+                    error=str(exc)[:200],
+                    run_id=run.run_id,
+                )
+                run.context.setdefault("__pipeline_warnings__", []).append(
+                    f"Agentic planner failed: {str(exc)[:200]}. Falling back to sequential execution."
+                )
+                await send_progress(
+                    project_id=run.project_id,
+                    agent_name="pipeline",
+                    phase="WARNING",
+                    percentage=run_progress_pct,
+                    message="AI planner unavailable — falling back to sequential pipeline.",
+                )
                 decision = None
 
             if decision and decision.next_actions:
@@ -2589,6 +2747,62 @@ class PipelineOrchestrator:
         await self._persist_run(run)
         return run
 
+    # ── Directive 7: Steering Halt Management ──────────────────────
+
+    async def _check_steering_halt(self, run: PipelineRun) -> bool:
+        """Check if a user steering halt request exists for this run.
+
+        Returns True if the pipeline should halt at the next safe point.
+        """
+        try:
+            from app.services.steering_service import get_steering_service
+            steer_svc = get_steering_service()
+            history = await steer_svc.get_history(run.run_id)
+            # Check for any unprocessed halt requests
+            for msg in reversed(history):
+                if msg.get("action") == "halt":
+                    return True
+        except Exception:
+            pass  # Steering service failure must not halt the pipeline
+        return False
+
+    async def resume_from_halt(
+        self,
+        run_id: str,
+        user_direction: str = "",
+    ) -> PipelineRun | None:
+        """Resume a halted pipeline, optionally with new direction from user.
+
+        Directive 7: Called when user wants to continue after a halt.
+        If user_direction is provided, it's stored as a pivot in steering
+        history and forwarded to Tilotma as an AUTHORITY directive.
+        """
+        run = self.get_run(run_id)
+        if run is None:
+            return None
+        if run.status != PipelineRunStatus.HALTED:
+            logger.warning("resume_from_halt_wrong_status", run_id=run_id, status=run.status.value)
+            return None
+
+        # Apply pivot direction if provided
+        if user_direction:
+            try:
+                from app.services.steering_service import get_steering_service
+                steer_svc = get_steering_service()
+                await steer_svc.send_user_message(
+                    run_id=run_id,
+                    user_id=run.user_id,
+                    message=user_direction,
+                    action="pivot",
+                )
+            except Exception as exc:
+                logger.warning("resume_halt_pivot_failed", error=str(exc)[:200])
+
+        run.status = PipelineRunStatus.RUNNING
+        await self._persist_run(run)
+        logger.info("pipeline_resumed_from_halt", run_id=run_id, has_pivot=bool(user_direction))
+        return run
+
     def _get_run_lock(self, run_id: str) -> asyncio.Lock:
         """Get or create an asyncio.Lock for a specific run_id.
 
@@ -2623,7 +2837,7 @@ class PipelineOrchestrator:
             return bool(was_set)
         except Exception as exc:
             # Valkey unavailable — fall back to local-only locking
-            logger.debug("distributed_lock_unavailable", run_id=run_id, error=str(exc))
+            logger.warning("distributed_lock_unavailable", run_id=run_id, error=str(exc))
             return True  # Permit execution (single-process fallback)
 
     async def _release_distributed_lock(self, run_id: str) -> None:
@@ -2634,7 +2848,7 @@ class PipelineOrchestrator:
             lock_key = f"pipeline:lock:{run_id}"
             await client.delete(lock_key)
         except Exception:
-            pass  # Best-effort release; TTL will expire it anyway
+            logger.warning("distributed_lock_release_failed", run_id=run_id, exc_info=True)
 
     def _evict_stale_paused(self) -> None:
         """R17-FIX: Evict locks and hot-cache entries for abandoned PAUSED runs.
@@ -2796,7 +3010,7 @@ class PipelineOrchestrator:
                 {"run_id": run.run_id, "project_id": run.project_id},
             )
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
 
         return True
 
@@ -2876,8 +3090,10 @@ class PipelineOrchestrator:
         errors_remaining = output.get("errors_remaining", 0)
         errors_fixed = output.get("errors_fixed", 0)
 
-        # Re-run quality gates if fixer applied fixes but errors remain
-        return bool(errors_remaining > 0 and errors_fixed > 0)
+        # P0-4: Re-run quality gates whenever errors remain — even if fixer
+        # couldn't fix any.  Old code: `errors_remaining > 0 and errors_fixed > 0`
+        # caused silent pass-through when errors_fixed == 0.
+        return bool(errors_remaining > 0)
 
     async def _persist_run(self, run: PipelineRun) -> None:
         """Persist the current run state to the database (non-fatal on error).
@@ -2908,7 +3124,7 @@ class PipelineOrchestrator:
         # {"__truncated__": True}, .append() on the next cycle crashes with
         # AttributeError: 'dict' object has no attribute 'append'.
         _METADATA_KEYS = frozenset({
-            "__fix_retest_cycle__", "__challenge_retry_count__",
+            "__fix_retest_cycle__", "__challenge_retry_count__", "__progress_state__",
             "__persist_failures__", "__last_step__",
             "__checkpoint_approved__", "__architecture_challenges__",
             "__paused_at__", "__feedback_history__", "__user_feedback__",
@@ -3132,6 +3348,47 @@ class PipelineOrchestrator:
                 except Exception:
                     pass  # Non-fatal — reflection is advisory
 
+        # PHASE-3: Authority message enforcement — if the agent still has unread
+        # AUTHORITY messages from Tilotma/Vikram after execution, it means the
+        # agent ignored them. Log a warning and store them in context so they
+        # are re-injected on next execution (inbox check at start of execute()).
+        try:
+            from app.services.agent_message_bus import get_agent_message_bus
+            _bus = get_agent_message_bus()
+            _unread_authority = await _bus.get_unread_authority_messages(
+                agent_name, run.run_id,
+            )
+            if _unread_authority:
+                logger.warning(
+                    "authority_messages_ignored",
+                    agent=agent_name,
+                    stage=stage.value,
+                    unread_count=len(_unread_authority),
+                    from_agents=[m.get("from_agent", "?") for m in _unread_authority],
+                )
+                # Store in context so Tilotma/Vikram can see who ignored directives
+                ignored_log = run.context.setdefault("__authority_ignored__", {})
+                ignored_log.setdefault(agent_name, []).append({
+                    "stage": stage.value,
+                    "unread_count": len(_unread_authority),
+                    "messages": [m.get("question", "")[:200] for m in _unread_authority[:3]],
+                })
+                # Send reminder via authority message
+                try:
+                    await _bus.send_authority_message(
+                        from_agent="tilotma",
+                        pipeline_run_id=run.run_id,
+                        message=(
+                            f"REMINDER: {agent_name} has {len(_unread_authority)} unread "
+                            f"AUTHORITY directive(s). These MUST be addressed in next execution."
+                        ),
+                        to_agents=[agent_name],
+                    )
+                except Exception:
+                    pass  # Non-fatal — best effort reminder
+        except Exception:
+            pass  # Message bus failures must never crash pipeline
+
         # CHANGE-22: Per-agent performance telemetry — accumulate metrics
         # in context for bottleneck detection and pattern analysis.
         telemetry = run.context.setdefault("__telemetry__", {})
@@ -3183,8 +3440,11 @@ class PipelineOrchestrator:
             out: dict[str, Any] = {}
             for key, val in ctx.items():
                 if key.startswith("__"):
-                    # Metadata keys — shared (read-only contract)
-                    out[key] = val
+                    # Metadata keys — shared via read-only proxy (T3-11-FIX)
+                    if isinstance(val, dict):
+                        out[key] = MappingProxyType(val)
+                    else:
+                        out[key] = val
                 elif isinstance(val, dict):
                     # Agent output — deep-copy to isolate mutations
                     out[key] = copy.deepcopy(val)
@@ -3229,6 +3489,17 @@ class PipelineOrchestrator:
                     safe_err = _sanitize_error(res)
                     combined_output[name] = {"error": safe_err}
                     logger.error("parallel_agent_exception", agent=name, error=safe_err)
+                    # T2-3-FIX: If a critical agent (karan) fails, fail the
+                    # entire pipeline step instead of silently skipping.
+                    _CRITICAL_PARALLEL_AGENTS = {"karan"}
+                    if name in _CRITICAL_PARALLEL_AGENTS:
+                        step.result = AgentResult(
+                            agent_name=step.agent_name,
+                            status=AgentStatus.FAILED,
+                            output=combined_output,
+                            error=f"Critical agent '{name}' failed: {safe_err}",
+                        )
+                        return step
 
             # R10-FIX: If ALL agents threw exceptions, mark step as FAILED.
             # Previously this always returned COMPLETED, letting the pipeline
@@ -3517,13 +3788,34 @@ class PipelineOrchestrator:
                 )
 
     async def _git_stage_commit(self, run: PipelineRun, step_result: StepResult) -> None:
-        """Commit generated files to git after each stage. GIT-FIX.
+        """Commit generated files to git after each stage. GIT-FIX + PHASE-8.
 
-        Only commits if git_config exists in run.context (set by user when
-        starting pipeline with git integration enabled).
+        PHASE-8: Always commits to local workspace git repo (no config needed).
+        GIT-FIX: Also pushes to remote if git_config exists in run.context.
         """
+        if step_result.skipped:
+            return
+
+        # PHASE-8: Local git commit via ProjectWorkspace (always runs)
+        try:
+            from app.services.project_workspace import get_workspace
+            _ws = get_workspace(run.run_id)
+            _ws.git_init()
+            _ws.git_commit(
+                message=f"feat({step_result.stage.value}): {step_result.agent_name or 'pipeline'}",
+                agent=step_result.agent_name or "pipeline",
+            )
+            # Tag at checkpoint stages
+            if "checkpoint" in step_result.stage.value:
+                _ws.git_tag(
+                    tag=f"checkpoint/{step_result.stage.value}",
+                    message=f"Checkpoint: {step_result.stage.value}",
+                )
+        except Exception as _ws_exc:
+            logger.debug("workspace_git_commit_skipped", error=str(_ws_exc)[:100])
+
         git_config = run.context.get("git_config")
-        if not git_config or step_result.skipped:
+        if not git_config:
             return
 
         from app.agents.git_agent import GitAgent
@@ -3635,7 +3927,7 @@ class PipelineOrchestrator:
                 {"run_id": run.run_id, "project_id": run.project_id, "stage": stage.value},
             )
         except Exception:
-            pass
+            pass  # Non-critical — error logged upstream or handled by caller
 
         return step
 

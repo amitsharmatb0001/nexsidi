@@ -94,6 +94,8 @@ class SecurityReport:
     files_scanned: int = 0
     passed: bool = True
     scan_type: str = "full"  # full, quick, compliance_only
+    # AUDIT-T3-1: O(1) dedup set instead of O(n) linear scan per add()
+    _seen_keys: set[tuple[str, str]] = field(default_factory=set, repr=False)
 
     @property
     def critical_count(self) -> int:
@@ -112,9 +114,11 @@ class SecurityReport:
         # AUDIT-FIX: Deduplicate findings. Phase 1 (static) and Phase 2 (AI)
         # can flag the same issue. Deduplicate by (file_path, title) to prevent
         # inflated counts and the Fixer from attempting double fixes.
+        # AUDIT-T3-1: O(1) lookup via set instead of O(n) linear scan
         key = (finding.file_path, finding.title)
-        if any((f.file_path, f.title) == key for f in self.findings):
+        if key in self._seen_keys:
             return  # Already reported
+        self._seen_keys.add(key)
         self.findings.append(finding)
         if finding.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH):
             self.passed = False
@@ -713,21 +717,66 @@ class Karan:
 
         report = SecurityReport(files_scanned=len(all_files))
 
-        # Phase 1: Static pattern scanning (ZERO AI)
-        self._scan_python_security(all_files, report)
-        self._scan_ts_security(all_files, report)
-        self._scan_dpdp_compliance(all_files, report)
+        # P1-6: Karan runs at 3 stages (QUALITY_REVIEW, SECURITY_AUDIT,
+        # COMPLIANCE_CHECK).  scan_mode skips already-completed phases.
+        scan_mode = context.get("__karan_scan_mode__", "full")
 
-        # Phase 1b (F15-FIX): AST-based Python analysis
-        # Catches obfuscated patterns that regex misses, like
-        # getattr(os, "system")(...), aliased imports, and indirect calls.
-        self._scan_python_ast(all_files, report)
+        # Phase 1: Static pattern scanning (ZERO AI)
+        if scan_mode != "compliance_only":
+            self._scan_python_security(all_files, report)
+            self._scan_ts_security(all_files, report)
+
+            # Phase 1b (F15-FIX): AST-based Python analysis
+            # Catches obfuscated patterns that regex misses, like
+            # getattr(os, "system")(...), aliased imports, and indirect calls.
+            self._scan_python_ast(all_files, report)
+
+        # Phase 1c (Directive 4): Code Authenticity Validation
+        # Zero-tolerance enforcement: NO stubs, NO facades, NO dead code, NO vaporware.
+        # AST-based — zero AI calls, zero cost, zero latency.
+        _authenticity_report = None
+        if scan_mode != "compliance_only":
+            try:
+                from app.services.code_authenticity import get_code_authenticity_validator
+                _auth_validator = get_code_authenticity_validator()
+                _authenticity_report = _auth_validator.validate_all_files(all_files)
+                # Convert authenticity findings to SecurityFindings for unified reporting
+                _AUTH_SEVERITY_MAP = {
+                    "critical": FindingSeverity.HIGH,    # Map to HIGH (blocking)
+                    "high": FindingSeverity.MEDIUM,
+                    "medium": FindingSeverity.LOW,
+                    "low": FindingSeverity.INFO,
+                }
+                for _af in _authenticity_report.findings:
+                    report.add(SecurityFinding(
+                        severity=_AUTH_SEVERITY_MAP.get(_af.severity.value, FindingSeverity.LOW),
+                        category=FindingCategory.MISCONFIGURATION,
+                        file_path=_af.file_path,
+                        line=_af.line,
+                        title=f"Code Authenticity: {_af.finding_type.value.upper()}",
+                        description=_af.description,
+                        fix_hint=_af.fix_hint,
+                        owasp_id=None,
+                        cwe_id=None,
+                    ))
+                logger.info(
+                    "authenticity_scan_complete",
+                    files_scanned=_authenticity_report.files_scanned,
+                    critical=_authenticity_report.critical_count,
+                    high=_authenticity_report.high_count,
+                    total=len(_authenticity_report.findings),
+                )
+            except Exception as _auth_exc:
+                logger.warning("authenticity_scan_failed", error=str(_auth_exc)[:200])
 
         # Phase 2: AI-powered deep analysis (agentic tool loop — no file cap)
-        await self._ai_deep_scan(all_files, context, report, pipeline_run_id=pipeline_run_id)
+        if scan_mode in ("full", "security_only"):
+            await self._ai_deep_scan(all_files, context, report, pipeline_run_id=pipeline_run_id)
 
-        # Phase 3: OWASP Top 10 checklist
-        self._check_owasp_top10(all_files, report)
+        # Phase 3: Compliance scans
+        if scan_mode != "security_only":
+            self._scan_dpdp_compliance(all_files, report)
+            self._check_owasp_top10(all_files, report)
 
         findings_output = [
             {
@@ -752,6 +801,8 @@ class Karan:
             "high_count": report.high_count,
             "blocking_count": report.blocking_count,
             "total_findings": len(report.findings),
+            # Phase 1B: Code authenticity report summary
+            "authenticity": _authenticity_report.to_dict() if _authenticity_report else None,
             # FIX-42: Token tracking for cost visibility
             "model_used": getattr(self, "_last_response_model", ""),
             "tokens": {
@@ -779,6 +830,39 @@ class Karan:
             high=report.high_count,
             passed=report.passed,
         )
+
+        # PHASE-3: Report critical/high security findings to responsible agents
+        try:
+            from app.agents.base import report_error_to_agent, notify_agents
+            _critical_findings = [
+                f for f in report.findings
+                if f.get("severity") in ("critical", "high")
+            ]
+            for _cf in _critical_findings[:5]:  # Report first 5 critical findings
+                _file = _cf.get("file", "")
+                # Route to the agent that likely generated this file
+                _target = "shubham" if _file.endswith(".py") else "aanya"
+                await report_error_to_agent(
+                    from_agent=self.name,
+                    to_agent=_target,
+                    pipeline_run_id=pipeline_run_id,
+                    error_type=f"security_{_cf.get('severity', 'high')}",
+                    file_path=_file,
+                    description=f"{_cf.get('rule', 'unknown')}: {_cf.get('message', '')[:200]}",
+                )
+            # Broadcast summary
+            await notify_agents(
+                from_agent=self.name,
+                pipeline_run_id=pipeline_run_id,
+                message=(
+                    f"Security scan complete: {report.files_scanned} files, "
+                    f"{report.critical_count} critical, {report.high_count} high, "
+                    f"{'PASSED' if report.passed else 'FAILED'}."
+                ),
+                priority="CRITICAL" if not report.passed else "NORMAL",
+            )
+        except Exception as _notify_exc:
+            logger.debug("karan_notify_failed", error=str(_notify_exc)[:100])
 
         return AgentResult(
             agent_name=self.name,
@@ -892,8 +976,8 @@ class Karan:
                             content = await vfs.read_file(run_id, path)
                             if content:
                                 files[path] = content
-                except Exception:
-                    pass  # VFS unavailable — files stay empty
+                except Exception as _vfs_exc:
+                    logger.debug("vfs_read_failed_for_audit", error=str(_vfs_exc)[:200])
             elif isinstance(fc, dict):
                 # Inline file_contents (dev mode / not compacted)
                 for path in generated_paths:
@@ -1206,6 +1290,39 @@ class Karan:
             "Do NOT repeat issues already found by static scanners.",
             "Use run_security_scan tools when the sandbox is available for real scanning.",
         ])
+
+        # PHASE-3: Check inbox for messages from other agents
+        _prev_outputs: dict[str, str] = {}
+        try:
+            from app.agents.base import check_inbox, format_inbox_for_prompt
+            _inbox_msgs = await check_inbox(self.name, pipeline_run_id)
+            if _inbox_msgs:
+                _inbox_text = format_inbox_for_prompt(_inbox_msgs)
+                _prev_outputs["_agent_messages"] = _inbox_text
+                # AUTHORITY directives from Tilotma/Vikram override normal flow
+                if "AUTHORITY" in _inbox_text:
+                    system_prompt += (
+                        "\n\n⚠ AUTHORITY DIRECTIVE RECEIVED — you MUST comply:\n"
+                        + _inbox_text
+                    )
+        except Exception as _ib_exc:
+            logger.debug("karan_inbox_failed", error=str(_ib_exc)[:100])
+
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "security_audit",
+                    "task_summary": f"Security audit of {len(files)} files",
+                    "previous_agent_outputs": _prev_outputs,
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
 
         user_message = (
             f"Perform a deep security audit of this project ({len(files)} files). "

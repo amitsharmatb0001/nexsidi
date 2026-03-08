@@ -14,6 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import AuditLog
 
 
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 # R20-FIX: Maximum length for user_agent to prevent DB bloat via large headers.
 # An attacker can send a 100MB User-Agent header per request; without truncation,
 # each login/register writes that to the audit.logs Text column, filling the DB.

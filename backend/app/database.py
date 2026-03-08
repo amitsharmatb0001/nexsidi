@@ -218,8 +218,8 @@ async def run_migrations() -> None:
                     await conn.execute(
                         text(f"SELECT pg_advisory_unlock({_MIGRATION_LOCK_ID})")
                     )
-            except Exception:
-                pass  # Lock has no TTL — it's released when session ends anyway
+            except Exception as _lock_exc:
+                logger.debug("advisory_lock_release_failed", error=str(_lock_exc)[:200])
     logger.info("Alembic migrations applied (upgrade head)")
 
 

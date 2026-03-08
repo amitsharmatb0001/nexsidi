@@ -58,6 +58,9 @@ logger = structlog.get_logger(__name__)
 
 _DOCKER_CACHE: tuple[bool, float] | None = None
 _DOCKER_CACHE_TTL = 60  # seconds — re-probe Docker at most once per minute
+# AUDIT-T2-21: Lock to prevent race condition on cache read→write
+import threading as _threading
+_docker_cache_lock = _threading.Lock()
 
 
 def _check_docker_available() -> bool:
@@ -73,20 +76,22 @@ def _check_docker_available() -> bool:
     """
     global _DOCKER_CACHE
     now = time.monotonic()
-    if _DOCKER_CACHE is not None and now < _DOCKER_CACHE[1]:
-        return _DOCKER_CACHE[0]
+    # AUDIT-T2-21: Thread-safe cache access to prevent concurrent probe race
+    with _docker_cache_lock:
+        if _DOCKER_CACHE is not None and now < _DOCKER_CACHE[1]:
+            return _DOCKER_CACHE[0]
 
-    try:
-        result = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            timeout=5,
-        )
-        available = result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        available = False
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                timeout=5,
+            )
+            available = result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            available = False
 
-    _DOCKER_CACHE = (available, now + _DOCKER_CACHE_TTL)
+        _DOCKER_CACHE = (available, now + _DOCKER_CACHE_TTL)
     logger.info("docker_availability_check", available=available, cache_ttl_seconds=_DOCKER_CACHE_TTL)
     return available
 
@@ -95,54 +100,6 @@ def _check_docker_available() -> bool:
 _GVISOR_CHECKED: bool = False
 
 
-def check_gvisor_runtime() -> bool:
-    """F10-FIX: Check if gVisor (runsc) runtime is available in Docker.
-
-    If gVisor is not installed, Docker silently falls back to runc (the default
-    runtime), which provides NO syscall-level sandboxing. This function logs a
-    WARNING at startup if runsc is missing so operators know the sandbox is
-    running without kernel-level isolation.
-
-    Called once at app startup. Safe to call multiple times (caches result).
-
-    Returns:
-        True if gVisor (runsc) is available, False otherwise.
-    """
-    global _GVISOR_CHECKED
-    if _GVISOR_CHECKED:
-        return True  # Already checked this process
-
-    try:
-        result = subprocess.run(
-            ["docker", "info", "--format", "{{json .Runtimes}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            runtimes_json = result.stdout.strip()
-            has_gvisor = "runsc" in runtimes_json.lower()
-            if has_gvisor:
-                logger.info("gvisor_runtime_available", runtimes=runtimes_json[:200])
-            else:
-                logger.warning(
-                    "gvisor_runtime_missing",
-                    runtimes=runtimes_json[:200],
-                    msg="gVisor (runsc) not found in Docker runtimes. "
-                        "Sandboxes will use runc (default) with NO syscall filtering. "
-                        "Install gVisor: https://gvisor.dev/docs/user_guide/install/",
-                )
-            _GVISOR_CHECKED = True
-            return has_gvisor
-        else:
-            logger.warning("gvisor_check_failed", stderr=result.stderr[:200])
-            return False
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug("gvisor_check_skipped", error=str(exc)[:100])
-        return False
-
-
-# ── Approved Docker Base Images (AUDIT FIX #1) ────────────────────
 
 APPROVED_BASE_IMAGES: frozenset[str] = frozenset({
     "python:3.12-slim",
@@ -518,17 +475,31 @@ class ExecutionEngine:
                 # Return True so pipeline continues in CI/dev without Docker
                 return True
 
-            # SANDBOX-FIX B (step 2): Write all project files to a temp dir
-            temp_dir = tempfile.mkdtemp(prefix=f"nexsidi-sandbox-{state.sandbox_id}-")
-            state.temp_dir = temp_dir
+            # PHASE-5: Use disk-backed workspace if available, else temp dir
+            temp_dir = None
+            try:
+                from app.services.project_workspace import get_workspace
+                _ws = get_workspace(pipeline_run_id)
+                # Write files to workspace (they persist across restarts)
+                for rel_path, content in project_files.items():
+                    _ws.write_file(rel_path, content, agent="execution_engine")
+                temp_dir = _ws.get_docker_bind_mount()
+            except Exception:
+                pass  # Fall back to temp dir
 
-            for rel_path, content in project_files.items():
-                # Normalise path separators and guard against path traversal
-                safe_rel = os.path.normpath(rel_path).lstrip("/\\")
-                dest = os.path.join(temp_dir, safe_rel)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                with open(dest, "w", encoding="utf-8") as fh:
-                    fh.write(content)
+            if temp_dir is None:
+                # SANDBOX-FIX B (step 2): Write all project files to a temp dir
+                temp_dir = tempfile.mkdtemp(prefix=f"nexsidi-sandbox-{state.sandbox_id}-")
+
+                for rel_path, content in project_files.items():
+                    # Normalise path separators and guard against path traversal
+                    safe_rel = os.path.normpath(rel_path).lstrip("/\\")
+                    dest = os.path.join(temp_dir, safe_rel)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    with open(dest, "w", encoding="utf-8") as fh:
+                        fh.write(content)
+
+            state.temp_dir = temp_dir
 
             # SANDBOX-FIX B (step 3): Write docker-compose.yml with config substituted
             compose_content = SANDBOX_COMPOSE_TEMPLATE.format(
@@ -553,13 +524,31 @@ class ExecutionEngine:
                 sandbox_id=state.sandbox_id,
                 temp_dir=temp_dir,
             )
-            proc = subprocess.run(
+            proc = await asyncio.to_thread(
+                subprocess.run,
                 ["docker", "compose", "-f", compose_path, "build", "--no-cache"],
                 capture_output=True,
                 text=True,
                 timeout=self._config.build_timeout,
             )
             state.build_logs = proc.stdout + proc.stderr
+
+            # Directive 5: Stream build output to Live AI Studio terminal
+            try:
+                from app.services.pipeline_events import publish_terminal_event
+                import asyncio as _aio
+                if proc.stdout:
+                    _aio.ensure_future(publish_terminal_event(
+                        pipeline_run_id, "docker compose build",
+                        proc.stdout[-2000:], "stdout",
+                    ))
+                if proc.stderr:
+                    _aio.ensure_future(publish_terminal_event(
+                        pipeline_run_id, "docker compose build",
+                        proc.stderr[-2000:], "stderr",
+                    ))
+            except Exception:
+                pass  # Non-fatal
 
             # SANDBOX-FIX B (step 5): Handle build failure
             if proc.returncode != 0:
@@ -655,7 +644,8 @@ class ExecutionEngine:
 
             # SANDBOX-FIX C (step 2): docker compose up -d
             logger.info("sandbox_docker_up_start", sandbox_id=state.sandbox_id)
-            proc = subprocess.run(
+            proc = await asyncio.to_thread(
+                subprocess.run,
                 ["docker", "compose", "-f", compose_path, "up", "-d"],
                 capture_output=True,
                 text=True,
@@ -676,7 +666,8 @@ class ExecutionEngine:
             # SANDBOX-FIX C (step 3): Extract mapped host port for sandbox-backend
             # (docker compose maps "0:8000" → random host port)
             try:
-                port_proc = subprocess.run(
+                port_proc = await asyncio.to_thread(
+                    subprocess.run,
                     [
                         "docker", "compose", "-f", compose_path,
                         "port", "sandbox-backend", "8000",
@@ -714,7 +705,7 @@ class ExecutionEngine:
                             healthy = True
                             break
                     except Exception:
-                        pass
+                        pass  # Non-critical — error logged upstream or handled by caller
                     await asyncio.sleep(2)
             except ImportError:
                 # httpx not available — assume healthy if docker up succeeded
@@ -795,7 +786,8 @@ class ExecutionEngine:
                 return True  # Nothing to migrate if compose wasn't built
 
             # Step 1: alembic upgrade head
-            alembic_proc = subprocess.run(
+            alembic_proc = await asyncio.to_thread(
+                subprocess.run,
                 [
                     "docker", "compose", "-f", compose_path,
                     "exec", "-T", "sandbox-backend",
@@ -816,7 +808,8 @@ class ExecutionEngine:
                 return False
 
             # Step 2: seed data (optional — script may not exist)
-            seed_proc = subprocess.run(
+            seed_proc = await asyncio.to_thread(
+                subprocess.run,
                 [
                     "docker", "compose", "-f", compose_path,
                     "exec", "-T", "sandbox-backend",
@@ -922,7 +915,7 @@ class ExecutionEngine:
                     _auth_token = data.get("access_token") or data.get("token")
                     return _auth_token
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
             return None
 
         async def _run_one_endpoint(
@@ -994,8 +987,9 @@ class ExecutionEngine:
                     "path": path,
                     "expected_status": expected_status,
                     "actual_status": None,
-                    "passed": None,   # None = not executed (skipped)
-                    "error": "sandbox not running (Docker unavailable)",
+                    "passed": None,
+                    "simulated": True,  # AUDIT-B3-FIX: was unmarked, now explicit
+                    "error": "SIMULATED — sandbox not running (Docker unavailable)",
                     "response_time_ms": 0.0,
                 })
         else:
@@ -1069,8 +1063,8 @@ class ExecutionEngine:
                     "load_time_ms": 0.0,
                     "console_errors": [],
                     "responsive_tests": {},
-                    "error": "Docker not available — simulation mode",
-                    "skipped": True,
+                    "error": "SIMULATED — Docker not available",
+                    "simulated": True,  # AUDIT-B3-FIX: was "skipped: True"
                 })
             return results
 
@@ -1108,7 +1102,8 @@ class ExecutionEngine:
             # Discover the frontend's randomly mapped host port
             frontend_port = 3000  # fallback
             try:
-                fp_proc = subprocess.run(
+                fp_proc = await asyncio.to_thread(
+                    subprocess.run,
                     [
                         "docker", "compose", "-f", compose_path,
                         "port", "sandbox-frontend", "3000",
@@ -1121,11 +1116,12 @@ class ExecutionEngine:
                     mapped = fp_proc.stdout.strip().split(":")[-1]
                     frontend_port = int(mapped)
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
             frontend_url = f"http://localhost:{frontend_port}"
 
-            proc = subprocess.run(
+            proc = await asyncio.to_thread(
+                subprocess.run,
                 [
                     "npx", "playwright", "test", "playwright_tests/",
                     "--reporter=json",
@@ -1273,7 +1269,8 @@ class ExecutionEngine:
         # Check 1: Verify each expected table exists via information_schema
         for table_name in expected_tables:
             try:
-                result = subprocess.run(
+                result = await asyncio.to_thread(
+                    subprocess.run,
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-db",
                      "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
                      f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='{table_name}')"],
@@ -1294,7 +1291,8 @@ class ExecutionEngine:
 
         # Check 2: Verify foreign key constraints exist
         try:
-            fk_result = subprocess.run(
+            fk_result = await asyncio.to_thread(
+                subprocess.run,
                 ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-db",
                  "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
                  "SELECT count(*) FROM information_schema.table_constraints WHERE constraint_type='FOREIGN KEY'"],
@@ -1316,7 +1314,8 @@ class ExecutionEngine:
         # Check 3: Verify seed data exists (at least 1 row in first table)
         if expected_tables:
             try:
-                seed_result = subprocess.run(
+                seed_result = await asyncio.to_thread(
+                    subprocess.run,
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-db",
                      "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
                      f'SELECT count(*) FROM "{expected_tables[0]}"'],
@@ -1372,7 +1371,8 @@ class ExecutionEngine:
 
         # Backend: pip install --dry-run
         try:
-            pip_proc = subprocess.run(
+            pip_proc = await asyncio.to_thread(
+                subprocess.run,
                 ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
                  "pip", "install", "-r", "requirements.txt", "--dry-run"],
                 capture_output=True, text=True, timeout=timeout_seconds,
@@ -1386,7 +1386,8 @@ class ExecutionEngine:
 
         # Frontend: npm install --dry-run
         try:
-            npm_proc = subprocess.run(
+            npm_proc = await asyncio.to_thread(
+                subprocess.run,
                 ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-frontend",
                  "npm", "install", "--dry-run"],
                 capture_output=True, text=True, timeout=timeout_seconds,
@@ -1457,7 +1458,7 @@ class ExecutionEngine:
                         try:
                             token = login.json().get("access_token", "")
                         except Exception:
-                            pass
+                            pass  # Non-critical — error logged upstream or handled by caller
                     results.append({
                         "test": "auth_login", "status": login.status_code,
                         "passed": login.status_code == 200 and bool(token),
@@ -1577,7 +1578,7 @@ class ExecutionEngine:
                             rate_limit_hit = True
                             break
                 except Exception:
-                    pass
+                    pass  # Non-critical — error logged upstream or handled by caller
                 results.append({
                     "test": "rate_limiting_active",
                     "passed": rate_limit_hit,
@@ -1774,7 +1775,8 @@ class ExecutionEngine:
         try:
             if _check_docker_available() and state.temp_dir and os.path.isfile(compose_path):
                 # SANDBOX-FIX D (step 1): docker compose down --volumes --remove-orphans
-                proc = subprocess.run(
+                proc = await asyncio.to_thread(
+                    subprocess.run,
                     [
                         "docker", "compose", "-f", compose_path,
                         "down", "--volumes", "--remove-orphans",

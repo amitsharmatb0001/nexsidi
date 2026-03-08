@@ -148,16 +148,29 @@ class DeliveryEngine:
 
         zip_buffer = io.BytesIO()
 
+        # AUDIT-T1-7: File size caps to prevent LLM hallucination blowup
+        _MAX_FILE_SIZE = 5 * 1024 * 1024   # 5MB per file
+        _MAX_TOTAL_SIZE = 200 * 1024 * 1024  # 200MB total uncompressed
+        _total_uncompressed = 0
+
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             # 1. Code files (backend)
             backend_files = self._collect_backend_files(context)
             for path, content in backend_files.items():
+                if len(content) > _MAX_FILE_SIZE:
+                    logger.warning("delivery_file_too_large", path=path, size=len(content))
+                    content = content[:_MAX_FILE_SIZE] + "\n# ... TRUNCATED (exceeded 5MB limit) ...\n"
+                _total_uncompressed += len(content)
                 zf.writestr(f"{project_name}/code/{path}", content)
                 manifest.backend_files += 1
 
             # 2. Code files (frontend)
             frontend_files = self._collect_frontend_files(context)
             for path, content in frontend_files.items():
+                if len(content) > _MAX_FILE_SIZE:
+                    logger.warning("delivery_file_too_large", path=path, size=len(content))
+                    content = content[:_MAX_FILE_SIZE] + "\n// ... TRUNCATED (exceeded 5MB limit) ...\n"
+                _total_uncompressed += len(content)
                 zf.writestr(f"{project_name}/code/{path}", content)
                 manifest.frontend_files += 1
 
@@ -264,7 +277,12 @@ class DeliveryEngine:
                 manifest.backend_files + manifest.frontend_files
                 + manifest.report_files + manifest.deploy_files + 1  # +1 for contract
             )
-            manifest.agents_involved = [k for k in context if not k.startswith("__")]
+            # AUDIT-T3-15: Validate agent names against alphanumeric+underscore to prevent injection
+            import re as _re_delivery
+            manifest.agents_involved = [
+                k for k in context
+                if not k.startswith("__") and _re_delivery.match(r'^[a-z_]+$', k)
+            ]
 
             # Deployment info
             pranav_output = context.get("pranav", {})

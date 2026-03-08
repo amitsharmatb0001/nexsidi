@@ -143,8 +143,9 @@ class AgentMemory:
                 col_name = f"knowledge_{agent_name}"[:63]
                 collection = chroma.get_or_create_collection(col_name)
                 knowledge_count = collection.count()
-            except Exception:
-                pass
+            except Exception as exc:
+                # AUDIT-T3-8: Log instead of silently swallowing
+                logger.warning("agent_memory_count_failed", agent=agent_name, error=str(exc)[:200])
 
         if not knowledge_count:
             key = f"knowledge_{agent_name}"
@@ -155,3 +156,8 @@ class AgentMemory:
 
 # Module-level singleton
 agent_memory = AgentMemory()
+
+
+def get_agent_memory() -> AgentMemory:
+    """Get the module-level AgentMemory singleton."""
+    return agent_memory

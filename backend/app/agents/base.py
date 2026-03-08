@@ -220,6 +220,266 @@ INTERRUPT_TOOL = ToolDefinition(
 )
 
 
+# ── Inter-Agent Communication Tool ────────────────────────────────
+
+ASK_AGENT_TOOL = ToolDefinition(
+    name="ask_agent",
+    description=(
+        "Ask another agent a question and wait for their response. "
+        "Use this when you need information from a specific agent "
+        "(e.g., ask vikram about architecture decisions, ask shubham "
+        "about API endpoint details). The target agent will be notified "
+        "and their response will be returned."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "to_agent": {
+                "type": "string",
+                "enum": [
+                    "tilotma", "saanvi", "vikram", "challenger", "dhruv",
+                    "vanya", "shubham", "aanya", "karan", "navya",
+                    "deepika", "aarav", "pranav", "fixer",
+                ],
+                "description": "Name of the agent to ask",
+            },
+            "question": {
+                "type": "string",
+                "description": "The question to ask the target agent",
+            },
+            "context": {
+                "type": "string",
+                "description": "Additional context to help the target agent answer",
+            },
+        },
+        "required": ["to_agent", "question"],
+    },
+)
+
+
+# ── Web Search Tools (Firecrawl) ──────────────────────────────────
+
+WEB_SEARCH_TOOL = ToolDefinition(
+    name="web_search",
+    description=(
+        "Search the web for documentation, best practices, error solutions, "
+        "market research, and framework-specific APIs. Returns titles, URLs, "
+        "and content snippets. Use this to research before making decisions."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query (e.g., 'FastAPI JWT authentication best practices 2025')",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of results (default 5, max 10)",
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+WEB_SCRAPE_TOOL = ToolDefinition(
+    name="web_scrape",
+    description=(
+        "Scrape a specific URL and extract its content as markdown. "
+        "Use this to read documentation pages, API references, or "
+        "blog posts found via web_search."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "The URL to scrape (must be a valid http/https URL)",
+            },
+        },
+        "required": ["url"],
+    },
+)
+
+
+# ── Self-Coding Tools (Evolution Engine) ─────────────────────────────
+#
+# These tools let agents read and modify their own source code.
+# SAFETY PROTOCOL: Changes to security/privacy/safety code are BLOCKED
+# and require human engineer approval. See self_coder.py for details.
+
+SELF_READ_SOURCE_TOOL = ToolDefinition(
+    name="self_read_source",
+    description=(
+        "Read a NexSidi source file to understand existing code. "
+        "Path is relative to backend/app/ (e.g., 'agents/vikram.py'). "
+        "Use this to inspect how agents, services, or tools work."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Path relative to backend/app/ (e.g., 'agents/shubham.py', 'services/ai_router.py')",
+            },
+        },
+        "required": ["file_path"],
+    },
+)
+
+SELF_LIST_FILES_TOOL = ToolDefinition(
+    name="self_list_files",
+    description="List NexSidi source files matching a glob pattern.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern (default: '**/*.py'). Examples: 'agents/*.py', 'services/*.py'",
+                "default": "**/*.py",
+            },
+        },
+    },
+)
+
+SELF_SEARCH_SOURCE_TOOL = ToolDefinition(
+    name="self_search_source",
+    description="Search across NexSidi source files for a regex pattern.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Regex pattern to search for (e.g., 'def execute', 'class.*Agent')",
+            },
+            "file_pattern": {
+                "type": "string",
+                "description": "File glob to limit search (default: '*.py')",
+                "default": "*.py",
+            },
+        },
+        "required": ["query"],
+    },
+)
+
+SELF_PROPOSE_CHANGE_TOOL = ToolDefinition(
+    name="self_propose_change",
+    description=(
+        "Propose a code change to any NexSidi source file. "
+        "The change is validated (AST check, path safety) before it can be applied. "
+        "NOTE: Changes to security/privacy/safety code require human approval."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Path relative to backend/app/",
+            },
+            "old_code": {
+                "type": "string",
+                "description": "Exact code to replace (must exist in file). Empty for new files.",
+            },
+            "new_code": {
+                "type": "string",
+                "description": "New code to insert in place of old_code.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why this change is needed (logged for audit trail).",
+            },
+            "proposed_by": {
+                "type": "string",
+                "description": "Your agent name.",
+            },
+            "change_type": {
+                "type": "string",
+                "enum": ["edit", "create", "add_tool", "modify_prompt", "create_agent"],
+                "description": "Type of change.",
+                "default": "edit",
+            },
+        },
+        "required": ["file_path", "new_code", "reason", "proposed_by"],
+    },
+)
+
+SELF_APPLY_CHANGE_TOOL = ToolDefinition(
+    name="self_apply_change",
+    description=(
+        "Apply a validated change proposal to the filesystem. "
+        "Only works if the proposal passed validation. "
+        "Changes to protected code will be BLOCKED (requires human approval)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "proposal_id": {
+                "type": "string",
+                "description": "The proposal ID returned by self_propose_change.",
+            },
+        },
+        "required": ["proposal_id"],
+    },
+)
+
+SELF_ROLLBACK_CHANGE_TOOL = ToolDefinition(
+    name="self_rollback_change",
+    description="Rollback a previously applied change to restore the original code.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "proposal_id": {
+                "type": "string",
+                "description": "The proposal ID to rollback.",
+            },
+        },
+        "required": ["proposal_id"],
+    },
+)
+
+SELF_CREATE_TOOL_TOOL = ToolDefinition(
+    name="self_create_tool",
+    description=(
+        "Add a new tool to an existing agent. Generates the ToolDefinition "
+        "registration and handler code, then creates a validated proposal."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "agent_name": {"type": "string", "description": "Target agent name"},
+            "tool_name": {"type": "string", "description": "Name for the new tool"},
+            "tool_description": {"type": "string", "description": "Tool description for the AI"},
+            "tool_parameters": {"type": "object", "description": "JSON Schema for tool parameters"},
+            "handler_code": {"type": "string", "description": "Python source for the handler method"},
+            "reason": {"type": "string", "description": "Why this tool is needed"},
+        },
+        "required": ["agent_name", "tool_name", "tool_description", "handler_code", "reason"],
+    },
+)
+
+SELF_GET_CHANGE_LOG_TOOL = ToolDefinition(
+    name="self_get_change_log",
+    description="View the history of all code changes made by agents.",
+    parameters={
+        "type": "object",
+        "properties": {},
+    },
+)
+
+# All self-coding tools bundled for easy registration
+SELF_CODING_TOOLS: list[ToolDefinition] = [
+    SELF_READ_SOURCE_TOOL,
+    SELF_LIST_FILES_TOOL,
+    SELF_SEARCH_SOURCE_TOOL,
+    SELF_PROPOSE_CHANGE_TOOL,
+    SELF_APPLY_CHANGE_TOOL,
+    SELF_ROLLBACK_CHANGE_TOOL,
+    SELF_CREATE_TOOL_TOOL,
+    SELF_GET_CHANGE_LOG_TOOL,
+]
+
+
 # ── Model Override Resolution ─────────────────────────────────────
 
 # Map raw model IDs to MODELS registry keys (fixes agent bug where
@@ -318,6 +578,16 @@ async def run_agent(
         execution_id=execution_id,
     )
 
+    # Directive 5: Emit agent_thinking "start" event
+    try:
+        from app.services.pipeline_events import publish_agent_thinking_event
+        await publish_agent_thinking_event(
+            pipeline_run_id, agent.name, "start",
+            detail=f"Agent {agent.name} starting execution",
+        )
+    except Exception as _evt_exc:
+        logger.debug("agent_thinking_event_failed", error=str(_evt_exc)[:200])
+
     try:
         result = await agent.execute(pipeline_run_id, context)
         result.execution_id = execution_id
@@ -331,6 +601,40 @@ async def run_agent(
             duration_ms=round(result.duration_ms, 1),
             pipeline_run_id=pipeline_run_id,
         )
+
+        # AGENTIC-FIX: Activate post-execution self-reflection.
+        # reflect() existed but was NEVER CALLED — now it runs after every
+        # successful agent execution using the cheapest model (~$0.001/call).
+        # Results are stored in agent output for downstream consumers.
+        if result.status == AgentStatus.COMPLETED and result.output:
+            try:
+                import json as _refl_json
+                output_summary = _refl_json.dumps(result.output, default=str)[:3000]
+                context_summary = str({
+                    k: type(v).__name__ for k, v in context.items()
+                    if not k.startswith("__")
+                })[:500]
+                reflection = await reflect(agent.name, output_summary, context_summary)
+                if reflection and reflection.get("issues"):
+                    result.output["__self_reflection__"] = reflection
+                    logger.info(
+                        "agent_reflection",
+                        agent=agent.name,
+                        issues=len(reflection.get("issues", [])),
+                        confidence=reflection.get("confidence", 0),
+                    )
+            except Exception as _refl_exc:
+                logger.debug("agent_reflection_failed", error=str(_refl_exc)[:200])
+
+        # Directive 5: Emit agent_thinking "complete" event
+        try:
+            await publish_agent_thinking_event(
+                pipeline_run_id, agent.name, "complete",
+                detail=f"Completed in {round(result.duration_ms)}ms — {result.status.value}",
+            )
+        except Exception as _evt_exc:
+            logger.debug("agent_thinking_complete_event_failed", error=str(_evt_exc)[:200])
+
         return result
 
     except Exception as exc:
@@ -346,6 +650,16 @@ async def run_agent(
             error=safe_error,
             pipeline_run_id=pipeline_run_id,
         )
+
+        # Directive 5: Emit agent_thinking "error" event
+        try:
+            await publish_agent_thinking_event(
+                pipeline_run_id, agent.name, "error",
+                detail=safe_error[:200],
+            )
+        except Exception as _evt_exc:
+            logger.debug("agent_thinking_error_event_failed", error=str(_evt_exc)[:200])
+
         # CHANGE-20: Build structured failure report instead of opaque error.
         failure_report = _build_failure_report(agent.name, exc)
         return AgentResult(
@@ -514,7 +828,175 @@ _AI_BACKOFF_BASE = 2.0
 def _is_retryable_error(exc: Exception) -> bool:
     """Check if an AI call error is transient (500, 503, 429, timeout)."""
     error_str = str(exc).lower()
-    return any(x in error_str for x in ["500", "503", "529", "429", "timeout", "overloaded", "rate_limit"])
+    return any(x in error_str for x in ["500", "502", "503", "429", "timeout", "overloaded", "rate_limit"])
+
+
+# ── Shared Web Search Tool Handler ─────────────────────────────────
+
+async def handle_web_tool(tool_name: str, tool_input: dict[str, Any]) -> str | None:
+    """Handle shared tool calls (web, inter-agent, self-coding) across all agents.
+
+    Returns the tool result string, or None if this isn't a shared tool.
+    Agent tool handlers should call this FIRST and return the result if not None.
+    """
+    import json as _json
+
+    # ── Web Search (multi-provider with fallback) ───────────────────
+    if tool_name == "web_search":
+        from app.services.web_search import get_multi_provider_search
+
+        ws = get_multi_provider_search()
+        query = tool_input.get("query", "")
+        max_results = min(tool_input.get("max_results", 5), 10)
+        results = await ws.search(query, max_results=max_results)
+
+        if not results:
+            return _json.dumps({"results": [], "note": "No results found or web search is disabled"})
+
+        return _json.dumps({
+            "results": [
+                {"title": r.title, "url": r.url, "snippet": r.snippet, "content": r.content[:2000]}
+                for r in results
+            ]
+        })
+
+    # ── Web Scrape (multi-provider with fallback) ───────────────────
+    if tool_name == "web_scrape":
+        from app.services.web_search import get_multi_provider_search
+
+        ws = get_multi_provider_search()
+        url = tool_input.get("url", "")
+        page = await ws.scrape(url)
+
+        if not page:
+            return _json.dumps({"error": "Failed to scrape URL or web search is disabled"})
+
+        return _json.dumps({
+            "url": page.url,
+            "title": page.title,
+            "markdown": page.markdown[:10000],
+        })
+
+    # ── Inter-Agent Communication ───────────────────────────────────
+    if tool_name == "ask_agent":
+        to_agent = tool_input.get("to_agent", "")
+        question = tool_input.get("question", "")
+        ctx = tool_input.get("context", "")
+
+        if not to_agent or not question:
+            return _json.dumps({"error": "to_agent and question are required"})
+
+        try:
+            from app.services.agent_message_bus import get_message_bus
+
+            bus = get_message_bus()
+            response = await bus.ask(
+                from_agent="requesting_agent",
+                to_agent=to_agent,
+                question=question,
+                context=ctx,
+                timeout=30,
+            )
+
+            if response:
+                return _json.dumps({"agent": to_agent, "response": response})
+            else:
+                return _json.dumps({"agent": to_agent, "response": "No response received (timeout)"})
+        except Exception as exc:
+            return _json.dumps({"error": f"Failed to ask {to_agent}: {str(exc)[:200]}"})
+
+    # ── Self-Coding Tools ───────────────────────────────────────────
+    if tool_name == "self_read_source":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        file_path = tool_input.get("file_path", "")
+        content = sc.read_source(file_path)
+        return _json.dumps({"file_path": file_path, "content": content[:20000]})
+
+    if tool_name == "self_list_files":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        pattern = tool_input.get("pattern", "**/*.py")
+        files = sc.list_source_files(pattern)
+        return _json.dumps({"files": files, "total": len(files)})
+
+    if tool_name == "self_search_source":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        query = tool_input.get("query", "")
+        file_pattern = tool_input.get("file_pattern", "*.py")
+        matches = sc.search_source(query, file_pattern)
+        return _json.dumps({"matches": matches, "total": len(matches)})
+
+    if tool_name == "self_propose_change":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        proposal = sc.propose_change(
+            file_path=tool_input.get("file_path", ""),
+            old_code=tool_input.get("old_code", ""),
+            new_code=tool_input.get("new_code", ""),
+            reason=tool_input.get("reason", ""),
+            proposed_by=tool_input.get("proposed_by", "unknown_agent"),
+            change_type=tool_input.get("change_type", "edit"),
+        )
+        result: dict[str, Any] = {
+            "proposal_id": proposal.id,
+            "status": proposal.status,
+            "file_path": proposal.file_path,
+            "validation_errors": proposal.validation_errors,
+        }
+        if proposal.requires_human_review:
+            result["requires_human_review"] = True
+            result["safety_flags"] = proposal.safety_flags
+            result["message"] = (
+                "SAFETY PROTOCOL: This change touches protected code. "
+                "A human engineer must approve before it can be applied. "
+                "The proposal is BLOCKED until then."
+            )
+        return _json.dumps(result)
+
+    if tool_name == "self_apply_change":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        proposal_id = tool_input.get("proposal_id", "")
+        result = sc.apply_change(proposal_id)
+        return _json.dumps(result)
+
+    if tool_name == "self_rollback_change":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        proposal_id = tool_input.get("proposal_id", "")
+        result = sc.rollback_change(proposal_id)
+        return _json.dumps(result)
+
+    if tool_name == "self_create_tool":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        proposal = sc.create_tool_for_agent(
+            agent_name=tool_input.get("agent_name", ""),
+            tool_name=tool_input.get("tool_name", ""),
+            tool_description=tool_input.get("tool_description", ""),
+            tool_parameters=tool_input.get("tool_parameters", {}),
+            handler_code=tool_input.get("handler_code", ""),
+            reason=tool_input.get("reason", ""),
+        )
+        result = {
+            "proposal_id": proposal.id,
+            "status": proposal.status,
+            "validation_errors": proposal.validation_errors,
+        }
+        if proposal.requires_human_review:
+            result["requires_human_review"] = True
+            result["safety_flags"] = proposal.safety_flags
+        return _json.dumps(result)
+
+    if tool_name == "self_get_change_log":
+        from app.services.self_coder import get_self_coder
+        sc = get_self_coder()
+        log = sc.get_change_log()
+        return _json.dumps({"changes": log[-20:], "total": len(log)})
+
+    return None  # Not a shared tool — let the agent's handler process it
 
 
 async def call_ai(
@@ -586,7 +1068,7 @@ async def call_ai_with_continuation(
     complexity: TaskComplexity | None = None,
     temperature: float = 0.7,
     max_tokens: int | None = None,
-    max_continuations: int = 5,
+    max_continuations: int = 50,  # PHASE-1: Safety cap only — no functional limit
     shared_context: Any | None = None,
     enable_thinking: bool = False,  # M3-FIX: Forward enable_thinking to call_ai
     dynamic_system_context: str | None = None,  # CACHE-FIX: forwarded to call_ai
@@ -671,6 +1153,7 @@ async def call_ai_with_continuation(
             {"role": "assistant", "content": tail},
             {"role": "user", "content": (
                 "Your response was cut off. Continue EXACTLY from where you stopped. "
+                f"(Accumulated {len(full_content)} chars so far across {continuation + 1} parts.) "
                 "Do NOT repeat any code already generated above. "
                 "Do NOT add any explanation — just continue the code."
             )},
@@ -710,7 +1193,7 @@ async def call_ai_with_tools(
     task_type: str = "general",
     complexity: TaskComplexity | None = None,
     tool_handler: Any = None,
-    max_tool_rounds: int = 10,
+    max_tool_rounds: int = 200,  # PHASE-1: Safety cap only — no functional limit
 ) -> AIResponse:
     """Make an AI call with observe→decide loop.
 
@@ -728,6 +1211,11 @@ async def call_ai_with_tools(
     ai_messages = [AIMessage(role=m["role"], content=m["content"]) for m in messages]
     tool_defs = [t.to_anthropic_format() for t in agent.tools] if agent.tools else None
 
+    # NATIVE-SEARCH: Detect if agent has web_search tool → enable provider-native search.
+    # This injects Claude's web_search_20250305 or Gemini's google_search grounding
+    # directly into the AI call. The model decides when to search autonomously.
+    _has_web_search = any(t.name == "web_search" for t in (agent.tools or []))
+
     request = AIRequest(
         messages=ai_messages,
         system_prompt=system_prompt,
@@ -735,6 +1223,7 @@ async def call_ai_with_tools(
         complexity=complexity or agent.default_complexity,
         model_override=resolve_model_override(agent.default_model),
         tools=tool_defs,
+        enable_native_web_search=_has_web_search,
     )
 
     response = await router.call(request)
@@ -759,7 +1248,7 @@ async def call_ai_with_tools(
     import hashlib as _hashlib_stall
     _tool_fingerprints: list[str] = []
     _stall_warnings = 0
-    _MAX_STALL_WARNINGS = 2  # Force-break after 2 stall warnings
+    _MAX_STALL_WARNINGS = 10  # PHASE-1: Safety cap only — generous before force-break
 
     while response.tool_calls and rounds < max_tool_rounds:
         rounds += 1
@@ -860,6 +1349,7 @@ async def call_ai_with_tools(
                             complexity=TaskComplexity.HIGH,
                             model_override=resolve_model_override(agent.default_model),
                             tools=tool_defs,
+                            enable_native_web_search=_has_web_search,
                         )
                         logger.info("tool_loop_escalated", tool=tc["name"], reason="observation")
             except Exception as exc:
@@ -942,30 +1432,32 @@ async def call_ai_with_tools(
         # Each round adds 2 messages (assistant tool_use + user tool_result).
         # By round 10, we'd send 22 messages with up to 50KB each = 1MB+.
         if len(ai_messages) > _MAX_HISTORY_MESSAGES:
-            # R25-FIX-5: Ensure message alternation after truncation.
-            # Anthropic requires strict user/assistant alternation. Naive
-            # truncation can produce two consecutive "user" messages (the
-            # original prompt + a tool_result that starts the tail). We must
-            # ensure the tail starts with an "assistant" message.
-            #
+            # P2-1: Improved sliding window — keeps first message (system context)
+            # + inserts a brief summary of dropped middle, then keeps recent rounds.
+            # Old code lost critical intermediate context silently.
+            first_msg = ai_messages[0]
             # R36-FIX: Ensure we keep COMPLETE rounds (assistant + user pairs).
-            # Previously, naive tail extraction could split a round, dropping
-            # the assistant tool_use but keeping its orphaned tool_result,
-            # which causes Anthropic API errors. We now compute the tail as
-            # an even number of messages (complete rounds) and ensure the
-            # tail starts with an assistant message.
             tail = ai_messages[-(_KEEP_ROUNDS * 2):]
-            # If tail starts with "user" (tool_result), drop it to maintain
-            # alternation: first_msg (user) must be followed by assistant.
+            # R25-FIX-5: Ensure message alternation after truncation.
             if tail and tail[0].role == "user":
                 tail = tail[1:]
-            # R36-FIX: Guard against empty tail after truncation. If all
-            # recent messages were user-role (edge case with tool results),
-            # keep at least the last 2 messages to avoid sending the AI
-            # only the initial prompt with no context about recent rounds.
+            # R36-FIX: Guard against empty tail after truncation.
             if not tail:
                 tail = ai_messages[-2:]
-            ai_messages = [ai_messages[0]] + tail
+            # P2-1: Insert a context bridge so the AI knows history was dropped.
+            dropped_count = len(ai_messages) - 1 - len(tail)
+            if dropped_count > 0:
+                from app.services.ai_router import AIMessage
+                summary_msg = AIMessage(
+                    role="user",
+                    content=(
+                        f"[Context: {dropped_count} earlier tool interactions omitted "
+                        "for brevity. Key actions were taken above.]"
+                    ),
+                )
+                ai_messages = [first_msg, summary_msg] + tail
+            else:
+                ai_messages = [first_msg] + tail
 
         # Call AI again with tool results
         request = AIRequest(
@@ -975,6 +1467,7 @@ async def call_ai_with_tools(
             complexity=complexity or agent.default_complexity,
             model_override=resolve_model_override(agent.default_model),
             tools=tool_defs,
+            enable_native_web_search=_has_web_search,
         )
         response = await router.call(request)
 
@@ -1075,6 +1568,261 @@ async def get_step_context(
             error=_sanitize_error(exc),
         )
         return None
+
+
+# ── PHASE-3: Inter-Agent Communication Utilities ─────────────────────
+
+
+async def notify_agents(
+    from_agent: str,
+    pipeline_run_id: str,
+    message: str,
+    to_agents: list[str] | None = None,
+    priority: str = "NORMAL",
+) -> None:
+    """Send a broadcast message to other agents (fire-and-forget).
+
+    Safe to call — silently does nothing if message bus unavailable.
+    """
+    try:
+        from app.services.agent_message_bus import get_agent_message_bus
+        bus = get_agent_message_bus()
+        await bus.broadcast(
+            from_agent=from_agent,
+            pipeline_run_id=pipeline_run_id,
+            message=message,
+            to_agents=to_agents,
+            cc_agents=["tilotma", "vikram"],  # Always CC both oversight agents
+            priority=priority,
+        )
+    except Exception as _bus_exc:
+        logger.debug("agent_broadcast_failed", from_agent=from_agent, error=str(_bus_exc)[:100])
+
+
+async def report_error_to_agent(
+    from_agent: str,
+    to_agent: str,
+    pipeline_run_id: str,
+    error_type: str,
+    file_path: str,
+    description: str,
+) -> str | None:
+    """Report an error to another agent. Returns their response or None.
+
+    E.g., Aanya finds broken API endpoint → reports to Shubham.
+    """
+    try:
+        from app.services.agent_message_bus import get_agent_message_bus
+        bus = get_agent_message_bus()
+        return await bus.report_error(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            pipeline_run_id=pipeline_run_id,
+            error_type=error_type,
+            file_path=file_path,
+            description=description,
+        )
+    except Exception as _bus_exc:
+        logger.debug("agent_error_report_failed", from_agent=from_agent, to_agent=to_agent, error=str(_bus_exc)[:100])
+        return None
+
+
+async def check_inbox(
+    agent_name: str,
+    pipeline_run_id: str,
+) -> list[dict[str, Any]]:
+    """Check for pending messages from other agents.
+
+    Returns list of messages (broadcasts, error reports, questions).
+    Call at the START of execute() to incorporate cross-agent context.
+    """
+    try:
+        from app.services.agent_message_bus import get_agent_message_bus
+        bus = get_agent_message_bus()
+        messages = await bus.get_pending_questions(agent_name, pipeline_run_id)
+        if messages:
+            logger.info(
+                "agent_inbox_messages",
+                agent=agent_name,
+                count=len(messages),
+                priorities=[m.get("priority", "NORMAL") for m in messages],
+            )
+        return messages
+    except Exception as _inbox_exc:
+        logger.debug("agent_inbox_check_failed", agent=agent_name, error=str(_inbox_exc)[:100])
+        return []
+
+
+def format_inbox_for_prompt(messages: list[dict[str, Any]]) -> str:
+    """Format inbox messages as a prompt section for the agent.
+
+    Converts raw message dicts into a readable prompt supplement
+    that informs the agent about cross-agent communications.
+
+    PHASE-3: AUTHORITY messages from Tilotma/Vikram are rendered with
+    non-ignorable markers. Agents MUST address these before proceeding.
+    """
+    if not messages:
+        return ""
+
+    # Sort: AUTHORITY first, then CRITICAL, then NORMAL/INFO
+    _PRIORITY_ORDER = {"AUTHORITY": 0, "CRITICAL": 1, "NORMAL": 2, "INFO": 3}
+    sorted_msgs = sorted(
+        messages[:15],  # Cap at 15 messages
+        key=lambda m: _PRIORITY_ORDER.get(m.get("priority", "NORMAL"), 2),
+    )
+
+    # Separate authority messages for special treatment
+    authority_msgs = [m for m in sorted_msgs if m.get("priority") == "AUTHORITY" or m.get("from_agent") in ("tilotma", "vikram")]
+    other_msgs = [m for m in sorted_msgs if m not in authority_msgs]
+
+    lines: list[str] = []
+
+    if authority_msgs:
+        lines.append("## ⚠ AUTHORITY DIRECTIVES (MANDATORY — DO NOT IGNORE)")
+        lines.append("The following messages are from Tilotma (Chief AI Official) or Vikram (Chief Architect).")
+        lines.append("You MUST address every directive below before proceeding with your task.")
+        lines.append("")
+        for msg in authority_msgs:
+            from_agent = msg.get("from_agent", "unknown")
+            content = msg.get("question", "")[:500]
+            lines.append(f"- **[AUTHORITY — {from_agent.upper()}]**: {content}")
+        lines.append("")
+
+    if other_msgs:
+        lines.append("## Messages from Other Agents")
+        for msg in other_msgs:
+            from_agent = msg.get("from_agent", "unknown")
+            priority = msg.get("priority", "NORMAL")
+            content = msg.get("question", "")[:500]
+            msg_type = "broadcast"
+            try:
+                import orjson
+                ctx = orjson.loads(msg.get("context", "{}"))
+                msg_type = ctx.get("type", "broadcast")
+            except Exception:
+                pass  # Expected: malformed context JSON — default to "broadcast"
+
+            prefix = "**CRITICAL**" if priority == "CRITICAL" else ""
+            lines.append(f"- [{msg_type}] from **{from_agent}** {prefix}: {content}")
+
+    return "\n".join(lines)
+
+
+# ── Structured Inbox Processing (Phase 6B) ──────────────────────────
+
+
+@dataclass
+class ProcessedInbox:
+    """Structured result of processing an agent's inbox.
+
+    Instead of just injecting raw text into prompts, this separates messages
+    by type so agents can handle them appropriately:
+    - authority_directives: MUST be injected into system prompt as mandatory
+    - pending_questions: Should be answered before proceeding (tool_result format)
+    - feedback: Must be addressed in the agent's work
+    - broadcasts: Informational context (optional to address)
+    """
+
+    authority_directives: list[dict[str, Any]] = field(default_factory=list)
+    pending_questions: list[dict[str, Any]] = field(default_factory=list)
+    feedback: list[dict[str, Any]] = field(default_factory=list)
+    broadcasts: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def has_authority(self) -> bool:
+        return len(self.authority_directives) > 0
+
+    @property
+    def has_questions(self) -> bool:
+        return len(self.pending_questions) > 0
+
+    def to_system_prompt_section(self) -> str:
+        """Build a system prompt section from authority directives."""
+        if not self.authority_directives:
+            return ""
+
+        lines = [
+            "\n## MANDATORY DIRECTIVES (from project leadership)",
+            "You MUST follow ALL directives below. Non-compliance will trigger pipeline rejection.",
+            "",
+        ]
+        for d in self.authority_directives:
+            from_agent = d.get("from_agent", "unknown")
+            content = d.get("question", d.get("content", ""))[:500]
+            lines.append(f"[{from_agent.upper()}]: {content}")
+
+        return "\n".join(lines)
+
+    def to_feedback_prompt(self) -> str:
+        """Build a feedback section that agents must address."""
+        if not self.feedback:
+            return ""
+
+        lines = [
+            "\n## FEEDBACK TO ADDRESS",
+            "The following feedback was provided by other agents. You MUST address each item.",
+            "",
+        ]
+        for f in self.feedback:
+            from_agent = f.get("from_agent", "unknown")
+            content = f.get("question", f.get("content", ""))[:500]
+            lines.append(f"- [{from_agent}]: {content}")
+
+        return "\n".join(lines)
+
+    def format_questions_as_tool_results(self) -> list[dict[str, str]]:
+        """Format pending questions as tool_result messages for the AI."""
+        results = []
+        for q in self.pending_questions:
+            from_agent = q.get("from_agent", "unknown")
+            question = q.get("question", "")[:500]
+            results.append({
+                "role": "user",
+                "content": (
+                    f"[QUESTION from {from_agent}]: {question}\n"
+                    "Please answer this question before continuing your work."
+                ),
+            })
+        return results
+
+
+def process_inbox_messages(messages: list[dict[str, Any]]) -> ProcessedInbox:
+    """Process raw inbox messages into structured categories.
+
+    Phase 6B: Instead of just formatting messages as text, this categorizes
+    them so agents can handle each type appropriately:
+    - AUTHORITY: From tilotma/vikram → mandatory system prompt injection
+    - QUESTION: Direct questions → must answer via tool_result
+    - FEEDBACK: Review feedback → must address in output
+    - BROADCAST: General info → optional context
+    """
+    inbox = ProcessedInbox()
+
+    for msg in messages[:15]:  # Cap at 15
+        priority = msg.get("priority", "NORMAL")
+        from_agent = msg.get("from_agent", "")
+        msg_type = "broadcast"
+
+        # Try to extract message type from context
+        try:
+            import json as _json
+            ctx = _json.loads(msg.get("context", "{}"))
+            msg_type = ctx.get("type", "broadcast")
+        except Exception:
+            pass
+
+        # Categorize
+        if priority == "AUTHORITY" or from_agent in ("tilotma", "vikram"):
+            inbox.authority_directives.append(msg)
+        elif msg_type == "question" or priority == "CRITICAL":
+            inbox.pending_questions.append(msg)
+        elif msg_type == "feedback" or msg_type == "review":
+            inbox.feedback.append(msg)
+        else:
+            inbox.broadcasts.append(msg)
+
+    return inbox
 
 
 # ── Agent Registry ──────────────────────────────────────────────────
@@ -1220,7 +1968,7 @@ class VerificationGate:
                                 f"Use one of these exact names."
                             )
                 except SyntaxError:
-                    pass  # Source file has syntax errors — can't parse
+                    pass  # Expected: source file has syntax errors — can't AST-parse imports
 
         # 5. Package __init__.py check (WARNING)
         dir_path = "/".join(path.split("/")[:-1])
@@ -1238,8 +1986,8 @@ class VerificationGate:
                 result = rule(path, content, all_files)
                 if isinstance(result, str) and result:
                     failures.append(result)
-            except Exception:
-                pass  # Don't let bad rules crash verification
+            except Exception as _rule_exc:
+                logger.debug("verification_rule_failed", rule=str(rule)[:100], error=str(_rule_exc)[:200])
 
         return VerificationResult(
             passed=len(failures) == 0,
@@ -1281,8 +2029,8 @@ class VerificationGate:
                 result = rule(path, content, all_files)
                 if isinstance(result, str) and result:
                     failures.append(result)
-            except Exception:
-                pass
+            except Exception as _rule_exc:
+                logger.debug("css_verification_rule_failed", rule=str(rule)[:100], error=str(_rule_exc)[:200])
 
         return VerificationResult(
             passed=len(failures) == 0,
@@ -1296,6 +2044,8 @@ class VerificationGate:
         CHANGE-1: After verification, checks if this exact content was
         previously rejected for the same path. If so, adds a HARD failure
         forcing the LLM to change its approach.
+
+        PHASE-9: Zero Trust scan of generated code before acceptance.
         """
         import hashlib as _hashlib
 
@@ -1309,6 +2059,55 @@ class VerificationGate:
             if "```" in content and (content.startswith("```") or "\n```" in content[:50]):
                 failures.append("Contains markdown code fences.")
             result = VerificationResult(passed=len(failures) == 0, failures=failures, warnings=[])
+
+        # PHASE-9: Zero Trust scan of generated code
+        try:
+            from app.services.zero_trust import get_zero_trust_gate
+            import asyncio
+            _zt = get_zero_trust_gate()
+            # Run scan synchronously since verify() is sync
+            try:
+                loop = asyncio.get_running_loop()
+                # Already in async context — schedule as task
+                import concurrent.futures
+                _zt_result = loop.run_until_complete(_zt.scan_generated_code(path, content, "unknown"))
+            except RuntimeError:
+                # No event loop — create one for the scan
+                _zt_result = asyncio.run(_zt.scan_generated_code(path, content, "unknown"))
+
+            if _zt_result.is_blocked():
+                result.failures.insert(0, f"SECURITY BLOCK: {'; '.join(_zt_result.findings[:3])}")
+                result.passed = False
+            elif _zt_result.findings:
+                for f in _zt_result.findings[:3]:
+                    result.warnings.append(f"SECURITY: {f}")
+        except Exception as _zt_exc:
+            logger.debug("zero_trust_scan_failed", path=path, error=str(_zt_exc)[:200])
+
+        # Phase 1B: Code Authenticity Validation (Directive 4)
+        # Zero-tolerance enforcement: NO stubs, NO facades, NO dead code, NO vaporware.
+        # Critical findings (stubs, facades) BLOCK the write. Agents must implement
+        # real logic. Applied to NexSidi's own generated code too.
+        try:
+            from app.services.code_authenticity import get_code_authenticity_validator
+            _lang = "python" if path.endswith(".py") else "other"
+            _auth_validator = get_code_authenticity_validator()
+            _auth_report = _auth_validator.validate_file(path, content, _lang)
+            if _auth_report.critical_count > 0:
+                for _af in _auth_report.findings:
+                    if _af.severity.value == "critical":
+                        result.failures.append(
+                            f"AUTHENTICITY: {_af.description} — {_af.fix_hint}"
+                        )
+                result.passed = False
+            # Non-critical authenticity findings as warnings
+            for _af in _auth_report.findings:
+                if _af.severity.value in ("high", "medium"):
+                    result.warnings.append(
+                        f"AUTHENTICITY: {_af.description}"
+                    )
+        except Exception as _auth_exc:
+            logger.debug("authenticity_scan_failed", path=path, error=str(_auth_exc)[:200])
 
         # CHANGE-1: Loop detection — if this content was already rejected,
         # the LLM is stuck in a loop. Add a HARD failure with prior reasons.
@@ -1552,7 +2351,7 @@ async def reflect(
             messages=[AIMessage(role="user", content=critique_prompt)],
             complexity=TaskComplexity.LOW,  # Cheapest model
             max_tokens=max_tokens,
-            agent_name=f"{agent_name}_reflection",
+            task_type="reflection",
         ))
 
         from app.utils.json_parser import parse_json

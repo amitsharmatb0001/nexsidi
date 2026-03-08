@@ -66,6 +66,11 @@ async def create_project(
         )
     except Exception as audit_exc:
         logger.error("audit_log_failed", action="project.create", error=str(audit_exc)[:200])
+        # AUDIT-T2-20: In production, audit trail is required for compliance.
+        # Re-raise so the transaction rolls back — no operation without audit.
+        from app.config import get_settings
+        if getattr(get_settings(), "is_production", False):
+            raise
 
     logger.info("project_created", project_id=str(project.id), name=body.name)
     return ProjectResponse.model_validate(project)

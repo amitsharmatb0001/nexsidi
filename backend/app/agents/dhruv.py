@@ -24,6 +24,9 @@ from app.agents.base import (
     ToolDefinition,
     call_ai,
     call_ai_with_tools,
+    check_inbox,
+    format_inbox_for_prompt,
+    notify_agents,
     register_agent,
     run_agent,
     store_output,
@@ -129,6 +132,18 @@ class DhruvToolHandler:
             has_create = "CREATE" in content.upper()
             if not has_create:
                 return "Validation WARNING: no CREATE statements found"
+
+        # AUDIT-T3-5: Check that all contract table names appear in generated DDL
+        # This catches cases where the LLM forgets to generate some tables
+        if dialect in ("postgresql", "mysql", "sqlite", "cockroachdb", "supabase"):
+            content_upper = content.upper()
+            if hasattr(self, '_contract_tables') and self._contract_tables:
+                missing = [t for t in self._contract_tables if t.upper() not in content_upper]
+                if missing:
+                    return (
+                        f"Validation WARNING: {len(missing)} contract table(s) missing from DDL: "
+                        f"{', '.join(missing[:10])}. Regenerate to include all tables."
+                    )
 
         return "Validation OK — schema syntax looks correct"
 
@@ -422,6 +437,10 @@ class Dhruv:
         context: dict[str, Any],
     ) -> AgentResult:
         """Generate database artifacts from Vikram's architecture contract."""
+        # PHASE-3: Check inbox for messages from other agents
+        inbox_messages = await check_inbox(self.name, pipeline_run_id)
+        inbox_context = format_inbox_for_prompt(inbox_messages)
+
         vikram_output = context.get("vikram")
         if not vikram_output:
             return AgentResult(
@@ -435,9 +454,11 @@ class Dhruv:
         # Detect database and backend framework from contract
         db_name = self._detect_database(contract)
         db_config = get_database_config(db_name)
-        backend_framework = contract.get("tech_stack", {}).get(
-            "backend", "fastapi"
-        )
+        # AUDIT-T3-13: Validate tech_stack is dict before calling .get()
+        _tech_stack = contract.get("tech_stack", {})
+        if not isinstance(_tech_stack, dict):
+            _tech_stack = {}
+        backend_framework = _tech_stack.get("backend", "fastapi")
 
         logger.info(
             "database_detected",
@@ -453,6 +474,11 @@ class Dhruv:
             tables = contract.get("database", {}).get("collections", [])
         if not tables:
             tables = contract.get("database", {}).get("entities", [])
+        # AUDIT-T3-5: Store contract table names for post-generation validation
+        self._contract_tables = [
+            t.get("name", "") for t in tables
+            if isinstance(t, dict) and t.get("name")
+        ]
 
         if not tables:
             return AgentResult(
@@ -464,6 +490,25 @@ class Dhruv:
 
         # Build dynamic system prompt from DatabaseConfig
         system_prompt = self._build_system_prompt(db_config, backend_framework)
+
+        # PHASE-10: Enrich prompt with learned knowledge, lessons, and warnings
+        try:
+            from app.services.dynamic_prompt_builder import get_dynamic_prompt_builder
+            _dpb = get_dynamic_prompt_builder()
+            system_prompt = await _dpb.build_system_prompt(
+                agent_name=self.name,
+                task_context={
+                    "task_type": "database_schema",
+                    "framework": backend_framework,
+                    "task_summary": f"Generate {db_config.display_name} schema ({len(tables or [])} tables)",
+                    "previous_agent_outputs": {
+                        "vikram": f"Contract with {len(tables or [])} tables, backend={backend_framework}",
+                    },
+                },
+                base_prompt_fallback=system_prompt,
+            )
+        except Exception as _dpb_exc:
+            logger.debug("dynamic_prompt_fallback", agent=self.name, error=str(_dpb_exc)[:100])
 
         # Add agentic instructions
         system_prompt += "\n".join([
@@ -500,6 +545,16 @@ class Dhruv:
             f"```json\n{tables_json}\n```\n\n"
             f"## Compliance Requirements\n{compliance}"
         )
+
+        # PHASE-3: Inject inbox messages into prompt context
+        if inbox_context:
+            user_content = f"{inbox_context}\n\n{user_content}"
+            # AUTHORITY directives from Tilotma/Vikram override normal flow
+            if "AUTHORITY" in inbox_context:
+                system_prompt += (
+                    "\n\n⚠ AUTHORITY DIRECTIVE RECEIVED — you MUST comply:\n"
+                    + inbox_context
+                )
 
         # FIX-40: Inject rejected approaches
         from app.agents.base import build_rejection_context
@@ -552,7 +607,30 @@ class Dhruv:
         except Exception:
             logger.warning("dhruv_self_eval_failed", exc_info=True)
 
+        # PHASE-2: Agent self-testing — test DB connection if possible
+        try:
+            from app.services.agent_sandbox import AgentSandbox
+            _sandbox = AgentSandbox(run_id=pipeline_run_id)
+            _db_url = f"postgresql://nexsidi:nexsidi@localhost:5432/{pipeline_run_id[:8]}"
+            _db_test = await _sandbox.test_db_connection(_db_url)
+            output["self_test_results"] = {
+                "db_reachable": _db_test.connected,
+                "tables": _db_test.tables,
+                "missing_tables": _db_test.missing_tables,
+                "errors": _db_test.errors,
+            }
+            await _sandbox.cleanup()
+        except Exception as _st_exc:
+            logger.warning("db_self_test_skipped", error=str(_st_exc)[:200])
+
         await store_output(self, pipeline_run_id, output)
+
+        # PHASE-3: Notify agents that database schema is ready
+        await notify_agents(
+            self.name, pipeline_run_id,
+            f"Database schema generated for {db_config.display_name}. "
+            f"Files: {len(handler._written_files)}, Migrations: {len(handler._migrations)}.",
+        )
 
         return AgentResult(
             agent_name=self.name,

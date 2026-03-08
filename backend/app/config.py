@@ -96,6 +96,15 @@ class Settings(BaseSettings):
     # --- AI Providers ---
     anthropic_api_key: str = ""
     google_ai_api_key: str = ""
+    firecrawl_api_key: str = ""  # Web search for agents (loaded from GCP Secret Manager)
+
+    # --- Claude via Vertex AI Model Garden (asia-south1 / Mumbai ONLY) ---
+    # IMPORTANT: This is for Claude models ONLY. Gemini uses its own config.
+    claude_vertex_location: str = "asia-south1"   # Mumbai — closest to our DB/GKE
+    claude_vertex_project_id: str = ""             # GCP project with Claude enabled on Model Garden
+
+    # --- LangGraph Agentic Pipeline ---
+    enable_langgraph: bool = True  # Feature flag: True = LangGraph StateGraph, False = legacy while-loop
 
     # --- Email (ZeptoMail) ---
     zeptomail_smtp_server: str = ""
@@ -152,6 +161,39 @@ class Settings(BaseSettings):
     # If empty, a key is derived from jwt_secret_key via HKDF.
     totp_encryption_key: str = ""
 
+    # --- Phase 1A: Agent Message Encryption ---
+    # When True, all inter-agent message payloads in Valkey are encrypted
+    # using per-pipeline-run Fernet keys (envelope encryption).
+    agent_message_encryption: bool = True
+    # Explicit Fernet key for message encryption master key.
+    # If empty, derives from jwt_secret_key via HKDF (salt="nexsidi-agent-msg-v1").
+    message_encryption_key: str = ""
+
+    # --- Phase 2A: Cloud DevBox ---
+    devbox_enabled: bool = False
+    devbox_default_ttl_hours: int = 24
+    devbox_max_per_user: int = 1
+    devbox_image: str = "nexsidi/devbox:latest"
+    gke_cluster_name: str = "nexsidi-devbox"
+    gke_cluster_zone: str = "asia-south1"
+    devbox_artifact_registry: str = "asia-south1-docker.pkg.dev/nexsidi-ai/nexsidi"
+
+    # --- Phase 2B: Visual Testing ---
+    visual_testing_enabled: bool = True
+    mobile_emulator_image: str = "budtmo/docker-android:emulator_11.0"
+
+    # --- Phase 3: Real-Time Observability ---
+    live_studio_enabled: bool = True
+    terminal_stream_buffer_size: int = 1000
+
+    # --- Phase 5B: User Steering ---
+    user_steering_enabled: bool = True
+
+    # --- External API Base URLs (configurable for testing/enterprise) ---
+    github_api_base_url: str = "https://api.github.com"
+    railway_api_url: str = "https://backboard.railway.app/graphql/v2"
+    vercel_api_base_url: str = "https://api.vercel.com"
+
     # --- AI Provider Mode ---
     # "gemini" = Gemini-only (beta default — saves Claude costs)
     # "mixed"  = both providers (production — activate via enable_claude)
@@ -182,9 +224,10 @@ class Settings(BaseSettings):
     executor_type: str = "docker"
 
     # 2.4-FIX: Pipeline execution mode.
-    # "sequential" — fixed STAGE_ORDER (existing behavior, default).
+    # "sequential" — fixed STAGE_ORDER (existing behavior).
     # "agentic" — AI PlannerAgent decides what stage to run next dynamically.
-    pipeline_mode: str = "sequential"
+    # PHASE-4: Default changed to "agentic" — AI-driven pipeline routing.
+    pipeline_mode: str = "agentic"
 
     # C1-FIX: InitContainer image for K8s executor GCS code download.
     gcs_init_image: str = "google/cloud-sdk:slim"
@@ -213,7 +256,7 @@ class Settings(BaseSettings):
     # FIX-11: When False (production default), pipeline blocks delivery of
     # projects where tests were SIMULATED (Docker unavailable). Prevents
     # untested code from reaching customers.  Set True only for dev/staging.
-    allow_simulation_delivery: bool = True
+    allow_simulation_delivery: bool = False
 
     # --- Proxy / Network ---
     # REFIX: Only trust X-Forwarded-For when behind a known reverse proxy.
@@ -327,8 +370,9 @@ def _ensure_secrets_loaded() -> None:
                 if count > 0:
                     logger.info("Loaded %d secrets from GCP Secret Manager", count)
         except Exception as exc:
-            # Non-fatal: fall back to env vars / .env
-            logger.debug("Secret Manager unavailable: %s", exc)
+            # AUDIT-T2-12: WARNING not DEBUG — DEBUG may be suppressed in production,
+            # hiding the reason why DB credentials are missing on first request.
+            logger.warning("secret_manager_unavailable", error=str(exc)[:200])
 
         # R36-FIX: Set flag AFTER loading completes, not before.
         _secrets_loaded = True
@@ -345,17 +389,4 @@ def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]
 
 
-def clear_settings_cache() -> None:
-    """R36-FIX: Clear the cached settings singleton.
 
-    The @lru_cache on get_settings() caches the Settings object indefinitely.
-    If secrets rotate (e.g., DB password via GCP Secret Manager) or env vars
-    change, the cache must be cleared so the next get_settings() call picks
-    up the new values. Without this, the only way to reload settings was
-    restarting the process.
-
-    Usage: call after secret rotation or config update.
-    """
-    global _secrets_loaded
-    get_settings.cache_clear()
-    _secrets_loaded = False

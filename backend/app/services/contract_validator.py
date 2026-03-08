@@ -45,6 +45,18 @@ def validate_contract_coherence(contract: dict[str, Any]) -> list[str]:
             errors.append(f"Duplicate table name: '{name}'")
         table_names.add(name)
 
+    # ── 1b. AUDIT-T1-6: Detect duplicate column names within each table ──────
+    for table in tables:
+        tname = table.get("name", "<unnamed>")
+        col_names: set[str] = set()
+        for col in table.get("columns", []):
+            cname = col.get("name")
+            if not cname:
+                continue
+            if cname in col_names:
+                errors.append(f"Table '{tname}': duplicate column '{cname}'")
+            col_names.add(cname)
+
     # ── 2. Foreign-key referential integrity ──────────────────────────────────
     # FK field format: "referenced_table.column" or "referenced_table"
     for table in tables:

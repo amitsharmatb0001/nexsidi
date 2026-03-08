@@ -58,7 +58,8 @@ class ProjectListResponse(BaseModel):
 class PipelineStartRequest(BaseModel):
     project_id: uuid.UUID
     execution_mode: str = Field("checkpoint", pattern="^(step_by_step|checkpoint|direct)$")
-    requirements: str = Field("", max_length=10000)
+    # AUDIT-T3-7: Increase max_length to 50000 for complex project requirements
+    requirements: str = Field("", max_length=50000)
     git_config: dict[str, str] | None = Field(
         None,
         description="Optional git integration config: {repo_url, token, branch, auto_pr}",
@@ -83,10 +84,34 @@ class PipelineStatusResponse(BaseModel):
     simulation_summary: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChangeRequestItem(BaseModel):
+    """Directive 5A: A specific change request on a section of the SDD."""
+
+    section: str = Field(..., min_length=1, max_length=200)
+    comment: str = Field(..., min_length=1, max_length=2000)
+    priority: str = Field("medium", pattern="^(low|medium|high|critical)$")
+
+
 class CheckpointApprovalRequest(BaseModel):
+    # Directive 5A: Added "request_changes" action for SDD workflow
     approved: bool
-    action: str = Field("approve", pattern="^(approve|reject|redo)$")
+    action: str = Field("approve", pattern="^(approve|reject|request_changes|redo)$")
     feedback: str = Field("", max_length=5000)
+    # Directive 5A: Structured change requests (optional, for request_changes action)
+    change_requests: list[ChangeRequestItem] | None = None
+
+    @model_validator(mode="after")
+    def validate_feedback_required(self) -> CheckpointApprovalRequest:
+        """Directive 5A: reject/request_changes requires non-empty feedback (>=10 chars)."""
+        if self.action in ("reject", "request_changes"):
+            feedback_len = len(self.feedback.strip()) if self.feedback else 0
+            has_changes = bool(self.change_requests)
+            if feedback_len < 10 and not has_changes:
+                raise ValueError(
+                    f"Action '{self.action}' requires feedback (min 10 chars) "
+                    f"or at least one change_request item."
+                )
+        return self
 
 
 # ── Chat Schemas ──────────────────────────────────────────────────

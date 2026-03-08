@@ -364,7 +364,7 @@ class AssetProcessor:
         try:
             spec = json.loads(content)
         except (json.JSONDecodeError, TypeError):
-            pass
+            pass  # Expected: type mismatch — fall through to default
 
         # Try YAML if JSON failed.
         if spec is None:
@@ -373,7 +373,7 @@ class AssetProcessor:
 
                 spec = yaml.safe_load(content)
             except Exception:
-                pass
+                pass  # Non-critical — error logged upstream or handled by caller
 
         if spec is None or not isinstance(spec, dict):
             raise ValueError("Unable to parse OpenAPI spec as JSON or YAML.")
