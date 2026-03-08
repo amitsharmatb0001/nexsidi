@@ -802,10 +802,12 @@ class AttackTester:
                 details=f"Connection error (blocked): {str(exc)[:80]}",
             )
         except Exception as exc:
+            # FIX-44: Use _sanitize_error for consistency with all other agents
+            from app.services.ai_router import _sanitize_error
             return AttackResult(
                 attack_type=payload.attack_type, payload=payload.payload[:80],
                 blocked=False, response_code=0,
-                details=f"[ERROR] {str(exc)[:80]}",
+                details=f"[ERROR] {_sanitize_error(exc)}",
             )
 
     async def execute(

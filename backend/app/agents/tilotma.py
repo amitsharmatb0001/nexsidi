@@ -186,6 +186,11 @@ class Tilotma:
                 error="Project beyond NexSidi's current capabilities",
             )
 
+        # --- Step 1b: Persona Detection (FIX-41) ---
+        persona = self._detect_persona(user_input)
+        context["__user_persona__"] = persona
+        logger.info("persona_detected", persona=persona, input_preview=user_input[:60])
+
         # --- Step 2: Requirements Extraction ---
         system_prompt = self._build_requirements_prompt()
 
@@ -741,6 +746,41 @@ class Tilotma:
     # ═══════════════════════════════════════════════════════════════
     # HELPER METHODS
     # ═══════════════════════════════════════════════════════════════
+
+    # FIX-41: Persona detection — Master Prompt defines 5 user personas.
+    # Detecting persona lets downstream agents tailor complexity and language.
+    _PERSONA_SIGNALS: dict[str, list[str]] = {
+        "non_technical_founder": [
+            "i want to build", "i have an idea", "something like", "help me build",
+            "app like", "startup", "my business", "no coding", "non-technical",
+        ],
+        "developer": [
+            "fastapi", "typescript", "postgresql", "jwt", "rest api", "npm",
+            "pip", "docker", "ci/cd", "react", "next.js", "express", "prisma",
+            "sqlalchemy", "alembic", "redis", "graphql", "websocket",
+        ],
+        "freelancer": [
+            "client wants", "by friday", "deadline", "deliver", "client project",
+            "freelance", "contract work", "agency",
+        ],
+        "student": [
+            "learning", "portfolio", "first project", "i'm new to", "university",
+            "assignment", "tutorial", "beginner", "college",
+        ],
+        "enterprise": [
+            "sso", "saml", "rbac", "compliance", "gdpr", "soc2", "audit trail",
+            "enterprise", "multi-tenant", "hipaa", "pci", "iso 27001",
+        ],
+    }
+
+    def _detect_persona(self, user_input: str) -> str:
+        """Detect user persona from input keywords. Returns persona key."""
+        input_lower = user_input.lower()
+        scores: dict[str, int] = {}
+        for persona, signals in self._PERSONA_SIGNALS.items():
+            scores[persona] = sum(1 for s in signals if s in input_lower)
+        best = max(scores, key=lambda k: scores[k])
+        return best if scores[best] > 0 else "non_technical_founder"
 
     async def _check_capability(self, user_input: str) -> dict[str, Any]:
         """Check if NexSidi can build what the user wants.

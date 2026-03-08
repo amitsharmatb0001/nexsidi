@@ -146,6 +146,8 @@ _ALLOWED_ROUTES: dict[str, set[str]] = {
     # Fixer can jump back to testing for re-validation,
     # or to quality_review for re-audit
     "fixing": {"testing", "quality_review"},
+    # FIX-17: Testing failures ALWAYS route to Fixer (not LLM-decided skip)
+    "testing": {"fixing"},
     # Architecture review can route back to architecture for redesign,
     # or to database_design if schema needs rework
     "architecture_review": {"architecture", "database_design"},
@@ -175,8 +177,12 @@ _AGENT_CONTEXT_DEPS: dict[str, list[str]] = {
     "navya":      ["vikram", "shubham", "aanya"],
     "deepika":    ["vikram", "shubham", "aanya"],
     "aarav":      ["vikram", "shubham", "aanya"],
-    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika"],
+    # FIX-37: attack_tester needs context from all code generators + security audit
+    "attack_tester": ["vikram", "shubham", "aanya", "karan"],
+    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika", "attack_tester"],
     "pranav":     ["vikram", "shubham", "aanya"],
+    # FIX-37: Tilotma review must see attack_tester results for GO/NO-GO decision
+    "tilotma_review": ["vikram", "shubham", "aanya", "aarav", "attack_tester", "karan", "navya", "deepika"],
 }
 
 
@@ -1038,6 +1044,31 @@ class PipelineOrchestrator:
 
         # DELIVERY-FIX: Handle delivery stage — build ZIP package, check simulation
         if agent_name == "__delivery__":
+            # FIX-12: Simulation hard gate — block delivery of untested code in production
+            sim_sandbox = run.context.get("aarav", {}).get("is_simulation_sandbox", False)
+            sim_deploy = run.context.get("pranav", {}).get("is_simulation_deploy", False)
+            is_sim = sim_sandbox or sim_deploy
+            settings = get_settings()
+            if is_sim and not settings.allow_simulation_delivery and settings.is_production:
+                logger.error(
+                    "delivery_blocked_simulation",
+                    run_id=run.run_id,
+                    sandbox_simulated=sim_sandbox,
+                    deploy_simulated=sim_deploy,
+                )
+                return StepResult(
+                    stage=stage,
+                    agent_name=agent_name,
+                    result=AgentResult(
+                        agent_name="__delivery__",
+                        status=AgentStatus.FAILED,
+                        error="Delivery blocked: tests were simulated in production mode. "
+                              "Set ALLOW_SIMULATION_DELIVERY=true to override.",
+                    ),
+                    completed_at=datetime.now(timezone.utc),
+                    skipped=False,
+                )
+
             from app.engine.delivery import get_delivery_engine
             delivery_engine = get_delivery_engine()
             try:
@@ -1112,6 +1143,23 @@ class PipelineOrchestrator:
                             error_count=len(coherence_errors),
                             errors=coherence_errors,
                         )
+                        # FIX-19: Notify user — coherence validation failed
+                        try:
+                            from app.routers.websocket import notify_pipeline_event
+                            await notify_pipeline_event(
+                                run.run_id,
+                                "quality_warning",
+                                data={
+                                    "type": "coherence_validation_failed",
+                                    "message": (
+                                        f"Architecture contract has {len(coherence_errors)} "
+                                        f"coherence error(s) after {retries} retries."
+                                    ),
+                                    "errors": coherence_errors[:5],
+                                },
+                            )
+                        except Exception:
+                            pass
                         failed_result = AgentResult(
                             agent_name="contract_coherence_validator",
                             status=AgentStatus.FAILED,
@@ -1339,6 +1387,18 @@ class PipelineOrchestrator:
                 run.context["__feedback_history__"] = history[-_MAX_FEEDBACK_HISTORY:]
 
         if action == "redo":
+            # FIX-38: Store rejected approaches so generator agents avoid repeating them
+            if feedback:
+                rejected = run.context.setdefault("__rejected_approaches__", [])
+                rejected.append({
+                    "stage": run.current_stage.value,
+                    "feedback": feedback[:2000],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                # Cap to prevent unbounded growth
+                if len(rejected) > 20:
+                    run.context["__rejected_approaches__"] = rejected[-20:]
+
             # Rewind to appropriate stage
             rewind_target = CHECKPOINT_REDO_TARGETS.get(run.current_stage)
             if rewind_target is None:
@@ -1491,6 +1551,21 @@ class PipelineOrchestrator:
                 # of how the pipeline exits (success, failure, timeout, cancel).
                 await self._release_distributed_lock(run.run_id)
                 await self._release_distributed_slot(run.run_id)
+                # FIX-45: Snapshot cost data to run context before cleanup.
+                # In-memory cost trackers are lost on process restart — persist
+                # the summary to the run context (which is saved to DB).
+                _tracker = _RUN_COST_TRACKERS.get(run.run_id)
+                if _tracker:
+                    try:
+                        run.context["__cost_summary__"] = {
+                            "total_cost_usd": round(_tracker.total_cost, 4),
+                            "call_count": _tracker.call_count,
+                            "cost_by_agent": {k: round(v, 4) for k, v in _tracker.cost_by_agent.items()},
+                            "cost_by_model": {k: round(v, 4) for k, v in _tracker.cost_by_model.items()},
+                        }
+                    except Exception:
+                        pass  # Cost snapshot failure must never crash pipeline cleanup
+
                 # 4.2-FIX: Always clean up cost tracker, even on crash.
                 # Without this, orphaned trackers accumulate in the global
                 # dict, each with a 10K-entry deque — OOM after many runs.
@@ -1745,6 +1820,24 @@ class PipelineOrchestrator:
             if run.status == PipelineRunStatus.PAUSED:
                 break
 
+            # FIX-17: When TESTING stage fails (Aarav found real test failures),
+            # ALWAYS route to FIXING. Don't let LLM recovery skip the Fixer.
+            # This guarantees broken code is always sent to the fix-retest loop.
+            if (
+                step_result.result
+                and step_result.result.status == AgentStatus.FAILED
+                and run.current_stage == PipelineStage.TESTING
+            ):
+                logger.info(
+                    "testing_failed_route_to_fixer",
+                    run_id=run.run_id,
+                    total_failed=step_result.result.output.get("total_failed", 0)
+                    if isinstance(step_result.result.output, dict) else 0,
+                )
+                run.current_stage = PipelineStage.FIXING
+                await self._persist_run(run)
+                continue
+
             # CHANGE-29: LLM-driven failure recovery — instead of immediately
             # crashing the pipeline, ask the LLM what to do. The LLM may decide
             # to retry with a different model, skip this stage, or go back.
@@ -1903,6 +1996,23 @@ class PipelineOrchestrator:
                         errors_remaining=_remaining,
                     )
                     run.context["__known_issues__"] = _remaining
+                    # FIX-19: Notify user — fix-retest loop gave up
+                    try:
+                        from app.routers.websocket import notify_pipeline_event
+                        await notify_pipeline_event(
+                            run.run_id,
+                            "quality_warning",
+                            data={
+                                "type": "fix_retest_exhausted",
+                                "message": (
+                                    f"Auto-fixer exhausted {run.fix_retest_cycle} cycles. "
+                                    f"{_remaining} issue(s) may remain unfixed."
+                                ),
+                                "errors_remaining": _remaining,
+                            },
+                        )
+                    except Exception:
+                        pass  # WebSocket failures must never crash pipeline
                     # Don't continue — fall through to advance() with known issues
                     await self._persist_run(run)
                 else:

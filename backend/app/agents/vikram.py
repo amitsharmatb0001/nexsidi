@@ -145,6 +145,35 @@ CONTRACT_SCHEMA: dict[str, Any] = {
         "integrations": {"type": "array", "items": {"type": "object"}},
         "security": {"type": "object"},
         "compliance": {"type": "object"},
+        # FIX-32: Environment, startup, and deployment config so downstream
+        # agents (Shubham, Pranav) know what env vars, commands, and infra
+        # the app needs — instead of guessing.
+        "env_vars": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "required": {"type": "boolean"},
+                    "description": {"type": "string"},
+                    "example": {"type": "string"},
+                },
+            },
+        },
+        "startup_commands": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Commands to run on first setup (e.g., alembic upgrade head)",
+        },
+        "deployment": {
+            "type": "object",
+            "properties": {
+                "provider": {"type": "string"},
+                "needs_db": {"type": "boolean"},
+                "needs_cache": {"type": "boolean"},
+                "needs_storage": {"type": "boolean"},
+            },
+        },
     },
 }
 
@@ -344,6 +373,13 @@ class Vikram:
             f"<user_request>\n{raw_input}\n</user_request>\n\n"
             f"## Requirements Analysis (from Saanvi)\n{analysis}"
         )
+
+        # FIX-40: Inject rejected approaches so Vikram avoids re-proposing
+        # architectures the user already rejected.
+        from app.agents.base import build_rejection_context
+        _rejection_ctx = build_rejection_context(context)
+        if _rejection_ctx:
+            user_content += _rejection_ctx
 
         # V3-FIX: If this is a coherence-rewind retry, inject the errors
         # from the previous attempt so Vikram can fix them.

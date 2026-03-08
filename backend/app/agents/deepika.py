@@ -394,6 +394,12 @@ class Deepika:
             "critical_count": report.critical_count,
             "high_count": report.high_count,
             "total_findings": len(report.findings),
+            # FIX-42: Token tracking for cost visibility
+            "model_used": getattr(self, "_last_response_model", ""),
+            "tokens": {
+                "input": getattr(self, "_last_response_input_tokens", 0),
+                "output": getattr(self, "_last_response_output_tokens", 0),
+            },
         }
 
         # ── LLM self-evaluation: performance analysis completeness ──
@@ -669,7 +675,7 @@ class Deepika:
         )
 
         try:
-            await call_ai_with_tools(
+            _ai_response = await call_ai_with_tools(
                 agent=self,
                 messages=[{"role": "user", "content": user_message}],
                 system_prompt=system_prompt,
@@ -677,6 +683,10 @@ class Deepika:
                 tool_handler=handler,
                 max_tool_rounds=12,
             )
+            # FIX-42: Capture token usage
+            self._last_response_model = getattr(_ai_response, "model_used", "")
+            self._last_response_input_tokens = getattr(_ai_response, "input_tokens", 0)
+            self._last_response_output_tokens = getattr(_ai_response, "output_tokens", 0)
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
             logger.warning("ai_perf_analysis_failed", error=_sanitize_error(exc))

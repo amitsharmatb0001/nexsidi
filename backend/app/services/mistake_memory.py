@@ -107,6 +107,8 @@ class MistakeMemory:
             "error": error[:500],
             "fix": fix[:500],
             "timestamp": time.time(),
+            # FIX-48: 90-day expiry — prevents unbounded ChromaDB growth
+            "expiry_timestamp": time.time() + (90 * 24 * 3600),
         }
         if context:
             # Store serializable context fields

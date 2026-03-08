@@ -1306,6 +1306,25 @@ class ShubhamToolHandler:
                     + "\n".join(f"  - {f}" for f in missing[:10])
                     + "\nWrite these files first, then call task_complete again."
                 )
+
+        # FIX-31: Infrastructure validation — block completion if critical
+        # infra files are missing. Without these, the generated app can't run.
+        _REQUIRED_INFRA = {
+            ".env.example": "Missing .env.example — app cannot start without environment config",
+            "Dockerfile": "Missing Dockerfile — app cannot be containerized",
+        }
+        infra_missing = []
+        all_file_paths = list(self._files.keys()) if hasattr(self, "_files") else []
+        for pattern, msg in _REQUIRED_INFRA.items():
+            if not any(pattern.lower() in f.lower() for f in all_file_paths):
+                infra_missing.append(msg)
+        if infra_missing:
+            return (
+                "NOT READY — missing critical infrastructure files:\n"
+                + "\n".join(f"  - {m}" for m in infra_missing)
+                + "\nGenerate these files first, then call task_complete again."
+            )
+
         self._done = True
         self._summary = summary
         return f"Task marked complete: {summary}"
@@ -1506,9 +1525,11 @@ class Shubham:
             from app.engine.template_engine import get_template_engine
 
             engine = get_template_engine()
+            # FIX-29: Include infra + frontend templates (Makefile, health_check,
+            # frontend Dockerfile, .env.local.example) in Phase 1 scaffolding.
             template_files = engine.render_all(
                 contract,
-                categories=["backend", "config"],
+                categories=["backend", "config", "infra", "frontend"],
                 framework=backend_framework,
             )
 
@@ -1538,13 +1559,17 @@ class Shubham:
         # can build compact manifests without passing the full dict through params.
         self._generated_files_ref = generated_files
 
+        # FIX-40: Inject rejected approaches so Shubham avoids user-rejected patterns
+        from app.agents.base import build_rejection_context
+        _rejection_ctx = build_rejection_context(context)
+
         system_prompt = self._build_agentic_system_prompt(
             contract=contract,
             generation_order=generation_order,
             db_artifacts=dhruv_output.get("database_artifacts", ""),
             fw_config=fw_config,
             template_file_paths=list(generated_files.keys()),
-            user_feedback=user_feedback,
+            user_feedback=(user_feedback + _rejection_ctx) if _rejection_ctx else user_feedback,
         )
 
         tool_handler = ShubhamToolHandler(
@@ -1610,6 +1635,14 @@ class Shubham:
             # generated_files may have partial output from tool calls before the
             # exception — keep whatever was written so downstream agents can work
             # with partial results rather than nothing.
+
+        # FIX-30: Reconcile requirements.txt with actual imports in generated code.
+        # AI-generated .py files may import packages not in requirements.txt,
+        # causing Docker builds to fail at pip install.
+        try:
+            self._reconcile_dependencies(generated_files)
+        except Exception as exc:
+            logger.debug("dependency_reconciliation_failed", error=str(exc)[:200])
 
         # PHASE-H: Track goal completion based on which files were generated
         for goal in goal_tracker.goals:
@@ -1761,6 +1794,113 @@ class Shubham:
             status=AgentStatus.COMPLETED,
             output=output,
         )
+
+    @staticmethod
+    def _reconcile_dependencies(generated_files: dict[str, str]) -> None:
+        """FIX-30: Ensure requirements.txt includes all imports from generated .py files.
+
+        AI code may ``import stripe``, ``import boto3``, etc. that were never
+        added to requirements.txt.  This method:
+        1. Parses all .py files with ``ast`` to collect top-level imports
+        2. Filters out stdlib and project-internal modules
+        3. Maps import names → pip package names
+        4. Appends missing packages to requirements.txt
+        """
+        import ast as _ast
+        import sys
+
+        # Find requirements.txt in generated files
+        req_key: str | None = None
+        for k in generated_files:
+            if k.endswith("requirements.txt"):
+                req_key = k
+                break
+        if req_key is None:
+            return  # No requirements.txt to reconcile
+
+        # Parse existing requirements
+        existing_req_content = generated_files[req_key]
+        existing_packages: set[str] = set()
+        for line in existing_req_content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("-"):
+                continue
+            # Extract package name (before ==, >=, [, etc.)
+            import re as _re
+            pkg_name = _re.split(r"[><=!\[;]", line)[0].strip().lower()
+            if pkg_name:
+                existing_packages.add(pkg_name)
+
+        # Collect all imports from .py files
+        all_imports: set[str] = set()
+        for path, content in generated_files.items():
+            if not path.endswith(".py") or not content:
+                continue
+            try:
+                tree = _ast.parse(content)
+            except SyntaxError:
+                continue
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Import):
+                    for alias in node.names:
+                        all_imports.add(alias.name.split(".")[0])
+                elif isinstance(node, _ast.ImportFrom):
+                    if node.module:
+                        all_imports.add(node.module.split(".")[0])
+
+        # Filter out stdlib modules
+        stdlib_modules = set(sys.stdlib_module_names) if hasattr(sys, "stdlib_module_names") else set()
+
+        # Common project-internal module prefixes to exclude
+        internal_prefixes = {"app", "tests", "test", "conftest", "config", "src"}
+
+        # Import name → pip package name mapping (common mismatches)
+        _IMPORT_TO_PIP: dict[str, str] = {
+            "PIL": "Pillow",
+            "cv2": "opencv-python",
+            "sklearn": "scikit-learn",
+            "yaml": "PyYAML",
+            "jose": "python-jose",
+            "jwt": "PyJWT",
+            "dotenv": "python-dotenv",
+            "bs4": "beautifulsoup4",
+            "gi": "PyGObject",
+            "attr": "attrs",
+            "dateutil": "python-dateutil",
+            "magic": "python-magic",
+            "multipart": "python-multipart",
+            "decouple": "python-decouple",
+            "passlib": "passlib",
+            "starlette": "starlette",
+            "uvicorn": "uvicorn",
+            "gunicorn": "gunicorn",
+            "psycopg2": "psycopg2-binary",
+            "asyncpg": "asyncpg",
+        }
+
+        missing: list[str] = []
+        for imp in sorted(all_imports):
+            imp_lower = imp.lower()
+            # Skip stdlib
+            if imp in stdlib_modules or imp_lower in stdlib_modules:
+                continue
+            # Skip project-internal
+            if imp_lower in internal_prefixes:
+                continue
+            # Map to pip name
+            pip_name = _IMPORT_TO_PIP.get(imp, imp).lower()
+            # Check if already in requirements
+            if pip_name not in existing_packages and imp_lower not in existing_packages:
+                missing.append(_IMPORT_TO_PIP.get(imp, imp))
+
+        if missing:
+            # Append missing packages to requirements.txt
+            lines = existing_req_content.rstrip().split("\n")
+            lines.append("")
+            lines.append("# Auto-detected missing dependencies (FIX-30)")
+            for pkg in sorted(set(missing)):
+                lines.append(pkg)
+            generated_files[req_key] = "\n".join(lines) + "\n"
 
     def _run_self_check(
         self,
@@ -2112,6 +2252,75 @@ class Shubham:
         for step_name, path in fw_config.file_structure.items():
             prompt_parts.append(f"- `{step_name}` → `{path}`")
         prompt_parts.append("")
+
+        # ── 4b. MANDATORY FOLDER STRUCTURE (FIX-20) ──
+        # Without this, AI dumps all code in main.py or a single flat file.
+        prompt_parts.extend([
+            "## MANDATORY FOLDER STRUCTURE (NEVER dump all code in one file)",
+            "",
+            "### Python (FastAPI/Flask):",
+            "```",
+            "backend/",
+            "├── app/",
+            "│   ├── __init__.py",
+            "│   ├── main.py              # App factory + lifespan ONLY",
+            "│   ├── config.py             # Settings from env vars",
+            "│   ├── database.py           # Engine + session factory",
+            "│   ├── models/               # ONE file per DB table",
+            "│   │   ├── __init__.py",
+            "│   │   └── {entity}.py",
+            "│   ├── schemas/              # Pydantic request/response models",
+            "│   │   ├── __init__.py",
+            "│   │   └── {entity}.py",
+            "│   ├── routes/               # ONE file per resource",
+            "│   │   ├── __init__.py",
+            "│   │   └── {entity}.py",
+            "│   ├── services/             # Business logic (NOT in routes)",
+            "│   │   └── {entity}_service.py",
+            "│   ├── middleware/",
+            "│   │   └── auth.py",
+            "│   └── utils/",
+            "│       └── helpers.py",
+            "├── alembic/                  # Migrations",
+            "├── tests/",
+            "│   ├── conftest.py",
+            "│   └── test_{entity}.py",
+            "├── requirements.txt",
+            "├── Dockerfile",
+            "├── .env.example",
+            "└── alembic.ini",
+            "```",
+            "",
+            "### Node.js (Express/NestJS):",
+            "```",
+            "backend/",
+            "├── src/",
+            "│   ├── index.ts              # Entry point ONLY",
+            "│   ├── config.ts",
+            "│   ├── database.ts",
+            "│   ├── models/",
+            "│   ├── routes/",
+            "│   ├── controllers/",
+            "│   ├── services/",
+            "│   ├── middleware/",
+            "│   └── utils/",
+            "├── prisma/",
+            "│   └── schema.prisma",
+            "├── tests/",
+            "├── package.json",
+            "├── Dockerfile",
+            "├── .env.example",
+            "└── tsconfig.json",
+            "```",
+            "",
+            "RULES:",
+            "1. NEVER put more than one route/model/service in a single file",
+            "2. Each file MUST have a clear single responsibility",
+            "3. Models in models/, routes in routes/, services in services/",
+            "4. main.py/index.ts contains ONLY app initialization and routing setup",
+            "5. Business logic MUST be in services/, NEVER directly in routes/",
+            "",
+        ])
 
         # ── 5. Required Files (grouped by dependency level) ──
         # REVIEW-FIX: Use compute_parallel_levels() to show files in dependency

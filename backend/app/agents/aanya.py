@@ -922,6 +922,10 @@ class Aanya:
             goals=goal_tracker.summary(),
         )
 
+        # FIX-40: Inject rejected approaches so Aanya avoids user-rejected UI patterns
+        from app.agents.base import build_rejection_context
+        _rejection_ctx = build_rejection_context(context)
+
         system_prompt = self._build_agentic_system_prompt(
             contract=contract,
             generation_order=generation_order,
@@ -929,7 +933,7 @@ class Aanya:
             fw_config=fw_config,
             framework_display=framework_display,
             design_spec=vanya_output.get("design_spec", ""),
-            user_feedback=user_feedback,
+            user_feedback=(user_feedback + _rejection_ctx) if _rejection_ctx else user_feedback,
         )
 
         try:
@@ -1420,6 +1424,65 @@ class Aanya:
                 prompt_parts.append(f"- `{step_name}` → `{path}`")
             prompt_parts.append("")
 
+        # ── 5b. MANDATORY FOLDER STRUCTURE (FIX-21) ──
+        # Without this, AI dumps all components in App.tsx or creates flat layout.
+        prompt_parts.extend([
+            "## MANDATORY FOLDER STRUCTURE (NEVER dump all code in one file)",
+            "",
+            "### Next.js:",
+            "```",
+            "frontend/",
+            "├── src/",
+            "│   ├── app/                  # App router pages",
+            "│   │   ├── layout.tsx",
+            "│   │   ├── page.tsx",
+            "│   │   └── {route}/",
+            "│   │       └── page.tsx",
+            "│   ├── components/           # ONE component per file",
+            "│   │   ├── ui/               # Reusable UI (Button, Input, Card)",
+            "│   │   └── {feature}/        # Feature-specific components",
+            "│   ├── hooks/                # Custom React hooks",
+            "│   ├── lib/                  # API client, utils",
+            "│   │   ├── api-client.ts",
+            "│   │   └── utils.ts",
+            "│   ├── types/                # TypeScript interfaces",
+            "│   │   └── index.ts",
+            "│   └── styles/",
+            "│       └── globals.css",
+            "├── public/",
+            "├── package.json",
+            "├── Dockerfile",
+            "├── .env.local.example",
+            "└── tsconfig.json",
+            "```",
+            "",
+            "### React (Vite):",
+            "```",
+            "frontend/",
+            "├── src/",
+            "│   ├── main.tsx",
+            "│   ├── App.tsx               # Routes ONLY",
+            "│   ├── components/",
+            "│   ├── pages/",
+            "│   ├── hooks/",
+            "│   ├── lib/",
+            "│   ├── types/",
+            "│   └── styles/",
+            "├── package.json",
+            "├── Dockerfile",
+            "├── .env.local.example",
+            "└── vite.config.ts",
+            "```",
+            "",
+            "RULES:",
+            "1. NEVER put more than one component per file",
+            "2. Each page is a separate file in pages/ or app/",
+            "3. Shared UI components in components/ui/",
+            "4. API calls ONLY through lib/api-client.ts",
+            "5. No business logic in components — use hooks/ for shared state logic",
+            "",
+        ])
+
         # ── 6. Mandatory Rules ──
         prompt_parts.append(f"## MANDATORY {display_name} RULES (NEVER VIOLATE)")
         for rule in config_rules:
@@ -1437,13 +1500,31 @@ class Aanya:
                     "",
                 ])
 
-        # ── 8. Design Specification ──
+        # ── 8. Design Specification (FIX-35: Read Vanya's full design system) ──
         if design_spec:
-            prompt_parts.extend([
-                "## Design Specification (from Vanya)",
-                str(design_spec),
-                "",
-            ])
+            prompt_parts.append("## APPROVED UI/UX DESIGN SYSTEM (from Vanya)")
+            prompt_parts.append("You MUST follow this design system. Do NOT invent your own colors or typography.")
+            if isinstance(design_spec, dict):
+                import orjson as _orjson
+                # Structured design spec — format key sections for clarity
+                if "colors" in design_spec:
+                    prompt_parts.append(f"### Color Palette\n{_orjson.dumps(design_spec['colors'], option=_orjson.OPT_INDENT_2).decode()}")
+                if "typography" in design_spec:
+                    prompt_parts.append(f"### Typography\n{_orjson.dumps(design_spec['typography'], option=_orjson.OPT_INDENT_2).decode()}")
+                if "spacing" in design_spec:
+                    prompt_parts.append(f"### Spacing Scale\n{_orjson.dumps(design_spec['spacing'], option=_orjson.OPT_INDENT_2).decode()}")
+                if "components" in design_spec:
+                    prompt_parts.append(f"### Component Hierarchy\n{_orjson.dumps(design_spec['components'], option=_orjson.OPT_INDENT_2).decode()}")
+                if "layout" in design_spec:
+                    prompt_parts.append(f"### Layout Guidelines\n{_orjson.dumps(design_spec['layout'], option=_orjson.OPT_INDENT_2).decode()}")
+                # Include any remaining keys not already printed
+                remaining = {k: v for k, v in design_spec.items()
+                             if k not in ("colors", "typography", "spacing", "components", "layout")}
+                if remaining:
+                    prompt_parts.append(f"### Additional Design Tokens\n{_orjson.dumps(remaining, option=_orjson.OPT_INDENT_2).decode()}")
+            else:
+                prompt_parts.append(str(design_spec))
+            prompt_parts.append("")
 
         # ── 9. Completeness Rules ──
         prompt_parts.extend([

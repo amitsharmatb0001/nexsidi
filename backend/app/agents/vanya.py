@@ -368,6 +368,12 @@ class Vanya:
             "Generate the UI/UX design specification for the pages described above."
         )
 
+        # FIX-40: Inject rejected approaches
+        from app.agents.base import build_rejection_context
+        _rejection_ctx = build_rejection_context(context)
+        if _rejection_ctx:
+            user_content += _rejection_ctx
+
         handler = VanyaToolHandler()
 
         try:

@@ -111,10 +111,9 @@ _FASTAPI_TEMPLATES: Final[list[SecurityTemplate]] = [
         code="""\
 from fastapi.middleware.cors import CORSMiddleware
 
-ALLOWED_ORIGINS = [
-    "https://yourdomain.com",
-    "https://app.yourdomain.com",
-]
+import os
+
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
@@ -135,7 +134,9 @@ from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 import redis.asyncio as redis
 
-_redis = redis.from_url("redis://localhost:6379/0")
+import os
+
+_redis = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -505,10 +506,9 @@ MIDDLEWARE.insert(
     "corsheaders.middleware.CorsMiddleware",
 )
 
-CORS_ALLOWED_ORIGINS = [
-    "https://yourdomain.com",
-    "https://app.yourdomain.com",
-]
+CORS_import os
+
+ALLOWED_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = ["authorization", "content-type", "x-csrf-token"]""",
     ),

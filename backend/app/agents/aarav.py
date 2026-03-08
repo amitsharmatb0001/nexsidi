@@ -1139,14 +1139,19 @@ class Aarav:
             failed_phases=report.failed_phases,
         )
 
-        # AARAV-FIX-1: Always return COMPLETED — test failures are expected data,
-        # not agent failures. Returning FAILED caused the pipeline to abort
-        # immediately instead of routing to the fix-retest loop (TESTING →
-        # FIXING → quality rewind). FAILED should only be for "Aarav crashed
-        # and couldn't run tests at all" (handled by execute()'s outer except).
+        # FIX-13: Return FAILED when real Docker tests actually fail.
+        # Previously always returned COMPLETED — test failures were invisible to
+        # the pipeline and broken code got delivered.  FAILED now triggers the
+        # fix-retest loop (TESTING → FIXING) via the explicit route added in
+        # FIX-17 (_ALLOWED_ROUTES).  Simulation mode still returns COMPLETED
+        # (no real test data to act on).
+        if not is_simulation_sandbox and report and not report.all_passed:
+            status = AgentStatus.FAILED  # Real test failures → triggers Fixer
+        else:
+            status = AgentStatus.COMPLETED
         return AgentResult(
             agent_name=self.name,
-            status=AgentStatus.COMPLETED,
+            status=status,
             output=output,
         )
 

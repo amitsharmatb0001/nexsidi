@@ -174,7 +174,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify, SignJWT } from "jose";
 import * as argon2 from "argon2";
 
-const JWT_SECRET = new TextEncoder().encode(process.env.JWT_SECRET || "change-me");
+// SECURITY: NEVER use fallback for secrets — crash if not configured
+const JWT_SECRET = new TextEncoder().encode(
+  process.env.JWT_SECRET ?? (() => { throw new Error("JWT_SECRET env var is required"); })()
+);
 const JWT_ISSUER = "nexsidi";
 const JWT_EXPIRY = "24h";
 

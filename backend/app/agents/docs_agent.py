@@ -199,9 +199,30 @@ class DocsAgent:
             frontend_stack=frontend_stack,
             database_stack=database_stack,
             deploy_provider=deploy_provider,
-            prerequisites="- Python 3.12+\n- Node.js 20+\n- PostgreSQL 16\n- Docker",
-            install_steps="git clone <repo-url>\ncd " + project_name.lower().replace(" ", "-") + "\npip install -r requirements.txt\nnpm install",
-            run_steps="# Backend\nuvicorn app.main:app --reload\n\n# Frontend\nnpm run dev",
+            prerequisites="- Docker & Docker Compose (recommended)\n- Python 3.12+ (manual setup)\n- Node.js 20+ (manual setup)\n- PostgreSQL 16 (manual setup)",
+            install_steps=(
+                "## Quick Start (Docker — recommended)\n"
+                "```bash\n"
+                "git clone <repo-url>\n"
+                "cd " + project_name.lower().replace(" ", "-") + "\n"
+                "docker-compose up\n"
+                "# App runs at http://localhost:8000 (backend) + http://localhost:3000 (frontend)\n"
+                "```\n\n"
+                "## Manual Setup (for development)\n"
+                "### Backend:\n"
+                "```bash\n"
+                "cp backend/.env.example backend/.env  # Edit with your values\n"
+                "cd backend && pip install -r requirements.txt\n"
+                "alembic upgrade head  # Run migrations\n"
+                "uvicorn app.main:app --reload\n"
+                "```\n"
+                "### Frontend:\n"
+                "```bash\n"
+                "cp frontend/.env.local.example frontend/.env.local  # Edit API URL\n"
+                "cd frontend && npm install && npm run dev\n"
+                "```"
+            ),
+            run_steps="# Using Docker (recommended):\ndocker-compose up\n\n# Manual:\n# Backend: uvicorn app.main:app --reload\n# Frontend: npm run dev",
             api_summary=api_summary,
             project_structure=_safe(project_structure),
             deploy_info=f"Deployed via {deploy_provider}. See deployment config in `/deploy` directory.",

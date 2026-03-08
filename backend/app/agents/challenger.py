@@ -207,6 +207,12 @@ class Challenger:
             "challenges": [c.to_dict() for c in unique_challenges],
             "has_critical": len(critical) > 0,
             "verdict": "reject" if critical else ("warn" if high else "pass"),
+            # FIX-42: Token tracking for cost visibility
+            "model_used": getattr(self, "_last_response_model", ""),
+            "tokens": {
+                "input": getattr(self, "_last_response_input_tokens", 0),
+                "output": getattr(self, "_last_response_output_tokens", 0),
+            },
         }
 
         logger.info(
@@ -412,7 +418,7 @@ class Challenger:
         )
 
         try:
-            await call_ai_with_tools(
+            _ai_response = await call_ai_with_tools(
                 agent=self,
                 messages=[{"role": "user", "content": f"Review this contract:\n```json\n{contract_json}\n```"}],
                 system_prompt=system_prompt,
@@ -420,6 +426,10 @@ class Challenger:
                 tool_handler=handler,
                 max_tool_rounds=8,
             )
+            # FIX-42: Capture token usage
+            self._last_response_model = getattr(_ai_response, "model_used", "")
+            self._last_response_input_tokens = getattr(_ai_response, "input_tokens", 0)
+            self._last_response_output_tokens = getattr(_ai_response, "output_tokens", 0)
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
             logger.warning("challenger_ai_review_failed", error=_sanitize_error(exc))

@@ -48,19 +48,24 @@ TENANT_TABLES: list[tuple[str, str]] = [
 
 
 def upgrade() -> None:
+    import os
+
     conn = op.get_bind()
 
     # ── Step 1: Create database roles (idempotent) ────────────────
-    # These roles should be created by the DBA in production.
-    # This migration handles dev/staging environments.
-    conn.execute(sa.text("""
+    # SECURITY-FIX: Read passwords from environment instead of hardcoding.
+    # In production, DB_APP_PASSWORD and DB_ADMIN_PASSWORD MUST be set to
+    # strong random values. The fallback is only for dev/staging convenience.
+    app_password = os.environ.get("DB_APP_PASSWORD", "changeme_in_production")
+    admin_password = os.environ.get("DB_ADMIN_PASSWORD", "changeme_in_production")
+    conn.execute(sa.text(f"""
         DO $$
         BEGIN
             IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'nexsidi_app') THEN
-                CREATE ROLE nexsidi_app WITH LOGIN PASSWORD 'changeme_in_production';
+                CREATE ROLE nexsidi_app WITH LOGIN PASSWORD '{app_password}';
             END IF;
             IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'nexsidi_admin') THEN
-                CREATE ROLE nexsidi_admin WITH LOGIN PASSWORD 'changeme_in_production';
+                CREATE ROLE nexsidi_admin WITH LOGIN PASSWORD '{admin_password}';
             END IF;
         END
         $$;

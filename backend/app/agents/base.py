@@ -145,6 +145,26 @@ def clamp_completeness(value: Any) -> int:
         return 0
 
 
+def build_rejection_context(context: dict) -> str:
+    """Build a prompt section from __rejected_approaches__ for generator agents.
+
+    FIX-39: Returns a string that can be appended to any agent's system prompt
+    to prevent repeating user-rejected approaches. Returns empty string if
+    no rejections exist.
+    """
+    rejected = context.get("__rejected_approaches__", [])
+    if not rejected:
+        return ""
+    lines = [
+        "\n## USER REJECTIONS — DO NOT USE THESE APPROACHES",
+        "The user has explicitly rejected the following. You MUST NOT repeat them:",
+    ]
+    for r in rejected:
+        lines.append(f"- Stage '{r.get('stage', '?')}': {r.get('feedback', 'no details')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 # ── Tool Definition ─────────────────────────────────────────────────
 
 
@@ -487,6 +507,16 @@ def estimate_file_complexity(
 # ── AI Call Helpers ─────────────────────────────────────────────────
 
 
+_AI_MAX_RETRIES = 3
+_AI_BACKOFF_BASE = 2.0
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Check if an AI call error is transient (500, 503, 429, timeout)."""
+    error_str = str(exc).lower()
+    return any(x in error_str for x in ["500", "503", "529", "429", "timeout", "overloaded", "rate_limit"])
+
+
 async def call_ai(
     agent: Any,
     messages: list[dict[str, str]],
@@ -499,13 +529,16 @@ async def call_ai(
     shared_context: Any | None = None,
     dynamic_system_context: str | None = None,  # CACHE-FIX: dynamic part of system prompt
 ) -> AIResponse:
-    """Make an AI call through the AI Router.
+    """Make an AI call through the AI Router with automatic retry on transient errors.
 
+    FIX-18: Retries up to 3 times with exponential backoff for 500/503/429/timeout.
     ``agent`` must have ``.default_complexity`` and ``.default_model`` attributes.
     ``shared_context`` is an optional :class:`SharedContext` for prompt caching.
     ``dynamic_system_context`` is appended AFTER the cached system_prompt block
     without cache_control, so it doesn't invalidate the stable prompt cache.
     """
+    import asyncio as _asyncio
+
     from app.services.ai_router import get_ai_router
 
     router = get_ai_router()
@@ -524,7 +557,25 @@ async def call_ai(
         dynamic_system_context=dynamic_system_context,  # CACHE-FIX
     )
 
-    return await router.call(request)
+    # FIX-18: Retry with exponential backoff for transient errors
+    for attempt in range(_AI_MAX_RETRIES):
+        try:
+            return await router.call(request)
+        except Exception as exc:
+            if attempt < _AI_MAX_RETRIES - 1 and _is_retryable_error(exc):
+                wait = _AI_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "ai_call_retry",
+                    agent=getattr(agent, "name", "unknown"),
+                    attempt=attempt + 1,
+                    wait_seconds=wait,
+                    error=str(exc)[:100],
+                )
+                await _asyncio.sleep(wait)
+            else:
+                raise
+    # Should never reach here, but satisfy type checker
+    raise RuntimeError("AI call retries exhausted")
 
 
 async def call_ai_with_continuation(

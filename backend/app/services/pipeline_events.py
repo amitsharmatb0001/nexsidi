@@ -96,6 +96,10 @@ class PipelineEventSubscriber:
 
     async def subscribe_run(self, run_id: str, handler: Callable) -> None:
         """Subscribe a handler to events for a specific run."""
+        # FIX-15: Auto-start if subscribe_run called before start() (race condition)
+        if self._pubsub is None:
+            await self.start()
+
         if run_id not in self._handlers:
             self._handlers[run_id] = []
             # Subscribe to the channel if the listener loop is already running

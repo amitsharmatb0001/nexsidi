@@ -135,19 +135,28 @@ _AVG_TOKENS_PER_STAGE = 8_000  # input + output combined
 _PIPELINE_STAGES = 18
 _BASE_AI_COST_USD = 0.50  # Minimum AI cost for simplest project
 
-# Price per 1M tokens (weighted average of Gemini + Claude mix)
-_COST_PER_MILLION_TOKENS = 5.0  # USD (mixed model pricing)
+# FIX-50: Pricing constants — read from config if available, else use defaults.
+# These affect billing estimates shown to users. Model pricing changes frequently.
+def _get_pricing_config() -> tuple[float, float]:
+    """Return (cost_per_million_tokens, avg_minutes_per_stage) from config or defaults."""
+    try:
+        from app.config import get_settings
+        s = get_settings()
+        return (
+            getattr(s, "cost_per_million_tokens", 5.0),
+            getattr(s, "avg_minutes_per_stage", 2.5),
+        )
+    except Exception:
+        return (5.0, 2.5)
 
-# Complexity multipliers for cost estimation
+_COST_PER_MILLION_TOKENS = 5.0  # Default; overridden at call time via _get_pricing_config
 _COMPLEXITY_COST_MULTIPLIER = {
     "basic": 0.5,
     "standard": 1.0,
     "professional": 2.0,
     "enterprise": 4.0,
 }
-
-# Estimated duration per stage (minutes)
-_AVG_MINUTES_PER_STAGE = 2.5
+_AVG_MINUTES_PER_STAGE = 2.5  # Default; overridden at call time via _get_pricing_config
 
 
 # ── Scoring Functions ────────────────────────────────────────────────

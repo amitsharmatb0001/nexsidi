@@ -587,7 +587,7 @@ class Karan:
     name = "karan"
     display_name = "Karan — Security Auditor"
     default_complexity = TaskComplexity.HIGH
-    default_model = "claude-sonnet-4-6"  # Security-critical: ALWAYS Sonnet 4.6
+    default_model = "sonnet"  # Security-critical: uses model registry key, not raw ID
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
@@ -752,6 +752,12 @@ class Karan:
             "high_count": report.high_count,
             "blocking_count": report.blocking_count,
             "total_findings": len(report.findings),
+            # FIX-42: Token tracking for cost visibility
+            "model_used": getattr(self, "_last_response_model", ""),
+            "tokens": {
+                "input": getattr(self, "_last_response_input_tokens", 0),
+                "output": getattr(self, "_last_response_output_tokens", 0),
+            },
         }
 
         # ── LLM self-evaluation: OWASP coverage check ──
@@ -1207,7 +1213,7 @@ class Karan:
         )
 
         try:
-            await call_ai_with_tools(
+            _ai_response = await call_ai_with_tools(
                 agent=self,
                 messages=[{"role": "user", "content": user_message}],
                 system_prompt=system_prompt,
@@ -1215,6 +1221,10 @@ class Karan:
                 tool_handler=handler,
                 max_tool_rounds=15,  # Allow thorough analysis
             )
+            # FIX-42: Capture token usage for cost tracking
+            self._last_response_model = getattr(_ai_response, "model_used", "")
+            self._last_response_input_tokens = getattr(_ai_response, "input_tokens", 0)
+            self._last_response_output_tokens = getattr(_ai_response, "output_tokens", 0)
         except Exception as exc:
             from app.services.ai_router import _sanitize_error
             logger.warning("ai_deep_scan_failed", error=_sanitize_error(exc))

@@ -64,6 +64,11 @@ async def send_progress(
             "current_agent": agent_name,
             "current_phase": phase,
         })
+        # FIX-47: Set TTL to prevent progress data from persisting indefinitely
+        # if the pipeline crashes before cleanup. Pipeline timeout + 5 min buffer.
+        from app.config import get_settings
+        _ttl = get_settings().pipeline_total_timeout_minutes * 60 + 300
+        r.expire(key, _ttl)
 
         # 2. Publish to Redis channel for WebSocket relay
         event = json.dumps({

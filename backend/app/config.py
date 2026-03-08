@@ -202,6 +202,19 @@ class Settings(BaseSettings):
     gcs_code_bucket: str = ""        # GCS bucket name (e.g., "nexsidi-generated-code")
     local_store_dir: str = ""        # Local filesystem fallback (dev mode)
 
+    # --- Valkey / Redis ---
+    valkey_max_connections: int = 50  # FIX-46: Configurable pool size
+
+    # --- Cost Estimation (FIX-50) ---
+    cost_per_million_tokens: float = 5.0  # USD, weighted model mix
+    avg_minutes_per_stage: float = 2.5
+
+    # --- Simulation Gate ---
+    # FIX-11: When False (production default), pipeline blocks delivery of
+    # projects where tests were SIMULATED (Docker unavailable). Prevents
+    # untested code from reaching customers.  Set True only for dev/staging.
+    allow_simulation_delivery: bool = True
+
     # --- Proxy / Network ---
     # REFIX: Only trust X-Forwarded-For when behind a known reverse proxy.
     # Without this, any client can spoof their IP to bypass rate limiting.

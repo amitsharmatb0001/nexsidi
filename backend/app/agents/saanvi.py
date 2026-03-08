@@ -374,9 +374,44 @@ class Saanvi:
         analysis_data = handler._analysis or response.content
         complexity_data = handler._complexity_score
 
+        # FIX-43: Unify LLM complexity score with heuristic scorer.
+        # If scores differ by >2, take the HIGHER (conservative) score.
+        # This prevents under-estimation that leads to wrong model tier.
+        heuristic_result = None
+        try:
+            from app.services.complexity_scorer import score_complexity
+            _desc = raw_input or ai_analysis or ""
+            heuristic_result = score_complexity(_desc)
+            llm_overall = (
+                complexity_data.get("overall", 0) if isinstance(complexity_data, dict) else 0
+            )
+            heuristic_overall = heuristic_result.overall_score
+
+            if abs(llm_overall - heuristic_overall) > 2:
+                logger.warning(
+                    "complexity_score_discrepancy",
+                    llm_score=llm_overall,
+                    heuristic_score=heuristic_overall,
+                    action="taking_higher",
+                )
+                # Take the higher (more conservative) score
+                if heuristic_overall > llm_overall and isinstance(complexity_data, dict):
+                    complexity_data["overall"] = heuristic_overall
+                    complexity_data["_override_reason"] = (
+                        f"Heuristic ({heuristic_overall}) > LLM ({llm_overall}) by >{2}. "
+                        "Using conservative (higher) estimate."
+                    )
+        except Exception as exc:
+            logger.debug("heuristic_scorer_failed", error=str(exc)[:200])
+
         output = {
             "analysis": analysis_data,
             "complexity_score": complexity_data,
+            "heuristic_score": {
+                "overall": heuristic_result.overall_score,
+                "tier": heuristic_result.tier,
+                "dimensions": heuristic_result.dimensions,
+            } if heuristic_result else None,
             "validation_passed": handler._validation_passed,
             "compliance_flags": compliance_flags,
             "model_used": response.model_used,

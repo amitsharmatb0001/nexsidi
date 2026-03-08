@@ -270,13 +270,72 @@ class Pranav:
         # D5-FIX: Generate Terraform IaC files alongside existing configs
         terraform_files = self._generate_terraform_files(config)
 
-        # Generate CI/CD pipeline (GitHub Actions)
+        # Generate CI/CD pipeline (GitHub Actions) — FIX-33: now includes
+        # DB migration step (alembic/prisma) so first deploy creates tables.
         ci_workflow = self._generate_ci_cd_workflow(config, contract)
         if ci_workflow:
             config_files[".github/workflows/ci.yml"] = ci_workflow
 
-        # Execute the deployment
+        # ── FIX-33: 7-Step URL Injection Deploy Flow ──────────────────
+        # Master Prompt: deploy backend → get URL → inject into frontend
+        # build → deploy frontend → update CORS → verify → smoke test.
+        #
+        # Step 1: Deploy backend → get backend_url
         result = await self._deploy(config, context)
+        backend_url = result.deployment_url or ""
+        is_sim = result.is_simulation
+
+        # Steps 2-4: Frontend deployment with injected backend URL
+        frontend_url = ""
+        frontend_result: DeployResult | None = None
+        has_frontend = bool(context.get("aanya", {}).get("file_contents", {}))
+
+        if has_frontend and backend_url:
+            # Step 2: Build frontend env with backend URL
+            frontend_env = self._build_frontend_env(backend_url)
+            config_files["frontend/.env.production"] = "\n".join(
+                f"{k}={v}" for k, v in frontend_env.items()
+            )
+
+            # Step 3: Deploy frontend (simulation or real)
+            if is_sim:
+                # Simulation: generate a plausible frontend URL
+                frontend_url = backend_url.replace("api.", "app.").replace(
+                    "-backend", ""
+                )
+                if frontend_url == backend_url:
+                    frontend_url = backend_url.rstrip("/") + ":3000"
+                logger.info("frontend_deploy_simulated", url=frontend_url)
+            else:
+                # Real deploy: Vercel-style frontend deployment
+                frontend_config = DeployConfig(
+                    provider=config.provider,
+                    provider_name=config.provider_name,
+                    service_name=f"{config.service_name}-frontend",
+                    project_id=config.project_id,
+                    region=config.region,
+                    env_vars=frontend_env,
+                    health_check_path="/",
+                    timeout_seconds=config.timeout_seconds,
+                )
+                frontend_result = await self._deploy(frontend_config, context)
+                frontend_url = frontend_result.deployment_url or ""
+
+            # Step 4: Update backend CORS with frontend URL
+            if frontend_url:
+                cors_origins = f"{frontend_url},http://localhost:3000"
+                config_files[".env.cors_update"] = (
+                    f"# Add to backend environment:\n"
+                    f"CORS_ORIGINS={cors_origins}\n"
+                )
+                logger.info(
+                    "cors_update_generated",
+                    backend_url=backend_url,
+                    frontend_url=frontend_url,
+                    cors_origins=cors_origins,
+                )
+
+        # Step 5-6: Verify connectivity + smoke tests happen below
 
         output = {
             "status": result.status.value,
@@ -284,6 +343,8 @@ class Pranav:
             "provider_display": cloud_config.display_name,
             "category": cloud_config.category,
             "deployment_url": result.deployment_url,
+            # FIX-33: Frontend URL from 7-step deploy flow
+            "frontend_url": frontend_url,
             "health_check_passed": result.health_check_passed,
             # Simulation transparency — always present so UI/API consumers can
             # show "simulated output" banners when no real deploy ran.
@@ -391,6 +452,31 @@ class Pranav:
             files[filename] = content
 
         return files
+
+    # -- FIX-33: Frontend environment builder ------------------------------------
+
+    @staticmethod
+    def _build_frontend_env(backend_url: str) -> dict[str, str]:
+        """Build frontend environment variables with injected backend URL.
+
+        Covers all major frontend frameworks:
+        - Vite: VITE_API_URL, VITE_WS_URL
+        - Next.js: NEXT_PUBLIC_API_URL, NEXT_PUBLIC_WS_URL
+        - CRA: REACT_APP_API_URL
+
+        The WebSocket URL is derived from the backend URL by replacing
+        the protocol prefix (https → wss, http → ws).
+        """
+        ws_url = backend_url.replace("https://", "wss://").replace(
+            "http://", "ws://"
+        )
+        return {
+            "VITE_API_URL": backend_url,
+            "NEXT_PUBLIC_API_URL": backend_url,
+            "REACT_APP_API_URL": backend_url,
+            "VITE_WS_URL": ws_url,
+            "NEXT_PUBLIC_WS_URL": ws_url,
+        }
 
     # -- D5-FIX: Terraform IaC generation (additive) --------------------------
 
@@ -939,6 +1025,12 @@ class Pranav:
                 "        continue-on-error: true",
                 "      - name: Test",
                 "        run: cd backend && pytest -x -q",
+                "      # FIX-33: DB migration step for deploy (runs on main only)",
+                "      - name: Run migrations",
+                "        if: github.ref == 'refs/heads/main'",
+                "        run: cd backend && alembic upgrade head",
+                "        env:",
+                "          DATABASE_URL: ${{ secrets.DATABASE_URL }}",
                 "",
             ])
 

@@ -164,12 +164,17 @@ async def send_password_reset_email(to_email: str, reset_url: str) -> bool:
     """
     settings = get_settings()
     if not settings.has_email:
-        # Dev mode: log the token so developers can test without SMTP
-        logger.warning(
-            "password_reset_dev_mode",
-            hint="Email not configured — use this URL to complete password reset",
-            reset_url=reset_url,
-        )
+        # SECURITY-FIX: Only log reset URLs in dev mode. In production, logging
+        # the URL (which contains the reset token) allows anyone with log access
+        # to hijack password resets.
+        if not settings.is_production:
+            logger.debug(
+                "password_reset_dev_mode",
+                hint="Email not configured — use this URL to complete password reset",
+                reset_url=reset_url,
+            )
+        else:
+            logger.warning("password_reset_email_not_configured", to_email=to_email)
         return False
 
     sender = settings.zeptomail_sender_email or settings.zeptomail_username
@@ -188,11 +193,15 @@ async def send_verification_email(to_email: str, verify_url: str) -> bool:
     """
     settings = get_settings()
     if not settings.has_email:
-        logger.warning(
-            "email_verification_dev_mode",
-            hint="Email not configured — use this URL to verify email",
-            verify_url=verify_url,
-        )
+        # SECURITY-FIX: Only log verify URLs in dev mode (same reason as above).
+        if not settings.is_production:
+            logger.debug(
+                "email_verification_dev_mode",
+                hint="Email not configured — use this URL to verify email",
+                verify_url=verify_url,
+            )
+        else:
+            logger.warning("email_verification_not_configured", to_email=to_email)
         return False
 
     sender = settings.zeptomail_sender_email or settings.zeptomail_username

@@ -105,8 +105,15 @@ class TemplateEngine:
 
             try:
                 rendered = self._render_template(template.content, context)
+                # SECURITY-FIX: Validate rendered output_path to prevent path traversal.
+                # A malicious contract with project_name: "../../../etc/passwd" could
+                # write to arbitrary filesystem locations without this check.
+                rendered_path = self._render_template(template.output_path, context)
+                path_parts = rendered_path.replace("\\", "/").split("/")
+                if rendered_path.startswith("/") or ".." in path_parts:
+                    raise ValueError(f"Unsafe output path (path traversal attempt): {rendered_path}")
                 files.append(GeneratedFile(
-                    path=self._render_template(template.output_path, context),
+                    path=rendered_path,
                     content=rendered,
                     template_name=name,
                     category=template.category,
@@ -341,11 +348,23 @@ services:
       VALKEY_URL: redis://cache:6379/0
       ENVIRONMENT: development
       DEBUG: "true"
+      CORS_ORIGINS: "http://localhost:3000"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
     depends_on:
       db:
         condition: service_healthy
       cache:
         condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://backend:8000
+      NEXT_PUBLIC_API_URL: http://backend:8000
+    depends_on:
+      - backend
 
 volumes:
   pgdata:
@@ -789,6 +808,223 @@ export interface {{ table.get('name', 'Unknown') | replace('_', ' ') | title | r
 }
 
 {% endfor %}
+""",
+        ))
+
+        # ── Makefile (FIX-25) ─────────────────────────────────────────
+        # Master Prompt mandates: make dev, make migrate, make seed,
+        # make test, make clean.  Framework-aware commands.
+        self.register(FileTemplate(
+            name="infra.makefile",
+            output_path="Makefile",
+            category="infra",
+            description="Project-level Makefile for common commands",
+            content="""\
+# {{ project_name }} — Developer Shortcuts
+# Usage: make <target>
+
+.PHONY: setup dev stop migrate seed test test-e2e lint logs shell-backend shell-db clean
+
+# ── Setup ───────────────────────────────────────────────────────
+setup:
+\t@echo "Setting up {{ project_name }}..."
+\tcp -n backend/.env.example backend/.env 2>/dev/null || true
+\tcp -n frontend/.env.local.example frontend/.env.local 2>/dev/null || true
+\tdocker compose build
+
+# ── Run ─────────────────────────────────────────────────────────
+dev:
+\tdocker compose up
+
+stop:
+\tdocker compose down
+
+# ── Database ────────────────────────────────────────────────────
+{% if backend_framework in ('fastapi', 'flask', 'django') %}
+migrate:
+\tdocker compose exec backend alembic upgrade head
+
+seed:
+\tdocker compose exec backend python -m app.seed
+{% elif backend_framework in ('express', 'nestjs') %}
+migrate:
+\tdocker compose exec backend npx prisma migrate deploy
+
+seed:
+\tdocker compose exec backend npx prisma db seed
+{% else %}
+migrate:
+\t@echo "Run migrations for your framework manually"
+
+seed:
+\t@echo "Run seed for your framework manually"
+{% endif %}
+
+# ── Testing ─────────────────────────────────────────────────────
+{% if backend_framework in ('fastapi', 'flask', 'django') %}
+test:
+\tdocker compose exec backend pytest -x --tb=short
+
+test-e2e:
+\tcd frontend && npx playwright test
+{% elif backend_framework in ('express', 'nestjs') %}
+test:
+\tdocker compose exec backend npm test
+
+test-e2e:
+\tcd frontend && npx playwright test
+{% else %}
+test:
+\t@echo "Run tests for your framework manually"
+{% endif %}
+
+lint:
+{% if backend_framework in ('fastapi', 'flask', 'django') %}
+\tdocker compose exec backend ruff check . --fix
+{% elif backend_framework in ('express', 'nestjs') %}
+\tdocker compose exec backend npx eslint src/ --fix
+{% endif %}
+
+# ── Debugging ───────────────────────────────────────────────────
+logs:
+\tdocker compose logs -f --tail=100
+
+shell-backend:
+\tdocker compose exec backend sh
+
+shell-db:
+\tdocker compose exec db psql -U postgres -d {{ project_slug }}
+
+# ── Cleanup ─────────────────────────────────────────────────────
+clean:
+\tdocker compose down -v --remove-orphans
+\t@echo "Cleaned up containers, volumes, and orphans."
+""",
+        ))
+
+        # ── Health Check Script (FIX-27) ─────────────────────────────
+        # Master Prompt mandates scripts/health_check.sh — a retry
+        # loop that waits for backend + frontend to become healthy.
+        self.register(FileTemplate(
+            name="infra.health_check",
+            output_path="scripts/health_check.sh",
+            category="infra",
+            description="Health check script with retry loop",
+            content="""\
+#!/usr/bin/env bash
+# {{ project_name }} — Health Check
+# Waits for backend and frontend to become healthy.
+# Usage: bash scripts/health_check.sh
+
+set -euo pipefail
+
+BACKEND_URL="${BACKEND_URL:-http://localhost:8000}"
+FRONTEND_URL="${FRONTEND_URL:-http://localhost:3000}"
+MAX_WAIT="${MAX_WAIT:-120}"
+INTERVAL=5
+ELAPSED=0
+
+echo "Waiting for services to become healthy (timeout: ${MAX_WAIT}s)..."
+
+# ── Backend health ────────────────────────────────────────────
+echo -n "Backend (${BACKEND_URL}/health): "
+while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+  if curl -sf "${BACKEND_URL}/health" > /dev/null 2>&1; then
+    echo "OK (${ELAPSED}s)"
+    break
+  fi
+  sleep "$INTERVAL"
+  ELAPSED=$((ELAPSED + INTERVAL))
+done
+
+if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+  echo "TIMEOUT after ${MAX_WAIT}s"
+  echo "Backend is not responding. Check: docker compose logs backend"
+  exit 1
+fi
+
+# ── Frontend health ───────────────────────────────────────────
+ELAPSED=0
+echo -n "Frontend (${FRONTEND_URL}): "
+while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+  if curl -sf "${FRONTEND_URL}" > /dev/null 2>&1; then
+    echo "OK (${ELAPSED}s)"
+    break
+  fi
+  sleep "$INTERVAL"
+  ELAPSED=$((ELAPSED + INTERVAL))
+done
+
+if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+  echo "TIMEOUT after ${MAX_WAIT}s"
+  echo "Frontend is not responding. Check: docker compose logs frontend"
+  exit 1
+fi
+
+echo ""
+echo "All services healthy!"
+echo "  Backend:  ${BACKEND_URL}"
+echo "  Frontend: ${FRONTEND_URL}"
+""",
+        ))
+
+        # ── Frontend Dockerfile (FIX-22) ────────────────────────────
+        # Without this, docker-compose references ./frontend/Dockerfile
+        # that doesn't exist, and sandbox build also fails.
+        self.register(FileTemplate(
+            name="frontend.dockerfile",
+            output_path="frontend/Dockerfile",
+            category="frontend",
+            description="Frontend multi-stage Dockerfile (Node.js)",
+            content="""\
+FROM node:20-alpine AS builder
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Next.js standalone output
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+
+# Vite/React fallback — serve static files
+COPY --from=builder /app/dist ./dist
+
+EXPOSE 3000
+CMD ["node", "server.js"]
+""",
+        ))
+
+        # ── Frontend .env.local.example (FIX-26) ───────────────────
+        self.register(FileTemplate(
+            name="frontend.env_local_example",
+            output_path="frontend/.env.local.example",
+            category="frontend",
+            description="Frontend environment variables template",
+            content="""\
+# {{ project_name }} Frontend Environment
+# Copy this file: cp .env.local.example .env.local
+
+# Backend API URL (adjust for deployment)
+VITE_API_URL=http://localhost:8000
+NEXT_PUBLIC_API_URL=http://localhost:8000
+REACT_APP_API_URL=http://localhost:8000
+
+# WebSocket URL (if applicable)
+VITE_WS_URL=ws://localhost:8000
+NEXT_PUBLIC_WS_URL=ws://localhost:8000
+
+# Production:
+# VITE_API_URL=https://api.{{ project_slug }}.com
+# NEXT_PUBLIC_API_URL=https://api.{{ project_slug }}.com
 """,
         ))
 

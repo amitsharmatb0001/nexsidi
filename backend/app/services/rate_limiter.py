@@ -123,14 +123,30 @@ class ValKeyRateLimiter:
                 window_seconds,  # ARGV[3]
             )
         except Exception as exc:  # noqa: BLE001
-            # Valkey unavailable — degrade gracefully (allow request, alert)
-            logger.warning(
-                "rate_limiter_valkey_unavailable",
-                scope=scope,
-                error=str(exc),
-                action="allowing_request",
-            )
+            # FIX-49: Escalating alerts — track consecutive failures.
+            # An attacker could DDoS Valkey to disable rate limiting.
+            # After 5 consecutive failures, escalate to ERROR level.
+            _consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+            self._consecutive_failures = _consecutive_failures
+            if _consecutive_failures > 5:
+                logger.error(
+                    "rate_limiter_persistent_failure",
+                    scope=scope,
+                    consecutive=_consecutive_failures,
+                    error=str(exc)[:200],
+                    action="allowing_request",
+                )
+            else:
+                logger.warning(
+                    "rate_limiter_valkey_unavailable",
+                    scope=scope,
+                    error=str(exc)[:200],
+                    action="allowing_request",
+                )
             return
+
+        # FIX-49: Reset consecutive failures on successful Valkey call
+        self._consecutive_failures = 0
 
         if count > max_attempts:
             logger.warning(

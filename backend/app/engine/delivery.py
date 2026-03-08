@@ -161,6 +161,37 @@ class DeliveryEngine:
                 zf.writestr(f"{project_name}/code/{path}", content)
                 manifest.frontend_files += 1
 
+            # FIX-14: Completeness validation — warn if critical files are missing.
+            # Prevents customers from receiving empty or broken projects.
+            all_paths = set(backend_files.keys()) | set(frontend_files.keys())
+            incomplete_warnings: list[str] = []
+            total_code = len(backend_files) + len(frontend_files)
+            if total_code == 0:
+                incomplete_warnings.append("No code files generated — project is empty")
+            if not any("requirements.txt" in f or "package.json" in f for f in all_paths):
+                incomplete_warnings.append("Missing dependency manifest (requirements.txt or package.json)")
+            if not any("dockerfile" in f.lower() for f in all_paths):
+                incomplete_warnings.append("Missing Dockerfile — app cannot be containerized")
+            if not any(".env" in f for f in all_paths):
+                incomplete_warnings.append("Missing .env.example — app cannot start without env config")
+
+            if incomplete_warnings:
+                warning_content = (
+                    "# INCOMPLETE PROJECT WARNING\n\n"
+                    "The following critical files are missing from this delivery:\n\n"
+                    + "\n".join(f"- {w}" for w in incomplete_warnings)
+                    + "\n\n## What to do\n\n"
+                    "These files are required for the project to build and run.\n"
+                    "Re-run the pipeline or manually create the missing files.\n"
+                )
+                zf.writestr(f"{project_name}/INCOMPLETE_PROJECT_WARNING.md", warning_content)
+                logger.warning(
+                    "delivery_incomplete_project",
+                    pipeline_run_id=pipeline_run_id,
+                    warnings=incomplete_warnings,
+                    total_files=total_code,
+                )
+
             # 3. Reports
             reports = self._collect_reports(context)
             for report_name, report_data in reports.items():
