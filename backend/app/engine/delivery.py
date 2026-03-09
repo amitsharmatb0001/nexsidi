@@ -183,7 +183,13 @@ class DeliveryEngine:
                 incomplete_warnings.append("No code files generated — project is empty")
             if not any("requirements.txt" in f or "package.json" in f for f in all_paths):
                 incomplete_warnings.append("Missing dependency manifest (requirements.txt or package.json)")
-            if not any("dockerfile" in f.lower() for f in all_paths):
+            # V5-FIX (HIGH-11): Use basename comparison instead of substring.
+            # The old ``"dockerfile" in f.lower()`` matched docs/dockerfile-guide.md,
+            # scripts/check_dockerfile.sh, etc. — any path containing "dockerfile".
+            # Only actual Dockerfiles should satisfy this check.
+            import os as _os_delivery
+            _dockerfile_names = {"dockerfile", "dockerfile.dev", "dockerfile.prod", "dockerfile.staging"}
+            if not any(_os_delivery.path.basename(f).lower() in _dockerfile_names for f in all_paths):
                 incomplete_warnings.append("Missing Dockerfile — app cannot be containerized")
             if not any(".env" in f for f in all_paths):
                 incomplete_warnings.append("Missing .env.example — app cannot start without env config")
@@ -292,10 +298,12 @@ class DeliveryEngine:
                 + manifest.report_files + manifest.deploy_files + 1  # +1 for contract
             )
             # AUDIT-T3-15: Validate agent names against alphanumeric+underscore to prevent injection
+            # V5-FIX (MEDIUM-6): Allow digits in agent names (e.g. ``gemini3_agent``).
+            # The old pattern ``r'^[a-z_]+$'`` rejected any name containing digits.
             import re as _re_delivery
             manifest.agents_involved = [
                 k for k in context
-                if not k.startswith("__") and _re_delivery.match(r'^[a-z_]+$', k)
+                if not k.startswith("__") and _re_delivery.match(r'^[a-z0-9_]+$', k)
             ]
 
             # Deployment info

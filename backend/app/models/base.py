@@ -19,6 +19,16 @@ class Base(DeclarativeBase):
     pass
 
 
+# V5-FIX (MEDIUM-3): Module-level functions instead of lambdas for
+# SQLAlchemy default/onupdate.  Lambdas can't be pickled (breaks
+# multiprocessing-based test runners and alembic autogenerate) and
+# cause opaque ``<lambda>`` in tracebacks.  Named functions are
+# equivalent but debuggable and serializable.
+def _utcnow() -> datetime:
+    """Return timezone-aware UTC now (used by column defaults)."""
+    return datetime.now(timezone.utc)
+
+
 class UUIDPrimaryKeyMixin:
     """UUID primary key with server-side default."""
 
@@ -35,15 +45,15 @@ class TimestampMixin:
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=_utcnow,
         server_default=func.now(),
         nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=_utcnow,
         server_default=func.now(),
-        onupdate=lambda: datetime.now(timezone.utc),
+        onupdate=_utcnow,
         nullable=False,
     )
 

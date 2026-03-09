@@ -382,8 +382,16 @@ async def pipeline_websocket(
     # processes (e.g. Celery workers, other FastAPI workers) are forwarded to
     # this WebSocket client. The handler is a closure over `websocket` and is
     # unregistered in the finally block when the connection closes.
+    # V5-FIX (HIGH-6): Flag to short-circuit sends after disconnect.
+    # Between WebSocketDisconnect and the finally block, pub-sub can still
+    # invoke _forward_to_ws on a dead socket.  The flag prevents buffering
+    # failed sends in Starlette's WebSocket object, reducing memory pressure.
+    _ws_disconnected = False
+
     async def _forward_to_ws(event: dict) -> None:
         """Forward a pub-sub event to this WebSocket connection."""
+        if _ws_disconnected:
+            return  # V5-FIX: Don't attempt send on dead socket
         try:
             await asyncio.wait_for(websocket.send_json(event), timeout=5.0)
         except Exception:
@@ -476,8 +484,9 @@ async def pipeline_websocket(
             except (ValueError, _json.JSONDecodeError):
                 pass  # Malformed JSON from client — ignore, keep connection
     except WebSocketDisconnect:
-        pass  # Expected: client disconnected — cleanup handled
+        _ws_disconnected = True  # V5-FIX: Signal closure to _forward_to_ws
     except Exception as exc:
+        _ws_disconnected = True  # V5-FIX: Signal closure to _forward_to_ws
         # R19-FIX: Sanitize exception before logging. Raw exception strings
         # from downstream httpx calls can contain API keys in headers.
         from app.services.ai_router import _sanitize_error

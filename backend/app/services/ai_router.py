@@ -187,8 +187,10 @@ MODELS: dict[str, ModelSpec] = {
         max_output_tokens=65536,
     ),
     # ── Tier 3: High-capability ──
+    # V5-FIX (CRITICAL-2): Was "claude-sonnet-4-5-20241022" (wrong date,
+    # no such model exists — every API call would 400).
     "sonnet-4.5": ModelSpec(
-        model_id="claude-sonnet-4-5-20241022",
+        model_id="claude-sonnet-4-5-20250514",
         provider=Provider.ANTHROPIC,
         display_name="Claude Sonnet 4.5",
         cost_tier=3,
@@ -231,17 +233,22 @@ MODELS: dict[str, ModelSpec] = {
     ),
 }
 
-# Escalation chain — index 0 is cheapest, last is most powerful
+# Escalation chain — index 0 is cheapest, last is most powerful.
+# V5-FIX (HIGH-2): Reordered so cost strictly increases.  Old order had
+# gemini-3-flash ($0.20/M) AFTER gemini-pro ($1.25/M) — a cost regression
+# that downgraded capability on escalation.  Also moved gemini-3.1-flash-lite
+# to its correct cost position and removed sonnet-4.5 from mid-chain
+# (it was routing to a broken model ID, now fixed but kept at correct tier).
 ESCALATION_CHAIN: list[str] = [
-    "gemini-flash",
-    "haiku",
-    "gemini-pro",
-    "gemini-3-flash",
-    "sonnet-4.5",
-    "sonnet",
-    "gemini-3.1-flash-lite",
-    "gemini-3.1-pro",
-    "opus",
+    "gemini-flash",           # tier 1: $0.15/M input
+    "gemini-3-flash",         # tier 1: $0.20/M input
+    "gemini-3.1-flash-lite",  # tier 1: $0.20/M input
+    "haiku",                  # tier 2: $0.25/M input (per 1K: $0.00025)
+    "gemini-pro",             # tier 2: $1.25/M input
+    "gemini-3.1-pro",         # tier 3: $1.75/M input
+    "sonnet-4.5",             # tier 3: $3.00/M input
+    "sonnet",                 # tier 3: $3.00/M input (latest)
+    "opus",                   # tier 5: $15.00/M input
 ]
 
 
@@ -2298,12 +2305,24 @@ class ProjectCostTracker:
 
     @staticmethod
     def _resolve_model_key(model_id: str) -> str:
-        """Resolve model registry key from model_id string."""
+        """Resolve model registry key from model_id string.
+
+        V5-FIX (HIGH-1): Also match partial model_id (prefix) so that
+        API responses with truncated or variant suffixes (e.g.,
+        ``"gemini-3.1-flash-lite"`` vs ``"gemini-3.1-flash-lite-preview"``)
+        still resolve correctly instead of falling back to Sonnet pricing.
+        """
+        # Exact match first
         for key, spec in MODELS.items():
             if spec.model_id == model_id:
                 return key
-        # M5-FIX: log warning when falling back to sonnet pricing
-        logger.warning("cost_tracker_unknown_model_id", model_id=model_id)
+        # Prefix match (model_id may drop "-preview" suffix)
+        for key, spec in MODELS.items():
+            if spec.model_id.startswith(model_id) or model_id.startswith(spec.model_id):
+                logger.info("cost_tracker_prefix_match", model_id=model_id, matched_key=key)
+                return key
+        logger.warning("cost_tracker_unknown_model_id", model_id=model_id,
+                       hint="Add this model to MODELS registry to avoid Sonnet fallback pricing")
         return "sonnet"  # Default fallback
 
     def estimate_and_check(self, model_key: str, estimated_input_tokens: int = 4000) -> None:

@@ -153,6 +153,72 @@ class MistakeMemory:
         if len(_FALLBACK_STORE["_shared"]) > 500:
             _FALLBACK_STORE["_shared"] = _FALLBACK_STORE["_shared"][-500:]
 
+    def record_lesson(
+        self,
+        agent_name: str,
+        task_type: str,
+        error: str,
+        fix: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Store a successful fix as a LESSON (not a failure).
+
+        V5-FIX (HIGH-13): ``record_failure()`` was being called on successful
+        fixes, which stored them with failure metadata.  This method stores
+        the fix with ``outcome=resolved`` so future queries correctly
+        distinguish between "mistakes to avoid" and "fixes that work."
+
+        V5-FIX (MEDIUM-7): Includes ``language`` and ``framework`` from
+        context metadata to prevent cross-language contamination (e.g.,
+        Shubham's Python None-checks leaking into Aanya's TypeScript).
+        """
+        doc_id = hashlib.md5(
+            f"{agent_name}:lesson:{task_type}:{error[:200]}".encode()
+        ).hexdigest()
+
+        doc_text = f"Error: {error}\nSuccessful Fix: {fix}"
+        metadata = {
+            "agent_name": agent_name,
+            "task_type": task_type,
+            "error": error[:500],
+            "fix": fix[:500],
+            "outcome": "resolved",  # V5-FIX: Distinguishes from failures
+            "timestamp": time.time(),
+            "expiry_timestamp": time.time() + (90 * 24 * 3600),
+        }
+        if context:
+            for k, v in context.items():
+                if isinstance(v, (str, int, float, bool)):
+                    metadata[f"ctx_{k}"] = v
+
+        chroma = _get_chroma()
+        if chroma:
+            try:
+                collection = chroma.get_or_create_collection(_collection_name(agent_name))
+                collection.upsert(
+                    ids=[doc_id],
+                    documents=[doc_text],
+                    metadatas=[metadata],
+                )
+                # Also write to shared collection (with outcome tag)
+                shared_coll = chroma.get_or_create_collection("mistakes_shared")
+                shared_coll.upsert(
+                    ids=[f"shared_{doc_id}"],
+                    documents=[doc_text],
+                    metadatas=[metadata],
+                )
+                logger.debug("lesson_recorded", agent=agent_name, task_type=task_type)
+                return
+            except Exception as exc:
+                logger.warning("lesson_record_chromadb_failed", error=str(exc)[:200])
+
+        # Fallback: in-memory
+        if agent_name not in _FALLBACK_STORE:
+            _FALLBACK_STORE[agent_name] = []
+        _FALLBACK_STORE[agent_name].append(metadata)
+        if len(_FALLBACK_STORE[agent_name]) > 200:
+            _FALLBACK_STORE[agent_name] = _FALLBACK_STORE[agent_name][-200:]
+
     def record_success(
         self,
         agent_name: str,

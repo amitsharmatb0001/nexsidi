@@ -17,6 +17,15 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
+class TenantContextError(ValueError):
+    """V5-FIX (HIGH-5): Raised when tenant context has invalid UUID values.
+
+    This replaces the unhandled ValueError from ``uuid.UUID()`` which would
+    crash the request as a 500 ISE, permanently locking out users with
+    corrupted JWTs.  Callers should catch this and return 401/400.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class TenantContext:
     """Immutable tenant context extracted from JWT claims."""
@@ -38,11 +47,22 @@ async def set_tenant_context(session: AsyncSession, ctx: TenantContext) -> None:
     Args:
         session: Active async SQLAlchemy session.
         ctx: Tenant context from JWT claims.
+
+    Raises:
+        TenantContextError: If org_id or user_id is not a valid UUID.
     """
     # Validate inputs are safe (UUIDs and known role values only)
     # A-16-FIX: Use normalized UUID strings to prevent any format-based injection
-    org_id = _validate_uuid(ctx.organization_id)
-    user_id = _validate_uuid(ctx.user_id)
+    # V5-FIX (HIGH-5): Catch ValueError from _validate_uuid so a corrupted
+    # JWT org_id doesn't crash the request with an unhandled exception.
+    # Previously, ValueError propagated as a 500 ISE — locking the user out.
+    try:
+        org_id = _validate_uuid(ctx.organization_id)
+        user_id = _validate_uuid(ctx.user_id)
+    except (ValueError, AttributeError) as exc:
+        raise TenantContextError(
+            f"Invalid tenant context — malformed UUID in JWT: {exc}"
+        ) from exc
     _validate_role(ctx.role)
 
     await session.execute(text(f"SET LOCAL app.current_tenant = '{org_id}'"))

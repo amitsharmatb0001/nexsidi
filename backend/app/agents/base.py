@@ -1329,7 +1329,24 @@ async def call_ai_with_tools(
         enable_native_web_search=_has_web_search,
     )
 
-    response = await router.call(request)
+    # V5-FIX (CRITICAL-12): Handle AIResponseTruncatedError specifically.
+    # The old code let truncation errors bubble up to _llm_recovery() which
+    # would just retry with a bigger model — but if the output is architecturally
+    # too large, every model will truncate.  Now we catch truncation, increase
+    # max_tokens on the request, and retry ONCE before escalating.
+    from app.services.ai_router import AIResponseTruncatedError as _TruncErr
+
+    try:
+        response = await router.call(request)
+    except _TruncErr:
+        # Double max_tokens and retry once before giving up
+        if request.max_tokens and request.max_tokens < 64000:
+            request.max_tokens = min(request.max_tokens * 2, 64000)
+            logger.warning("truncation_retry_with_higher_max_tokens",
+                           new_max_tokens=request.max_tokens, task_type=task_type)
+            response = await router.call(request)
+        else:
+            raise  # Already at max — let _llm_recovery handle escalation
 
     # Tool use loop
     #

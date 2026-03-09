@@ -190,8 +190,14 @@ _AGENT_CONTEXT_DEPS: dict[str, list[str]] = {
     "pranav":     ["vikram", "shubham", "aanya"],
     # HIGH-2 FIX: GitAgent needs architecture contract + code outputs for repo creation
     "git_agent":  ["vikram", "shubham", "aanya", "docs_agent"],
+    # V5-FIX (CRITICAL-4): docs_agent needs architecture contract + code outputs
+    # for generating README, API docs, and user guides.  Without this entry
+    # it gets FULL unfiltered context (MBs) + logs a false "unknown_agent" warning.
+    "docs_agent": ["vikram", "shubham", "aanya", "dhruv"],
     # FIX-37: Tilotma review must see attack_tester results for GO/NO-GO decision
-    "tilotma_review": ["vikram", "shubham", "aanya", "aarav", "attack_tester", "karan", "navya", "deepika"],
+    # V5-FIX (CRITICAL-3): Added "saanvi" — GO/NO-GO needs complexity score +
+    # estimated effort to validate whether the build matches project scope.
+    "tilotma_review": ["vikram", "shubham", "aanya", "aarav", "attack_tester", "karan", "navya", "deepika", "saanvi"],
 }
 
 
@@ -389,44 +395,42 @@ class ProjectRateLimiter:
     async def _try_valkey_acquire(self, project_id: str) -> bool:
         """Attempt Valkey-backed sliding window rate limit (cross-worker safe).
 
+        V5-FIX (HIGH-7): Uses ``ValKeyRateLimiter`` instead of a duplicate
+        inline Lua script.  The old code:
+        - Re-parsed the Lua script on every call (``redis.eval`` vs ``EVALSHA``)
+        - Used a different key namespace (``rl:{id}`` vs ``ratelimit:{scope}:{key}``)
+        - Had no SHA caching — 10× slower than the shared limiter
+
         Returns True if acquired (caller should proceed), False if Valkey
         unavailable (caller should fall back to in-memory).
         Raises nothing — failures fall back to in-memory.
         """
         try:
-            from app.services.token_revocation import get_revocation_store
-            store = get_revocation_store()
-            redis = store._redis  # noqa: SLF001 — reuse existing pool
-            if redis is None:
-                return False
-            key = f"rl:{project_id}"
-            now_ms = int(time.time() * 1000)
-            window_ms = 60_000
-            # Lua sliding window: ZREMRANGEBYSCORE + ZCARD + ZADD
-            lua = """
-            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])
-            local count = redis.call('ZCARD', KEYS[1])
-            if count < tonumber(ARGV[3]) then
-                redis.call('ZADD', KEYS[1], ARGV[1], ARGV[1] .. ':' .. math.random(1000000))
-                redis.call('EXPIRE', KEYS[1], 120)
-                return 0
-            else
-                return 1
-            end
-            """
-            result = await redis.eval(lua, 1, key, now_ms, window_ms, self._calls_per_minute)
-            if result == 1:
-                # R25-FIX-1: Rate limited — sleep and retry. If STILL denied
-                # after retry, return False to fall back to in-memory limiter
-                # which correctly blocks. Previously returned True regardless,
-                # allowing rate-limited requests to proceed.
-                await asyncio.sleep(2.0)
-                result = await redis.eval(lua, 1, key, int(time.time() * 1000), window_ms, self._calls_per_minute)
-                if result == 1:
-                    # Still rate-limited after retry — let in-memory handle blocking
-                    return False
+            from app.services.rate_limiter import ValKeyRateLimiter
+            _rl = ValKeyRateLimiter()
+            # check() raises HTTPException(429) on limit exceeded
+            await _rl.check(
+                scope="pipeline_ai_call",
+                key=project_id,
+                max_attempts=self._calls_per_minute,
+                window_seconds=60,
+            )
             return True  # Valkey handled it (acquired successfully)
-        except Exception:
+        except Exception as exc:
+            # HTTPException(429) means rate-limited — retry once
+            from fastapi import HTTPException
+            if isinstance(exc, HTTPException) and exc.status_code == 429:
+                await asyncio.sleep(2.0)
+                try:
+                    await _rl.check(
+                        scope="pipeline_ai_call",
+                        key=project_id,
+                        max_attempts=self._calls_per_minute,
+                        window_seconds=60,
+                    )
+                    return True
+                except Exception:
+                    return False  # Still rate-limited after retry
             return False  # Fall back to in-memory
 
     def _evict_stale_buckets(self, now: float, window: float) -> None:
@@ -862,12 +866,24 @@ class PipelineOrchestrator:
             self._semaphore = asyncio.Semaphore(self._max_concurrent)
         return self._semaphore
 
+    # V5-FIX (CRITICAL-8): Hard in-process pipeline counter — absolute last resort
+    # when Valkey is down.  Without this, an attacker can DDoS Valkey and start
+    # unlimited pipelines (the local asyncio.Semaphore only limits within the
+    # async context, not the total count of accepted starts).
+    _local_active_count: int = 0
+    _LOCAL_FALLBACK_MAX: int = 5  # Conservative: 5 per process when Valkey is down
+
     async def _acquire_distributed_slot(self, run_id: str) -> bool:
         """REVIEW-FIX: Acquire a slot in the distributed concurrency semaphore.
 
         Uses Valkey INCR + TTL to count active pipelines across all workers.
         Each worker's local asyncio.Semaphore only limits within that process.
         This distributed counter limits TOTAL concurrent pipelines cluster-wide.
+
+        V5-FIX (CRITICAL-8): When Valkey fails, fall back to a hard in-process
+        counter (not unbounded ``return True``).  This ensures that even during
+        a Valkey outage, each worker only accepts ``_LOCAL_FALLBACK_MAX``
+        concurrent pipelines instead of unlimited.
 
         Returns True if a slot was acquired, False if at max capacity.
         """
@@ -898,11 +914,30 @@ class PipelineOrchestrator:
                 return True
             return False
         except Exception as exc:
-            logger.debug("distributed_semaphore_unavailable", error=str(exc))
-            return True  # Fall back to local semaphore only
+            # V5-FIX: Use hard in-process counter instead of blindly allowing
+            if self._local_active_count >= self._LOCAL_FALLBACK_MAX:
+                logger.error(
+                    "distributed_semaphore_unavailable_rejected",
+                    error=str(exc)[:200],
+                    local_active=self._local_active_count,
+                    max=self._LOCAL_FALLBACK_MAX,
+                    msg="Valkey down + local limit reached — rejecting pipeline start",
+                )
+                return False
+            self._local_active_count += 1
+            logger.warning(
+                "distributed_semaphore_unavailable_local_fallback",
+                error=str(exc)[:200],
+                local_active=self._local_active_count,
+                max=self._LOCAL_FALLBACK_MAX,
+            )
+            return True
 
     async def _release_distributed_slot(self, run_id: str) -> None:
         """REVIEW-FIX: Release a slot in the distributed concurrency semaphore."""
+        # V5-FIX: Always decrement the in-process fallback counter
+        if self._local_active_count > 0:
+            self._local_active_count -= 1
         try:
             from app.services.valkey_pool import get_valkey_client
             client = await get_valkey_client()
@@ -3488,14 +3523,35 @@ class PipelineOrchestrator:
         import copy
         from types import MappingProxyType
 
+        def _deep_freeze(d: dict) -> MappingProxyType:
+            """V5-FIX (HIGH-3): Recursively freeze nested dicts.
+
+            ``MappingProxyType`` only freezes the top level — nested dicts
+            and lists are still mutable.  When parallel agents (Karan, Navya,
+            Deepika) share metadata via ``MappingProxyType``, they can still
+            mutate nested values causing cross-agent data corruption.
+            """
+            frozen: dict[str, Any] = {}
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    frozen[k] = _deep_freeze(v)
+                elif isinstance(v, list):
+                    frozen[k] = tuple(
+                        _deep_freeze(item) if isinstance(item, dict) else item
+                        for item in v
+                    )
+                else:
+                    frozen[k] = v
+            return MappingProxyType(frozen)
+
         def _selective_context_copy(ctx: dict[str, Any]) -> dict[str, Any]:
             """Deep-copy only mutable agent output dicts; share metadata."""
             out: dict[str, Any] = {}
             for key, val in ctx.items():
                 if key.startswith("__"):
-                    # Metadata keys — shared via read-only proxy (T3-11-FIX)
+                    # V5-FIX (HIGH-3): Recursively freeze metadata dicts
                     if isinstance(val, dict):
-                        out[key] = MappingProxyType(val)
+                        out[key] = _deep_freeze(val)
                     else:
                         out[key] = val
                 elif isinstance(val, dict):

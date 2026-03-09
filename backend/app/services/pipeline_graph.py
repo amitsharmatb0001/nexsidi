@@ -68,6 +68,8 @@ async def _run_agent_node(
     state: PipelineState,
     agent_name: str,
     stage_name: str,
+    *,
+    context_key: str | None = None,
 ) -> PipelineState:
     """Execute a single agent and update pipeline state.
 
@@ -76,10 +78,16 @@ async def _run_agent_node(
     - Mistake memory (inject past lessons into prompt)
     - Output storage in context
     - Pipeline event emission
+
+    V5-FIX (CASING-2): Added ``context_key`` parameter.  When provided,
+    output is stored under ``context[context_key]`` instead of
+    ``context[agent_name]``.  This prevents tilotma_review from
+    overwriting tilotma's original requirements output.
     """
     from app.agents import get_agent_instance
     from app.agents.base import run_agent
 
+    _output_key = context_key or agent_name
     run_id = state["run_id"]
     context = state.get("context", {})
 
@@ -89,10 +97,10 @@ async def _run_agent_node(
         agent = get_agent_instance(agent_name)
         result = await run_agent(agent, run_id, context)
 
-        # Store agent output in context
+        # Store agent output in context under the designated key
         new_context = {**context}
         if result.output:
-            new_context[agent_name] = result.output
+            new_context[_output_key] = result.output
 
         # Extract route suggestion if agent directed routing
         route = result.route_to if hasattr(result, "route_to") else None
@@ -383,8 +391,17 @@ async def compliance_node(state: PipelineState) -> PipelineState:
 
 
 async def tilotma_review_node(state: PipelineState) -> PipelineState:
-    """Tilotma: Final GO/NO-GO review with all agent reports."""
-    return await _run_agent_node(state, "tilotma", "tilotma_review")
+    """Tilotma: Final GO/NO-GO review with all agent reports.
+
+    V5-FIX (CASING-2): Store output under ``"tilotma_review"`` key so
+    it does NOT overwrite the original ``"tilotma"`` requirements output.
+    Also use ``context_key="tilotma_review"`` for filtering so the agent
+    receives the correct deps from ``_AGENT_CONTEXT_DEPS["tilotma_review"]``
+    (vikram, shubham, aanya, aarav, attack_tester, karan, navya, deepika, saanvi).
+    """
+    return await _run_agent_node(
+        state, "tilotma", "tilotma_review", context_key="tilotma_review",
+    )
 
 
 async def fixing_node(state: PipelineState) -> PipelineState:
@@ -539,9 +556,14 @@ def route_after_tilotma_review(state: PipelineState) -> str:
     HIGH-6 FIX: Normalize verdict string robustly.  Tilotma might return
     "NO GO", "No-Go", "NOGO", "no_go", "REJECT", "rejected", "fail", etc.
     We normalize to a canonical form before matching against the rejection set.
+
+    V5-FIX (CASING-2): Read from ``"tilotma_review"`` context key.
+    V5-FIX (CASING-1): Collapse consecutive hyphens after normalization.
     """
     context = state.get("context", {})
-    tilotma_output = context.get("tilotma", {})
+    # V5-FIX: Read from tilotma_review key (not tilotma) to avoid
+    # reading the requirements-phase output.
+    tilotma_output = context.get("tilotma_review", {})
 
     raw_verdict = tilotma_output.get("verdict", "GO")
     if not isinstance(raw_verdict, str):
@@ -549,9 +571,14 @@ def route_after_tilotma_review(state: PipelineState) -> str:
 
     # Normalize: uppercase, replace spaces/underscores with hyphens, strip
     normalized = raw_verdict.upper().strip().replace(" ", "-").replace("_", "-")
+    # V5-FIX (CASING-1): Collapse consecutive hyphens so "NO - GO" →
+    # "NO---GO" → "NO-GO" (match).  The old set had "NO--GO" which was
+    # unreachable — no input could produce exactly two hyphens.
+    import re as _re_verdict
+    normalized = _re_verdict.sub(r"-{2,}", "-", normalized)
 
     _REJECTION_VERDICTS = {
-        "NO-GO", "NOGO", "NO--GO", "REJECT", "REJECTED",
+        "NO-GO", "NOGO", "REJECT", "REJECTED",
         "FAIL", "FAILED", "BLOCK", "BLOCKED",
     }
 
@@ -569,12 +596,20 @@ def route_after_fixing(state: PipelineState) -> str:
 
 
 def route_after_testing(state: PipelineState) -> str:
-    """Route after testing: if failures found → fixing, else → security audit."""
+    """Route after testing: if failures found → fixing, else → security audit.
+
+    V5-FIX (CRITICAL-10): Aarav outputs ``total_failed`` and ``total_tests``,
+    NOT ``failures`` and ``pass_rate``.  The old code always read default (0/100)
+    which meant test failures NEVER triggered the fix-retest loop from the
+    testing stage.  This was the single most severe routing bug in the pipeline.
+    """
     context = state.get("context", {})
     aarav_output = context.get("aarav", {})
 
-    failures = aarav_output.get("failures", 0)
-    test_pass_rate = aarav_output.get("pass_rate", 100)
+    # V5-FIX: Read the correct keys from Aarav's output
+    failures = aarav_output.get("total_failed", 0)
+    total_tests = aarav_output.get("total_tests", 1)
+    test_pass_rate = ((total_tests - failures) / max(total_tests, 1)) * 100
 
     if failures > 0 or test_pass_rate < 80:
         fix_cycle = state.get("fix_retest_cycle", 0)
@@ -591,6 +626,14 @@ def route_after_post_deploy(state: PipelineState) -> str:
     HIGH-7 FIX: Increment fix_retest_cycle BEFORE routing to fixing.
     Without this, the counter never advances and the 3-cycle safety cap
     never triggers → infinite fix loop on persistent post-deploy failures.
+
+    V5-FIX (HIGH-9): Bridge post-deploy failures into ``__fix_items__``
+    metadata so the Fixer can act on them.  The Fixer already receives
+    ``post_deploy_verify`` in context (BLOCKER-3 FIX), but it expects
+    file-level errors with ``file_path`` + ``error_message``.  Post-deploy
+    failures are endpoint-level (HTTP 500, missing headers, timeouts).
+    Without this bridge, the Fixer sees the verify output but can't
+    extract actionable fix items → it runs an empty loop and exits.
     """
     context = state.get("context", {})
     verify_output = context.get("post_deploy_verify", {})
@@ -607,6 +650,40 @@ def route_after_post_deploy(state: PipelineState) -> str:
             "post_deploy_fix_cycle_incremented",
             extra={"cycle": fix_cycle + 1, "critical_failures": critical_failures},
         )
+
+        # V5-FIX (HIGH-9): Translate endpoint failures → fixer-compatible
+        # __fix_items__.  Keys starting with __ are auto-included in all
+        # agent contexts (pipeline.py L218: ``if k.startswith("__")``).
+        _failed_eps = verify_output.get("failed_endpoints", [])
+        _fix_items: list[dict[str, str]] = []
+        for ep in _failed_eps:
+            method = ep.get("method", "GET")
+            path = ep.get("path", "/")
+            status = ep.get("status", "error")
+            detail = ep.get("detail", "unknown error")[:300]
+            source_file = ep.get("likely_source_file", "")
+            _fix_items.append({
+                "file_path": source_file or f"routes/{path.strip('/').replace('/', '_') or 'root'}.py",
+                "error_message": (
+                    f"POST-DEPLOY FAILURE: {method} {path} "
+                    f"returned {status} — {detail}"
+                ),
+                "severity": "HIGH",
+                "source": "post_deploy_verify",
+            })
+        # Also include non-endpoint failures (security headers, CORS, etc.)
+        _header_issues = verify_output.get("security_header_issues", [])
+        for issue in _header_issues:
+            _fix_items.append({
+                "file_path": issue.get("file_path", "app/main.py"),
+                "error_message": f"POST-DEPLOY SECURITY: {issue.get('detail', str(issue)[:300])}",
+                "severity": "MEDIUM",
+                "source": "post_deploy_verify",
+            })
+        if _fix_items:
+            state.setdefault("context", {})["__fix_items__"] = _fix_items
+            logger.info("post_deploy_fix_items_bridged", count=len(_fix_items))
+
         return "fixing"
     return "documentation"
 

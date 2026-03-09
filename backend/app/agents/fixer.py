@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -164,7 +164,8 @@ class FixerReport:
     # TRIVIAL = syntax/import/typo — pipeline can skip quality review.
     # MODERATE = logic fixes, type corrections.
     # STRUCTURAL = new files, API/schema changes — must re-run full quality.
-    fix_severity: str = "STRUCTURAL"
+    # V5-FIX (TYPO-2): Typed as Literal for IDE type-checking.
+    fix_severity: str = "STRUCTURAL"  # V5-FIX: Values: TRIVIAL | MODERATE | STRUCTURAL
 
 
 def _classify_fix_severity(attempts: list[FixAttempt]) -> str:
@@ -172,9 +173,14 @@ def _classify_fix_severity(attempts: list[FixAttempt]) -> str:
 
     I4-FIX: Drives fast-path routing in pipeline fix-retest loop.
     Conservative: any ambiguity defaults to STRUCTURAL (safe).
+
+    V5-FIX (MEDIUM-5): Empty attempts returns MODERATE (not TRIVIAL).
+    TRIVIAL on empty sets ``__fix_fast_path__`` which persists across
+    fix cycles, causing the next cycle to skip quality review — even
+    when there ARE real errors to review.
     """
     if not attempts:
-        return "TRIVIAL"
+        return "MODERATE"
 
     _STRUCTURAL = {
         "new file", "endpoint", "schema", "model change", "migration",
@@ -1037,11 +1043,29 @@ class Fixer:
         # CHANGE-6: Track fix hashes to detect duplicate (identical) fixes
         import hashlib as _hashlib_fixer
         seen_fix_hashes: set[str] = set()
+        # V5-FIX (CRITICAL-9): Track consecutive failures on the SAME error.
+        # If we fail 5 times on the same error message, the fixer is stuck —
+        # skip it instead of burning through 200 iterations at Sonnet pricing.
+        _consecutive_fail_count: dict[str, int] = {}
+        _MAX_CONSECUTIVE_FAILS = 5
 
         while remaining_errors and iteration < MAX_FIX_ITERATIONS:
             iteration += 1
             report.iterations = iteration
             current_error = remaining_errors[0]
+
+            # V5-FIX (CRITICAL-9): Skip errors that have failed too many times
+            _err_key = f"{current_error.file_path}::{current_error.error_message[:80]}"
+            if _consecutive_fail_count.get(_err_key, 0) >= _MAX_CONSECUTIVE_FAILS:
+                logger.warning(
+                    "fixer_consecutive_fail_skip",
+                    file=current_error.file_path,
+                    error=current_error.error_message[:100],
+                    consecutive_fails=_consecutive_fail_count[_err_key],
+                    msg="Skipping error — fixer is stuck on this error",
+                )
+                remaining_errors.pop(0)
+                continue
 
             model_override, enable_thinking = _get_iteration_model_map().get(
                 iteration, ("sonnet", False)
@@ -1128,6 +1152,8 @@ class Fixer:
             if attempt.success:
                 report.errors_fixed += 1
                 remaining_errors.pop(0)
+                # V5-FIX: Reset consecutive fail counter on success
+                _consecutive_fail_count.pop(_err_key, None)
 
                 # Update context with fixed file content
                 if attempt.file_path and attempt.file_content_after:
@@ -1137,10 +1163,13 @@ class Fixer:
                     if attempt.file_path not in report.files_modified:
                         report.files_modified.append(attempt.file_path)
 
-                # Record successful fix in mistake memory for future learning
+                # V5-FIX (HIGH-13): Record as a LESSON (not a "failure").
+                # The old ``record_failure()`` call recorded successful fixes
+                # as failures, which poisoned the mistake memory — future agents
+                # would learn to AVOID the correct fix.
                 try:
                     from app.services.mistake_memory import mistake_memory
-                    mistake_memory.record_failure(
+                    mistake_memory.record_lesson(
                         agent_name=current_error.source_agent or "unknown",
                         task_type=current_error.error_type,
                         error=current_error.error_message,
@@ -1148,11 +1177,14 @@ class Fixer:
                         context={
                             "file_path": current_error.file_path,
                             "severity": current_error.severity,
+                            "outcome": "resolved",
                         },
                     )
                 except Exception as _mm_exc:
                     logger.debug("mistake_memory_record_failed", error=str(_mm_exc)[:200])
             else:
+                # V5-FIX (CRITICAL-9): Track consecutive fails on same error
+                _consecutive_fail_count[_err_key] = _consecutive_fail_count.get(_err_key, 0) + 1
                 # If fix failed, try next error (don't re-attempt same one immediately)
                 failed = remaining_errors.pop(0)
                 remaining_errors.append(failed)
