@@ -1180,13 +1180,44 @@ class Pranav:
             logger.info("deploy_mode", mode="vercel_api", service=config.service_name)
             deploy_mode = "vercel_api"
             try:
-                # Collect all generated files for the Vercel deployment payload
+                # HIGH-5 FIX: Collect files with size guard — Vercel v13 has practical
+                # limits on JSON body size (~100MB hard, but httpx times out on large
+                # payloads). Skip binary/vendor files and cap total payload at 50MB.
+                _MAX_VERCEL_PAYLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+                _MAX_SINGLE_FILE_BYTES = 5 * 1024 * 1024      # 5 MB per file
+                _SKIP_PATTERNS = (
+                    "node_modules/", ".git/", "__pycache__/", ".venv/",
+                    "dist/", "build/", ".next/", "venv/",
+                )
+
                 all_files: list[dict[str, str]] = []
+                _total_size = 0
+                _skipped_files: list[str] = []
                 for agent_name in ("shubham", "aanya"):
                     agent_out = context.get(agent_name, {})
                     if isinstance(agent_out, dict):
                         for fpath, fcontent in agent_out.get("file_contents", {}).items():
+                            # Skip vendor/build directories
+                            if any(pat in fpath for pat in _SKIP_PATTERNS):
+                                _skipped_files.append(fpath)
+                                continue
+                            file_size = len(fcontent.encode("utf-8", errors="replace"))
+                            if file_size > _MAX_SINGLE_FILE_BYTES:
+                                _skipped_files.append(f"{fpath} ({file_size // 1024}KB)")
+                                continue
+                            if _total_size + file_size > _MAX_VERCEL_PAYLOAD_BYTES:
+                                _skipped_files.append(f"{fpath} (would exceed 50MB limit)")
+                                continue
                             all_files.append({"file": fpath, "data": fcontent})
+                            _total_size += file_size
+
+                if _skipped_files:
+                    logger.warning(
+                        "vercel_deploy_files_skipped",
+                        skipped_count=len(_skipped_files),
+                        first_5=_skipped_files[:5],
+                        total_payload_kb=_total_size // 1024,
+                    )
 
                 if all_files:
                     async with httpx.AsyncClient(timeout=120.0) as client:

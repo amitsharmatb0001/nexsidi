@@ -251,7 +251,7 @@ class PipelineRunStatus(str, Enum):
 # PHASE-1: Hardcoded limits removed — replaced by ProgressState safety caps.
 # Old: MAX_FIX_RETEST_CYCLES = 3, MAX_CHALLENGE_RETRIES = 2
 # New: progress.should_continue() checks budget/time/stall.
-from app.services.progress_tracker import ProgressState
+from app.services.progress_tracker import ProgressState, resolve_progress_state
 
 # Stages that are re-run in the fix-retest loop
 FIX_RETEST_STAGES: list[PipelineStage] = [
@@ -2004,14 +2004,13 @@ class PipelineOrchestrator:
                 and self._has_critical_challenges(step_result)
             ):
                 # PHASE-1: Progress-based challenge retry — no hardcoded MAX_CHALLENGE_RETRIES.
-                _challenge_progress = run.context.get("__progress_state__")
-                if _challenge_progress is None:
-                    _challenge_progress = ProgressState()
-                    run.context["__progress_state__"] = _challenge_progress
+                # HIGH-2 FIX: Use resolve_progress_state() for crash-recovery safe serialization.
+                _challenge_progress = resolve_progress_state(run.context)
 
                 _challenge_progress.record_cycle(errors_found=1, errors_fixed=0)
                 if hasattr(self, "_cost_tracker") and self._cost_tracker is not None:
                     _challenge_progress.update_budget(self._cost_tracker.total_cost_usd)
+                run.context["__progress_state__"] = _challenge_progress.to_dict()
 
                 _ch_continue, _ch_reason = _challenge_progress.should_continue()
                 if _ch_continue:
@@ -2087,8 +2086,8 @@ class PipelineOrchestrator:
                 and self._has_errors_to_fix(step_result)
             ):
                 # PHASE-1: Progress-based termination replaces MAX_FIX_RETEST_CYCLES.
-                # Get or create progress tracker for this run.
-                _progress = run.context.setdefault("__progress_state__", ProgressState())
+                # HIGH-2 FIX: Use resolve_progress_state() for crash-recovery safe serialization.
+                _progress = resolve_progress_state(run.context)
                 fixer_output = step_result.result.output or {}
                 _fixed = fixer_output.get("errors_fixed", 0)
                 _remaining = fixer_output.get("errors_remaining", 0)
@@ -2097,6 +2096,7 @@ class PipelineOrchestrator:
                 # Update budget from cost tracker if available
                 if hasattr(self, "_cost_tracker") and self._cost_tracker is not None:
                     _progress.update_budget(self._cost_tracker.total_cost_usd)
+                run.context["__progress_state__"] = _progress.to_dict()
 
                 _should_continue, _stop_reason = _progress.should_continue()
                 if not _should_continue:
@@ -2643,8 +2643,12 @@ class PipelineOrchestrator:
             pass  # Message bus may not be initialized
 
         # PHASE-1: Include progress tracker state
+        # HIGH-2 FIX: Handle both ProgressState object and serialized dict
         _progress = ctx.get("__progress_state__")
-        if _progress and hasattr(_progress, "get_summary"):
+        if isinstance(_progress, dict) and _progress.get("__type__") == "ProgressState":
+            # Already a serialized dict — use it directly (minus the __type__ marker)
+            state["progress"] = {k: v for k, v in _progress.items() if k != "__type__"}
+        elif _progress and hasattr(_progress, "get_summary"):
             state["progress"] = _progress.get_summary()
 
         return state

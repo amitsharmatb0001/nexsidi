@@ -4,21 +4,29 @@ Phase 5B: Enables users to send halt/pivot/feedback commands to the
 pipeline while it's executing. Messages are routed to Tilotma as
 AUTHORITY directives via the encrypted agent message bus.
 
+HIGH-8 FIX: Steering history is now persisted to Valkey (Redis-compatible)
+instead of in-memory dict. This survives worker crashes, restarts, and
+Celery task migrations. TTL is set to pipeline_total_timeout + 1 hour.
+
 The SteeringService:
 - Routes user messages to Tilotma as AUTHORITY directives
 - Handles halt requests (pauses pipeline)
 - Handles pivot requests (stores new direction, triggers re-evaluation)
-- Stores steering history for audit trail
+- Stores steering history in Valkey for audit trail + crash recovery
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+_STEERING_KEY_PREFIX = "nexsidi:steering"
+_DEFAULT_TTL_SECONDS = 7200 + 3600  # pipeline timeout (2h) + 1h buffer
 
 
 class SteeringService:
@@ -41,8 +49,53 @@ class SteeringService:
     """
 
     def __init__(self) -> None:
-        # In-memory history (per run_id)
+        # Fallback in-memory history — used only when Valkey is unavailable
         self._history: dict[str, list[dict[str, Any]]] = {}
+
+    async def _get_valkey(self) -> Any:
+        """Get Valkey client — returns None if unavailable."""
+        try:
+            from app.services.valkey_pool import get_valkey_client
+            return await get_valkey_client()
+        except Exception:
+            return None
+
+    def _key(self, run_id: str) -> str:
+        """Valkey key for a run's steering history."""
+        return f"{_STEERING_KEY_PREFIX}:{run_id}"
+
+    async def _persist_entry(self, run_id: str, entry: dict[str, Any]) -> None:
+        """Persist a steering entry to Valkey (with in-memory fallback)."""
+        redis = await self._get_valkey()
+        if redis:
+            try:
+                key = self._key(run_id)
+                await redis.rpush(key, json.dumps(entry, default=str))
+                await redis.expire(key, _DEFAULT_TTL_SECONDS)
+                return
+            except Exception as exc:
+                logger.warning("steering_valkey_persist_failed", error=str(exc)[:200])
+        # Fallback: in-memory
+        self._history.setdefault(run_id, []).append(entry)
+
+    async def _update_last_entry(self, run_id: str, field: str, value: Any) -> None:
+        """Update the last entry's field in Valkey."""
+        redis = await self._get_valkey()
+        if redis:
+            try:
+                key = self._key(run_id)
+                # Get, modify, set last element
+                raw = await redis.lindex(key, -1)
+                if raw:
+                    entry = json.loads(raw)
+                    entry[field] = value
+                    await redis.lset(key, -1, json.dumps(entry, default=str))
+                    return
+            except Exception as exc:
+                logger.debug("steering_valkey_update_failed", error=str(exc)[:200])
+        # Fallback: in-memory
+        if self._history.get(run_id):
+            self._history[run_id][-1][field] = value
 
     async def send_user_message(
         self,
@@ -68,7 +121,7 @@ class SteeringService:
 
         now = datetime.now(timezone.utc).isoformat()
 
-        # Store in history
+        # Store in history (Valkey-persisted)
         entry = {
             "timestamp": now,
             "user_id": user_id,
@@ -77,7 +130,7 @@ class SteeringService:
             "tilotma_response": None,
         }
 
-        self._history.setdefault(run_id, []).append(entry)
+        await self._persist_entry(run_id, entry)
 
         result: dict[str, Any] = {
             "acknowledged": True,
@@ -94,8 +147,7 @@ class SteeringService:
             result = await self._handle_feedback(run_id, user_id, message)
 
         # Update history entry with response
-        if self._history.get(run_id):
-            self._history[run_id][-1]["tilotma_response"] = result.get("tilotma_response")
+        await self._update_last_entry(run_id, "tilotma_response", result.get("tilotma_response"))
 
         return result
 
@@ -198,7 +250,20 @@ class SteeringService:
             }
 
     async def get_history(self, run_id: str) -> list[dict[str, Any]]:
-        """Get steering message history for a pipeline run."""
+        """Get steering message history for a pipeline run.
+
+        Reads from Valkey first, falls back to in-memory.
+        """
+        redis = await self._get_valkey()
+        if redis:
+            try:
+                key = self._key(run_id)
+                raw_list = await redis.lrange(key, 0, -1)
+                if raw_list:
+                    return [json.loads(item) for item in raw_list]
+            except Exception as exc:
+                logger.debug("steering_valkey_read_failed", error=str(exc)[:200])
+        # Fallback: in-memory
         return self._history.get(run_id, [])
 
 

@@ -137,3 +137,75 @@ class ProgressState:
             "elapsed_seconds": round(time.monotonic() - self.start_time, 1),
             "time_limit_seconds": round(self.time_limit_seconds, 1),
         }
+
+    # ── HIGH-2 FIX: Serialization for crash recovery ─────────────────
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe dict for persistence in pipeline context.
+
+        ``start_time`` is stored as elapsed seconds (monotonic clock is not
+        meaningful across restarts). On restore, ``start_time`` is recalculated
+        from current monotonic minus stored elapsed.
+        """
+        return {
+            "__type__": "ProgressState",
+            "total_errors_found": self.total_errors_found,
+            "total_errors_fixed": self.total_errors_fixed,
+            "fix_rate": self.fix_rate,
+            "last_fix_rate": self.last_fix_rate,
+            "stall_count": self.stall_count,
+            "budget_spent_usd": self.budget_spent_usd,
+            "budget_limit_usd": self.budget_limit_usd,
+            "elapsed_seconds": time.monotonic() - self.start_time,
+            "time_limit_seconds": self.time_limit_seconds,
+            "total_cycles": self.total_cycles,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ProgressState":
+        """Reconstruct ProgressState from a serialized dict.
+
+        Recalculates ``start_time`` so ``elapsed_seconds`` resumes from where
+        the previous instance left off (i.e. time already spent counts).
+        """
+        elapsed = data.get("elapsed_seconds", 0.0)
+        ps = cls(
+            total_errors_found=data.get("total_errors_found", 0),
+            total_errors_fixed=data.get("total_errors_fixed", 0),
+            fix_rate=data.get("fix_rate", 0.0),
+            last_fix_rate=data.get("last_fix_rate", 0.0),
+            stall_count=data.get("stall_count", 0),
+            budget_spent_usd=data.get("budget_spent_usd", 0.0),
+            budget_limit_usd=data.get("budget_limit_usd", 50.0),
+            time_limit_seconds=data.get("time_limit_seconds", 7200.0),
+            total_cycles=data.get("total_cycles", 0),
+        )
+        # Re-anchor start_time so elapsed_seconds picks up from stored value
+        ps.start_time = time.monotonic() - elapsed
+        ps.elapsed_seconds = elapsed
+        return ps
+
+
+def resolve_progress_state(ctx: dict, key: str = "__progress_state__") -> "ProgressState":
+    """Get or create ProgressState from pipeline context.
+
+    Handles three cases:
+      1. Already a ProgressState instance (normal execution)
+      2. A plain dict from JSON deserialization (crash recovery)
+      3. Missing — creates a new one and stores it
+
+    Always stores back as a plain dict for safe JSON serialization.
+    """
+    raw = ctx.get(key)
+
+    if isinstance(raw, ProgressState):
+        return raw
+    if isinstance(raw, dict) and raw.get("__type__") == "ProgressState":
+        ps = ProgressState.from_dict(raw)
+        ctx[key] = ps.to_dict()  # Keep serializable for next persist
+        return ps
+
+    # New — create fresh and store serialized form
+    ps = ProgressState()
+    ctx[key] = ps.to_dict()
+    return ps

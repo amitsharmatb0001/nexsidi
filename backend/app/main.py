@@ -160,6 +160,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
         )
 
+    # HIGH-1 FIX: Validate LangGraph pipeline graph at startup.
+    # If enable_langgraph=True (default) but the graph fails to compile,
+    # fail hard in production — otherwise every pipeline run would crash with
+    # an opaque error inside the worker, not at startup.
+    if settings.enable_langgraph:
+        try:
+            from app.services.pipeline_graph import get_compiled_graph
+            _graph = get_compiled_graph()
+            if _graph is None:
+                raise RuntimeError("get_compiled_graph() returned None")
+            logger.info("langgraph_startup_validated")
+        except Exception as _lg_exc:
+            if settings.is_production:
+                raise RuntimeError(
+                    f"enable_langgraph=True but graph compilation failed: {_lg_exc}. "
+                    "Fix the LangGraph graph or set enable_langgraph=False to use legacy pipeline."
+                ) from _lg_exc
+            logger.warning(
+                "langgraph_startup_validation_failed",
+                error=str(_lg_exc)[:200],
+                hint="LangGraph graph could not compile — pipeline may fall back to legacy.",
+            )
+
     # AI Router (lazy-init, just ensure it's importable)
     _ = get_ai_router()
     logger.info("ai_router_ready")
