@@ -1036,6 +1036,59 @@ class Aanya:
             user_feedback=(user_feedback + _rejection_ctx) if _rejection_ctx else user_feedback,
         )
 
+        # SDD-FIX: Inject Software Design Document context so Aanya sees
+        # the full project scope — user roles (for protected routes/UI),
+        # integrations, and page-level design decisions from the design phase.
+        _sdd = context.get("__sdd__")
+        if _sdd and isinstance(_sdd, dict):
+            _sdd_parts: list[str] = ["\n## Software Design Document — Project Context"]
+            _overview = _sdd.get("project_overview", {})
+            if _overview.get("assumptions"):
+                _sdd_parts.append(
+                    "### Design Assumptions\n"
+                    + "\n".join(f"- {a}" for a in _overview["assumptions"][:10])
+                )
+            _roles = _sdd.get("user_roles", [])
+            if _roles:
+                _role_strs = []
+                for r in _roles[:8]:
+                    if isinstance(r, dict):
+                        _role_strs.append(f"- **{r.get('name', r.get('role', 'user'))}**: {r.get('permissions', r.get('description', ''))}")
+                    else:
+                        _role_strs.append(f"- {r}")
+                _sdd_parts.append("### User Roles & Permissions\n" + "\n".join(_role_strs))
+                _sdd_parts.append(
+                    "**Your frontend MUST implement role-based routing and "
+                    "conditional UI rendering for these roles.**"
+                )
+            _fe = _sdd.get("frontend", {})
+            _pages = _fe.get("pages", [])
+            if _pages:
+                _page_strs = []
+                for p in _pages[:15]:
+                    if isinstance(p, dict):
+                        _page_strs.append(f"- `{p.get('path', p.get('route', '/'))}` — {p.get('name', p.get('description', ''))}")
+                    else:
+                        _page_strs.append(f"- {p}")
+                _sdd_parts.append(
+                    "### SDD Pages (MUST implement ALL)\n" + "\n".join(_page_strs)
+                )
+            _integrations = _sdd.get("integrations", [])
+            if _integrations:
+                _sdd_parts.append(
+                    "### Integrations Required\n"
+                    + "\n".join(f"- {i}" for i in _integrations[:6])
+                )
+            _sec = _sdd.get("security", {})
+            _compliance = _sec.get("compliance_flags", [])
+            if _compliance:
+                _sdd_parts.append(
+                    "### Compliance Requirements\n"
+                    + "\n".join(f"- {c}" for c in _compliance[:5])
+                )
+            if len(_sdd_parts) > 1:  # Has content beyond the header
+                system_prompt += "\n".join(_sdd_parts) + "\n"
+
         # PHASE-3: Check inbox for messages from other agents
         _prev_outputs = {
             "vikram": f"Contract for {contract.get('project_name', 'project')}",

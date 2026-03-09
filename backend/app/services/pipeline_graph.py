@@ -171,12 +171,156 @@ async def ui_design_node(state: PipelineState) -> PipelineState:
 
 
 async def checkpoint_design_node(state: PipelineState) -> PipelineState:
-    """Pause for user approval before build phase (if in CHECKPOINT mode)."""
+    """Compile Software Design Document (SDD) from all design phase outputs.
+
+    SDD-FIX: Previously this was a blank pass-through.  Now it compiles a
+    proper SDD from the outputs of Tilotma (requirements), Saanvi (analysis),
+    Vikram (architecture contract), Challenger (review), Dhruv (database),
+    and Vanya (UI design) — exactly like a real SDLC design checkpoint.
+
+    The SDD is stored in context["__sdd__"] and is available to ALL
+    downstream agents (Shubham, Aanya, Karan, etc.) as the single source
+    of truth for what to build.
+
+    In CHECKPOINT mode, the pipeline pauses here for user review of the SDD.
+    In DIRECT mode, it auto-approves and continues to build.
+    """
+    context = state.get("context", {})
+    run_id = state.get("run_id", "")
+
+    # ── Gather outputs from all design-phase agents ──
+    tilotma_out = context.get("tilotma", {})
+    saanvi_out = context.get("saanvi", {})
+    vikram_out = context.get("vikram", {})
+    challenger_out = context.get("challenger", {})
+    dhruv_out = context.get("dhruv", {})
+    vanya_out = context.get("vanya", {})
+
+    # Vikram's contract is the core architecture spec
+    contract = vikram_out.get("contract", {})
+
+    # ── Compile the SDD ──
+    parsed_req = tilotma_out.get("parsed_requirements", {}) or {}
+
+    sdd: dict[str, Any] = {
+        "__type__": "SoftwareDesignDocument",
+        "version": "1.0",
+        "pipeline_run_id": run_id,
+
+        # Section 1: Project Overview
+        "project_overview": {
+            "title": parsed_req.get("understanding", tilotma_out.get("raw_input", "")[:200]),
+            "project_type": parsed_req.get("project_type", "web_app"),
+            "key_features": parsed_req.get("key_features", []),
+            "user_input": tilotma_out.get("raw_input", "")[:500],
+            "confidence": parsed_req.get("confidence", 0),
+            "assumptions": parsed_req.get("assumptions", []),
+            "capability_validated": tilotma_out.get("capability_validated", False),
+        },
+
+        # Section 2: Market Analysis & Complexity
+        "analysis": {
+            "complexity_score": saanvi_out.get("complexity_score"),
+            "market_analysis": saanvi_out.get("market_analysis", ""),
+            "risk_factors": saanvi_out.get("risk_factors", []),
+            "estimated_effort": saanvi_out.get("estimated_effort"),
+        },
+
+        # Section 3: System Architecture (from Vikram's contract)
+        "architecture": {
+            "tech_stack": contract.get("tech_stack", {}),
+            "system_components": contract.get("system_components", []),
+            "deployment_target": contract.get("deployment", {}),
+            "architecture_review": {
+                "verdict": challenger_out.get("verdict", ""),
+                "has_critical": challenger_out.get("has_critical", False),
+                "findings": challenger_out.get("findings", [])[:10],
+            },
+        },
+
+        # Section 4: Database Design
+        "database": {
+            "tables": contract.get("database", {}).get("tables", []),
+            "relationships": contract.get("database", {}).get("relationships", []),
+            "database_type": dhruv_out.get("database", "postgresql"),
+            "migrations_ready": bool(dhruv_out.get("migrations")),
+            "seed_data_ready": bool(dhruv_out.get("seed_data")),
+            "table_count": dhruv_out.get("table_count", 0),
+        },
+
+        # Section 5: API Specification
+        "api": {
+            "endpoints": contract.get("api", {}).get("endpoints", []),
+            "auth_strategy": contract.get("api", {}).get("auth", {}),
+            "middleware": contract.get("api", {}).get("middleware", []),
+            "endpoint_count": len(contract.get("api", {}).get("endpoints", [])),
+        },
+
+        # Section 6: Frontend Design
+        "frontend": {
+            "pages": contract.get("frontend", {}).get("pages", []),
+            "components": contract.get("frontend", {}).get("components", []),
+            "design_spec": vanya_out.get("design_spec", ""),
+            "design_tokens_validated": vanya_out.get("tokens_validated", False),
+            "page_count": vanya_out.get("page_count", 0),
+        },
+
+        # Section 7: Security & Compliance Requirements
+        "security": {
+            "compliance_flags": tilotma_out.get("compliance_auto_detected", []),
+            "non_functional": parsed_req.get("non_functional", []),
+            "auth_required": bool(contract.get("api", {}).get("auth")),
+        },
+
+        # Section 8: User Roles & Permissions
+        "user_roles": parsed_req.get("user_roles", []),
+
+        # Section 9: Integrations
+        "integrations": parsed_req.get("integrations", []),
+
+        # Section 10: Build Statistics
+        "stats": {
+            "tables": vikram_out.get("stats", {}).get("tables", 0),
+            "endpoints": vikram_out.get("stats", {}).get("endpoints", 0),
+            "pages": vikram_out.get("stats", {}).get("pages", 0),
+            "contract_valid": vikram_out.get("is_valid", False),
+        },
+    }
+
+    # Store SDD in context (accessible to ALL downstream agents)
+    new_context = {**context, "__sdd__": sdd}
+
+    logger.info(
+        "sdd_compiled",
+        run_id=run_id,
+        tables=sdd["stats"]["tables"],
+        endpoints=sdd["stats"]["endpoints"],
+        pages=sdd["stats"]["pages"],
+        project_type=sdd["project_overview"]["project_type"],
+    )
+
+    # Emit SDD event for Live Studio
+    try:
+        from app.services.pipeline_events import publish_agent_thinking_event
+        await publish_agent_thinking_event(
+            run_id, "checkpoint_design", "complete",
+            detail=(
+                f"SDD compiled: {sdd['stats']['tables']} tables, "
+                f"{sdd['stats']['endpoints']} endpoints, "
+                f"{sdd['stats']['pages']} pages — "
+                f"project type: {sdd['project_overview']['project_type']}"
+            ),
+        )
+    except Exception:
+        pass  # Non-fatal
+
+    # ── Checkpoint gate ──
     mode = state.get("execution_mode", "DIRECT")
     if mode == "DIRECT":
-        return {**state, "checkpoint_approved": True}
-    # In CHECKPOINT/STEP_BY_STEP mode, pause and wait for approval
-    return {**state, "status": "paused", "checkpoint_approved": False}
+        return {**state, "context": new_context, "checkpoint_approved": True}
+
+    # In CHECKPOINT/STEP_BY_STEP mode, pause for user review of the SDD
+    return {**state, "context": new_context, "status": "paused", "checkpoint_approved": False}
 
 
 async def backend_build_node(state: PipelineState) -> PipelineState:
