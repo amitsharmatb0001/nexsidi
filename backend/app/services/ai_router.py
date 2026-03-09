@@ -2233,6 +2233,10 @@ class ProjectCostTracker:
     _HARD_CAP_USD: float = float(os.environ.get("PIPELINE_COST_CAP_USD", "50.0"))  # COST-CAP-FIX
     # CHANGE-7: Soft cap ratio for graceful degradation
     _SOFT_CAP_RATIO: float = 0.75  # 75% of hard cap → constrained mode
+    # MVP-FIX: Disable cost tracking entirely for internal use.
+    # Set DISABLE_COST_TRACKING=true to skip cost math + cap enforcement.
+    # Tokens are still counted for observability but costs are $0.
+    _DISABLED: bool = os.environ.get("DISABLE_COST_TRACKING", "").lower() in ("1", "true", "yes")
 
     def __init__(self, pipeline_run_id: str = "") -> None:
         from collections import deque
@@ -2288,14 +2292,20 @@ class ProjectCostTracker:
             if not model_key:
                 model_key = self._resolve_model_key(response.model_used)
 
-            # M5-FIX: Warn on unknown model instead of silently defaulting to sonnet pricing
-            costs = _COST_PER_1K_TOKENS.get(model_key)
-            if costs is None:
-                logger.warning("unknown_model_cost_fallback", model_key=model_key)
-                costs = {"input": 0.003, "output": 0.015}  # sonnet pricing as safe default
-            input_cost = (response.input_tokens / 1000) * costs["input"]
-            output_cost = (response.output_tokens / 1000) * costs["output"]
-            total_cost = input_cost + output_cost
+            # MVP-FIX: Skip cost math when cost tracking disabled
+            if self._DISABLED:
+                input_cost = 0.0
+                output_cost = 0.0
+                total_cost = 0.0
+            else:
+                # M5-FIX: Warn on unknown model instead of silently defaulting to sonnet pricing
+                costs = _COST_PER_1K_TOKENS.get(model_key)
+                if costs is None:
+                    logger.warning("unknown_model_cost_fallback", model_key=model_key)
+                    costs = {"input": 0.003, "output": 0.015}  # sonnet pricing as safe default
+                input_cost = (response.input_tokens / 1000) * costs["input"]
+                output_cost = (response.output_tokens / 1000) * costs["output"]
+                total_cost = input_cost + output_cost
 
             entry = CostEntry(
                 model_key=model_key,
@@ -2315,10 +2325,11 @@ class ProjectCostTracker:
             self._total_call_count += 1
 
             # COST-CAP-FIX: Enforce hard cost cap per pipeline run.
-            if self._total_cost > self._HARD_CAP_USD:  # COST-CAP-FIX
+            # MVP-FIX: Skip cap enforcement when cost tracking disabled.
+            if not self._DISABLED and self._total_cost > self._HARD_CAP_USD:
                 raise PipelineCostLimitError(
                     f"Pipeline cost {self._total_cost:.2f} exceeded cap {self._HARD_CAP_USD:.2f}"
-                )  # COST-CAP-FIX
+                )
 
             # DEFERRED-FIX-17: Update incremental breakdown dicts
             if model_key not in self._per_model:
@@ -2372,7 +2383,10 @@ class ProjectCostTracker:
 
         Estimates cost from model pricing and raises PipelineCostLimitError
         if the estimated call would push total cost over the hard cap.
+        MVP-FIX: No-op when DISABLE_COST_TRACKING=true.
         """
+        if self._DISABLED:
+            return
         costs = _COST_PER_1K_TOKENS.get(model_key)
         if costs is None:
             costs = {"input": 0.003, "output": 0.015}

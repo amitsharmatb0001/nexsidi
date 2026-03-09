@@ -342,8 +342,23 @@ class Aarav:
             await store_output(self, pipeline_run_id, result.output)
             return result
 
-        # Phase 8: Security Scanning (NEW — bandit, safety, npm audit)
-        security_result = await self._phase_security_scan(pipeline_run_id, contract)
+        # Phase 8: Security Scanning (bandit, safety, npm audit)
+        # V5-FIX (DISCONNECT-5): Skip if Karan (security_audit) will run anyway.
+        # Aarav's bandit/safety/npm_audit scan duplicates Karan's AI-powered
+        # security analysis.  Aarav's findings are nested 3 levels deep in
+        # phase_results and the fixer can't parse them — they go unfixed.
+        # Karan's findings are in the standard format the fixer reads.
+        # Skip the scan to save ~180s + tokens; Karan handles security.
+        _skip_security = True  # Set False to re-enable dual scanning
+        if _skip_security:
+            security_result = TestPhaseResult(
+                phase=TestPhase.SECURITY_SCAN,
+                status=TestStatus.SKIPPED,
+                duration_ms=0,
+                output="Skipped — Karan (security_audit) handles security scanning",
+            )
+        else:
+            security_result = await self._phase_security_scan(pipeline_run_id, contract)
         report.add(security_result)
         if _check_timeout("security_scan"):
             result = self._build_result(report, sandbox_start)

@@ -63,7 +63,12 @@ class WhatsAppAccount(Base, UUIDPrimaryKeyMixin, TenantMixin):
         {"schema": "auth"},
     )
 
-    organization_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    # V5-FIX (CRITICAL-5): Add FK to organizations table.  Without this,
+    # WhatsApp rows with deleted org_ids remain as orphans visible to admin
+    # dashboards, leaking PII (phone numbers).  CASCADE ensures cleanup.
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("core.organizations.id", ondelete="CASCADE"), nullable=False,
+    )
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("auth.users.id", ondelete="CASCADE"), nullable=False
     )

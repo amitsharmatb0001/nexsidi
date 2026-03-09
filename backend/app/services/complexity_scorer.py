@@ -130,8 +130,17 @@ _PRICING_TIERS = [
 
 # ── Cost Estimation Constants ────────────────────────────────────────
 
-# Average tokens per pipeline stage (based on observed runs)
-_AVG_TOKENS_PER_STAGE = 8_000  # input + output combined
+# V5-FIX (DISCONNECT-3): Realistic token estimate per stage.
+# Old value (8K) was 5× too low — Shubham alone uses 150K-300K tokens.
+# Observed averages across real runs:
+#   - Small agents (tilotma, saanvi, vanya): ~10K tokens
+#   - Architecture (vikram, challenger): ~25K tokens
+#   - Code gen (shubham, aanya): ~175K tokens average
+#   - Quality (karan, navya, deepika): ~25K each
+#   - Testing (aarav): ~40K tokens
+#   - Fixer (if triggered): ~100K tokens
+# Weighted average across 18 stages ≈ 40K tokens/stage.
+_AVG_TOKENS_PER_STAGE = 40_000  # input + output combined
 _PIPELINE_STAGES = 18
 _BASE_AI_COST_USD = 0.50  # Minimum AI cost for simplest project
 

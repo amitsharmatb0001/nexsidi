@@ -46,7 +46,11 @@ def register_all_agents() -> int:
         "app.agents.docs_agent",
         "app.agents.git_agent",
         "app.agents.whatsapp_agent",
-        "app.agents.support_agent",
+        # V5-FIX (DISCONNECT-2): support_agent is registered but never wired
+        # into any pipeline stage.  No stage produces "support_requests" context.
+        # It wastes import time + LLM context.  Re-enable when support ticket
+        # pipeline is implemented.
+        # "app.agents.support_agent",
         "app.agents.security_guardian",
         "app.agents.system_monitor",
     ]

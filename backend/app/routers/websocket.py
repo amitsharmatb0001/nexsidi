@@ -213,8 +213,48 @@ _MAX_PRE_AUTH_CONNECTIONS = 100
 _pre_auth_semaphore: asyncio.Semaphore | None = None
 
 
+async def _try_valkey_pre_auth_limit() -> bool | None:
+    """V5-FIX (MEDIUM-4): Cluster-wide pre-auth limit via Valkey.
+
+    Returns True (allowed), False (rejected), or None (Valkey unavailable).
+    Without this, the per-process semaphore allows ``100 × workers`` total
+    pre-auth connections cluster-wide.  An attacker targeting 4 workers
+    can hold 400 unauthenticated connections.  This Valkey counter is
+    shared across all pods/workers.
+    """
+    try:
+        from app.services.valkey_pool import get_valkey_client
+        client = await get_valkey_client()
+        if client is None:
+            return None
+        key = "nexsidi:ws:pre_auth_count"
+        count = await client.incr(key)
+        # Auto-expire in case of process crash (leaked counters)
+        await client.expire(key, 120)
+        if count > _MAX_PRE_AUTH_CONNECTIONS:
+            await client.decr(key)
+            return False
+        return True
+    except Exception:
+        return None  # Valkey down — fall back to local semaphore
+
+
+async def _release_valkey_pre_auth() -> None:
+    """Decrement cluster-wide pre-auth counter."""
+    try:
+        from app.services.valkey_pool import get_valkey_client
+        client = await get_valkey_client()
+        if client:
+            await client.decr("nexsidi:ws:pre_auth_count")
+    except Exception:
+        pass  # Best-effort; TTL will clean up
+
+
 def _get_pre_auth_semaphore() -> asyncio.Semaphore:
-    """Get or create the pre-auth connection semaphore (lazy init)."""
+    """Get or create the pre-auth connection semaphore (lazy init).
+
+    Process-local fallback when Valkey is unavailable.
+    """
     global _pre_auth_semaphore
     if _pre_auth_semaphore is None:
         _pre_auth_semaphore = asyncio.Semaphore(_MAX_PRE_AUTH_CONNECTIONS)
@@ -285,15 +325,27 @@ async def pipeline_websocket(
     # exhausted, close with rejection code after accept.
     await websocket.accept()
 
-    # Acquire semaphore slot, release after auth completes.
+    # V5-FIX (MEDIUM-4): Try cluster-wide Valkey limit first, fall back
+    # to process-local semaphore if Valkey is unavailable.
+    _valkey_acquired = False
     acquired = False
     try:
-        try:
-            await asyncio.wait_for(_get_pre_auth_semaphore().acquire(), timeout=0.01)
-            acquired = True
-        except asyncio.TimeoutError:
+        _vresult = await _try_valkey_pre_auth_limit()
+        if _vresult is False:
+            # Cluster-wide limit reached
             await websocket.close(code=4029, reason="Too many pending connections")
             return
+        _valkey_acquired = _vresult is True
+        if not _valkey_acquired:
+            # Valkey unavailable — fall back to local semaphore
+            try:
+                await asyncio.wait_for(_get_pre_auth_semaphore().acquire(), timeout=0.01)
+                acquired = True
+            except asyncio.TimeoutError:
+                await websocket.close(code=4029, reason="Too many pending connections")
+                return
+        else:
+            acquired = True  # Valkey-backed slot acquired
 
         # Determine auth source: query param (deprecated) or first message (new)
         claims: dict[str, str] | None = None
@@ -344,7 +396,10 @@ async def pipeline_websocket(
             claims = await _validate_ws_token(auth_msg["token"])
     finally:
         if acquired:
-            _get_pre_auth_semaphore().release()
+            if _valkey_acquired:
+                await _release_valkey_pre_auth()
+            else:
+                _get_pre_auth_semaphore().release()
 
     if claims is None:
         await websocket.close(code=4001, reason="Invalid token")

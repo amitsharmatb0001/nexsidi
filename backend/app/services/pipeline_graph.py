@@ -453,6 +453,19 @@ async def post_deploy_verify_node(state: PipelineState) -> PipelineState:
         vikram_output = context.get("vikram", {})
         contract_endpoints = vikram_output.get("endpoints", [])
 
+        # V5-FIX (DISCONNECT-4): Also verify Shubham-generated routes.
+        # Shubham (agentic backend builder) can create utility routes,
+        # health endpoints, webhooks, and admin routes beyond Vikram's
+        # contract.  Without this, broken extra routes are never caught
+        # and customers discover 500s in production.
+        shubham_output = context.get("shubham", {})
+        if isinstance(shubham_output, dict):
+            extra_endpoints = shubham_output.get("additional_endpoints", [])
+            # Also check generated_routes if available
+            extra_endpoints += shubham_output.get("generated_routes", [])
+            if extra_endpoints:
+                contract_endpoints = list(contract_endpoints) + extra_endpoints
+
         report = await verifier.verify_all_endpoints(deployment_url, contract_endpoints)
 
         new_context = {**context, "post_deploy_verify": report}

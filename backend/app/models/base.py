@@ -30,13 +30,21 @@ def _utcnow() -> datetime:
 
 
 class UUIDPrimaryKeyMixin:
-    """UUID primary key with server-side default."""
+    """UUID primary key with Python-side default.
+
+    V5-FIX (CRITICAL-6): Removed ``server_default=func.gen_random_uuid()``.
+    Having BOTH ``default`` (Python) and ``server_default`` (DB) meant:
+    - ORM inserts use Python ``uuid.uuid4()`` (correct)
+    - Raw SQL / Alembic bulk inserts used DB ``gen_random_uuid()``
+    - Two different UUID generators → no single audit trail
+    Python-side ``default=uuid.uuid4`` is canonical.  Alembic migrations
+    should always provide explicit IDs.
+    """
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid,
         primary_key=True,
         default=uuid.uuid4,
-        server_default=func.gen_random_uuid(),
     )
 
 
