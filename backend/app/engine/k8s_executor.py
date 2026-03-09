@@ -1044,16 +1044,25 @@ class DevBoxExecutor(KubernetesExecutor):
                 namespace=namespace, body=deployment,
             )
 
-            # 5. Create Service for external access
+            # 5. Create Service for EXTERNAL access
+            # DEVBOX-FIX: Changed from ClusterIP to LoadBalancer so users
+            # get a real external IP they can access from their browser.
+            # GKE provisions a Google Cloud Load Balancer automatically (~60s).
             service = k8s.V1Service(
-                metadata=k8s.V1ObjectMeta(name=service_name),
+                metadata=k8s.V1ObjectMeta(
+                    name=service_name,
+                    annotations={
+                        # GKE annotation: use regional external LB (same region as cluster)
+                        "networking.gke.io/load-balancer-type": "External",
+                    },
+                ),
                 spec=k8s.V1ServiceSpec(
                     selector={"app": "nexsidi-devbox", "devbox-id": safe_id},
                     ports=[
                         k8s.V1ServicePort(name="backend", port=8000, target_port=8000),
                         k8s.V1ServicePort(name="frontend", port=3000, target_port=3000),
                     ],
-                    type="ClusterIP",
+                    type="LoadBalancer",
                 ),
             )
             await core_v1.create_namespaced_service(
@@ -1117,14 +1126,31 @@ class DevBoxExecutor(KubernetesExecutor):
                         container_statuses = pod.status.container_statuses or []
                         all_ready = all(cs.ready for cs in container_statuses)
                         if all_ready:
-                            state.service_url = (
-                                f"http://{state.service_name}.{state.namespace}.svc.cluster.local"
+                            # DEVBOX-FIX: Get the REAL external IP from the
+                            # LoadBalancer Service instead of internal cluster URL.
+                            external_ip = await self._wait_for_external_ip(
+                                core_v1, state.namespace, state.service_name,
+                                timeout_seconds=120,
                             )
+                            if external_ip:
+                                state.service_url = f"http://{external_ip}"
+                            else:
+                                # Fallback to internal URL if LB not ready
+                                state.service_url = (
+                                    f"http://{state.service_name}.{state.namespace}"
+                                    f".svc.cluster.local"
+                                )
+                                logger.warning(
+                                    "devbox_external_ip_unavailable",
+                                    devbox_id=devbox_id,
+                                    fallback=state.service_url,
+                                )
                             state.status = "running"
                             logger.info(
                                 "devbox_started",
                                 devbox_id=devbox_id,
                                 service_url=state.service_url,
+                                has_external_ip=bool(external_ip),
                             )
                             return True
 
@@ -1144,6 +1170,61 @@ class DevBoxExecutor(KubernetesExecutor):
             state.status = "failed"
             logger.error("devbox_start_failed", error=str(exc)[:300])
             return False
+
+    async def _wait_for_external_ip(
+        self,
+        core_v1: Any,
+        namespace: str,
+        service_name: str,
+        timeout_seconds: int = 120,
+    ) -> str:
+        """Poll the LoadBalancer Service until GKE assigns an external IP.
+
+        GKE typically provisions a regional external LB in ~30-60s.
+        Returns the external IP string, or empty string on timeout.
+        """
+        poll_interval = 5  # seconds between checks
+        max_attempts = timeout_seconds // poll_interval
+
+        for attempt in range(max_attempts):
+            try:
+                svc = await core_v1.read_namespaced_service(
+                    name=service_name, namespace=namespace,
+                )
+                ingress = (
+                    svc.status
+                    and svc.status.load_balancer
+                    and svc.status.load_balancer.ingress
+                )
+                if ingress:
+                    # GKE provides .ip; some cloud providers use .hostname
+                    ip = ingress[0].ip or ingress[0].hostname or ""
+                    if ip:
+                        logger.info(
+                            "devbox_external_ip_assigned",
+                            service=service_name,
+                            namespace=namespace,
+                            external_ip=ip,
+                            attempts=attempt + 1,
+                            elapsed_seconds=(attempt + 1) * poll_interval,
+                        )
+                        return ip
+            except Exception as exc:
+                logger.debug(
+                    "devbox_external_ip_poll_error",
+                    attempt=attempt + 1,
+                    error=str(exc)[:200],
+                )
+
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(
+            "devbox_external_ip_timeout",
+            service=service_name,
+            namespace=namespace,
+            timeout_seconds=timeout_seconds,
+        )
+        return ""
 
     def get_devbox_url(self, devbox_id: str) -> str | None:
         """Return the Service endpoint URL for a running DevBox."""

@@ -170,7 +170,7 @@ class Settings(BaseSettings):
     message_encryption_key: str = ""
 
     # --- Phase 2A: Cloud DevBox ---
-    devbox_enabled: bool = False
+    devbox_enabled: bool = True
     devbox_default_ttl_hours: int = 24
     devbox_max_per_user: int = 1
     devbox_image: str = "nexsidi/devbox:latest"
