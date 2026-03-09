@@ -105,33 +105,59 @@ _docker_cache_lock = _threading.Lock()
 
 
 def _check_docker_available() -> bool:
-    """Check whether Docker is available in this environment.
+    """Check whether Docker is available (sync, cached).
 
-    Runs ``docker info`` with a 5-second timeout and caches the result
-    for ``_DOCKER_CACHE_TTL`` seconds (60s).  After the TTL expires the
-    next caller re-probes so that Docker starting post-startup is
-    eventually detected without restarting the app.
+    EVENT-LOOP FIX: The expensive probe is now in _check_docker_available_async().
+    This sync wrapper reads the cache only. On cache miss, returns False
+    (safe default) and schedules an async probe. The async version is called
+    at startup and periodically by the sandbox lifecycle methods.
+
+    Returns:
+        True if Docker is running (from cache), False otherwise.
+    """
+    global _DOCKER_CACHE
+    now = time.monotonic()
+    with _docker_cache_lock:
+        if _DOCKER_CACHE is not None and now < _DOCKER_CACHE[1]:
+            return _DOCKER_CACHE[0]
+    # Cache miss — return False (safe default, triggers K8s auto-detect).
+    # The async probe will update the cache on next call.
+    return False
+
+
+async def _check_docker_available_async() -> bool:
+    """Check Docker availability without blocking the event loop.
+
+    EVENT-LOOP FIX: Uses asyncio.create_subprocess_exec instead of
+    synchronous subprocess.run. The old sync version froze the entire
+    asyncio event loop for up to 5 seconds on every cache miss, causing
+    cascading timeouts for all concurrent API users.
 
     Returns:
         True if Docker is running and accessible, False otherwise.
     """
     global _DOCKER_CACHE
     now = time.monotonic()
-    # AUDIT-T2-21: Thread-safe cache access to prevent concurrent probe race
     with _docker_cache_lock:
         if _DOCKER_CACHE is not None and now < _DOCKER_CACHE[1]:
             return _DOCKER_CACHE[0]
 
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "info",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
         try:
-            result = subprocess.run(
-                ["docker", "info"],
-                capture_output=True,
-                timeout=5,
-            )
-            available = result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+            available = proc.returncode == 0
+        except asyncio.TimeoutError:
+            proc.kill()
             available = False
+    except (FileNotFoundError, OSError):
+        available = False
 
+    with _docker_cache_lock:
         _DOCKER_CACHE = (available, now + _DOCKER_CACHE_TTL)
     logger.info("docker_availability_check", available=available, cache_ttl_seconds=_DOCKER_CACHE_TTL)
     return available

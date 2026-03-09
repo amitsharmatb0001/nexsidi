@@ -81,41 +81,74 @@ class AgentDeadlockDetected(Exception):
 class _AskTracker:
     """Tracks active ask_agent relationships to detect deadlock cycles.
 
-    Maintains a directed graph: asking_agent -> target_agent.
-    Before each ask, checks if adding the edge would create a cycle.
-    Thread-safe via a simple lock (low contention -- ask() is rare).
+    DISTRIBUTED-FIX: Uses Valkey Hash instead of in-memory dict.
+    All workers share the same tracker via Valkey, so cross-worker
+    deadlocks (A on Worker 1 asks B on Worker 2 which asks A) are detected.
+
+    Key: nexsidi:ask_tracker:{pipeline_run_id}
+    Fields: from_agent -> to_agent
+    TTL: 300s (same as default ask timeout)
     """
 
-    def __init__(self) -> None:
-        self._lock = _threading.Lock()
-        self._active: dict[str, str] = {}  # from_agent -> to_agent
+    _KEY_PREFIX = "nexsidi:ask_tracker"
+    _TTL_SECONDS = 300
 
-    def register_ask(self, from_agent: str, to_agent: str) -> None:
-        """Register an ask. Raises AgentDeadlockDetected if cycle detected."""
-        with self._lock:
-            visited: set[str] = {from_agent}
-            current = to_agent
-            while current in self._active:
-                if current in visited:
-                    cycle = self._build_cycle_path(from_agent, to_agent)
-                    raise AgentDeadlockDetected(
-                        f"Deadlock detected: {' -> '.join(cycle)}"
-                    )
-                visited.add(current)
-                current = self._active[current]
-            self._active[from_agent] = to_agent
+    async def register_ask(
+        self, from_agent: str, to_agent: str,
+        pipeline_run_id: str, redis_client: Any,
+    ) -> None:
+        """Register an ask in Valkey. Raises AgentDeadlockDetected if cycle detected."""
+        if redis_client is None:
+            return  # Degrade gracefully if Valkey unavailable
 
-    def release_ask(self, from_agent: str) -> None:
-        """Release an active ask (call in finally block)."""
-        with self._lock:
-            self._active.pop(from_agent, None)
+        key = f"{self._KEY_PREFIX}:{pipeline_run_id}"
 
-    def _build_cycle_path(self, from_a: str, to_a: str) -> list[str]:
+        # Get all current ask edges from Valkey (distributed state)
+        raw_active: dict[bytes | str, bytes | str] = await redis_client.hgetall(key)
+        active: dict[str, str] = {
+            (k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v)
+            for k, v in raw_active.items()
+        }
+
+        # Check for cycle: follow the chain from to_agent
+        visited: set[str] = {from_agent}
+        current = to_agent
+        while current in active:
+            if current in visited:
+                cycle = self._build_cycle_path(active, from_agent, to_agent)
+                raise AgentDeadlockDetected(
+                    f"Deadlock detected: {' -> '.join(cycle)}"
+                )
+            visited.add(current)
+            current = active[current]
+
+        # No cycle — register in Valkey
+        await redis_client.hset(key, from_agent, to_agent)
+        await redis_client.expire(key, self._TTL_SECONDS)
+
+    async def release_ask(
+        self, from_agent: str, pipeline_run_id: str, redis_client: Any,
+    ) -> None:
+        """Release an active ask from Valkey (call in finally block)."""
+        if redis_client is None:
+            return
+        key = f"{self._KEY_PREFIX}:{pipeline_run_id}"
+        try:
+            await redis_client.hdel(key, from_agent)
+        except Exception:
+            pass  # Non-critical — TTL will clean up
+
+    @staticmethod
+    def _build_cycle_path(
+        active: dict[str, str], from_a: str, to_a: str,
+    ) -> list[str]:
         path = [from_a, to_a]
         current = to_a
-        while self._active.get(current) != from_a:
-            current = self._active[current]
+        safety = 0
+        while active.get(current) != from_a and safety < 50:
+            current = active[current]
             path.append(current)
+            safety += 1
         path.append(from_a)
         return path
 
@@ -377,8 +410,11 @@ class AgentMessageBus:
         # Deadlock prevention: register this ask and check for cycles
         # before blocking on BLPOP. If A is waiting on B and B tries to
         # ask A, the tracker detects the cycle and raises immediately.
+        # DISTRIBUTED-FIX: Now uses Valkey so cross-worker cycles are detected.
         try:
-            _ask_tracker.register_ask(from_agent, to_agent)
+            await _ask_tracker.register_ask(
+                from_agent, to_agent, pipeline_run_id, self._redis,
+            )
         except AgentDeadlockDetected as exc:
             self._logger.error(
                 "agent_deadlock_detected",
@@ -453,7 +489,7 @@ class AgentMessageBus:
             )
             return answer_text
         finally:
-            _ask_tracker.release_ask(from_agent)
+            await _ask_tracker.release_ask(from_agent, pipeline_run_id, self._redis)
 
     async def answer(
         self,

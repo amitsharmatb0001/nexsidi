@@ -237,12 +237,26 @@ class DeliveryEngine:
                 if user_guide:
                     zf.writestr(f"{project_name}/docs/user_guide.md", user_guide)
 
-            # F4-FIX: Blocklist scan before packaging
+            # F4-FIX + HIGH-7 FIX: Blocklist scan before packaging.
+            # HIGH-7: Now BLOCKS delivery when dangerous patterns found,
+            # instead of just logging a warning and handing malicious code
+            # to the customer. This is the last safety gate.
             blocklist_findings = self._scan_for_dangerous_patterns(context)
             if blocklist_findings:
                 blocklist_json = orjson.dumps(blocklist_findings, option=orjson.OPT_INDENT_2).decode("utf-8")
                 zf.writestr(f"{project_name}/reports/blocklist_scan.json", blocklist_json)
                 manifest.report_files += 1
+
+                # HIGH-7 FIX: Block delivery — dangerous code must not reach customers.
+                finding_summary = ", ".join(
+                    f"{f['file']}:{f.get('line', '?')} ({f.get('description', 'dangerous pattern')[:60]})"
+                    for f in blocklist_findings[:5]
+                )
+                raise RuntimeError(
+                    f"DELIVERY BLOCKED: {len(blocklist_findings)} dangerous pattern(s) "
+                    f"detected in generated code. First findings: {finding_summary}. "
+                    f"Review reports/blocklist_scan.json. Route back to Fixer."
+                )
 
             # DELIVERY-FIX: Add prominent warning file when stages were simulated
             if is_simulation:

@@ -67,7 +67,8 @@ def _get_railway_api_url() -> str:
         from app.config import get_settings
         return get_settings().railway_api_url
     except Exception:
-        return _get_railway_api_url()
+        # CRITICAL-2 FIX: Was calling itself recursively → stack overflow.
+        return "https://backboard.railway.app/graphql/v2"
 
 
 def _get_vercel_api_base() -> str:
@@ -1075,7 +1076,83 @@ class Pranav:
                 if resp.status_code == 200:
                     data = resp.json()
                     if "errors" not in data:
-                        deployment_url = _generate_deployment_url(config)
+                        # CRITICAL-1 FIX: Poll Railway for real deployment URL
+                        # instead of inventing one with _generate_deployment_url().
+                        # The serviceInstanceDeploy mutation returns {id, status}
+                        # but NOT the URL. We query the service for its domain.
+                        deploy_id = ""
+                        try:
+                            deploy_data = data.get("data", {}).get("serviceInstanceDeploy", {})
+                            deploy_id = deploy_data.get("id", "")
+                        except (AttributeError, TypeError):
+                            pass
+
+                        real_url = ""
+                        if deploy_id:
+                            # Poll for deployment URL via service domains query
+                            domain_query = (
+                                "query ServiceDomains($serviceId: String!) {"
+                                "  service(id: $serviceId) {"
+                                "    deployments(first: 1) {"
+                                "      edges { node { staticUrl status } }"
+                                "    }"
+                                "  }"
+                                "}"
+                            )
+                            for _poll in range(24):  # 24 × 5s = 120s max
+                                await asyncio.sleep(5)
+                                try:
+                                    poll_resp = await client.post(
+                                        _get_railway_api_url(),
+                                        headers={
+                                            "Authorization": f"Bearer {railway_token}",
+                                            "Content-Type": "application/json",
+                                        },
+                                        json={
+                                            "query": domain_query,
+                                            "variables": {"serviceId": config.service_name},
+                                        },
+                                    )
+                                    if poll_resp.status_code == 200:
+                                        poll_data = poll_resp.json()
+                                        edges = (
+                                            poll_data.get("data", {})
+                                            .get("service", {})
+                                            .get("deployments", {})
+                                            .get("edges", [])
+                                        )
+                                        if edges:
+                                            node = edges[0].get("node", {})
+                                            static_url = node.get("staticUrl", "")
+                                            deploy_status = node.get("status", "")
+                                            if static_url:
+                                                real_url = (
+                                                    f"https://{static_url}"
+                                                    if not static_url.startswith("https://")
+                                                    else static_url
+                                                )
+                                                break
+                                            if deploy_status in ("FAILED", "CRASHED", "REMOVED"):
+                                                logger.warning(
+                                                    "railway_deploy_failed",
+                                                    status=deploy_status,
+                                                    deploy_id=deploy_id,
+                                                )
+                                                break
+                                except Exception as _poll_exc:
+                                    logger.debug("railway_poll_error", error=str(_poll_exc)[:100])
+
+                        if real_url:
+                            deployment_url = real_url
+                        else:
+                            # Fallback: use generated URL but mark as unverified
+                            deployment_url = _generate_deployment_url(config)
+                            logger.warning(
+                                "railway_graphql_url_unverified",
+                                url=deployment_url,
+                                reason="Could not fetch real URL from Railway API. "
+                                       "Using generated URL — may not match actual domain.",
+                            )
                         deploy_log = f"Railway GraphQL deploy triggered: {data}"
                         deploy_mode = "railway_graphql"
                     else:

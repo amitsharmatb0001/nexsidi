@@ -637,6 +637,13 @@ async def run_agent(
 
         return result
 
+    except AgentInterruptRequest:
+        # CONTROL-FLOW FIX: Re-raise AgentInterruptRequest so the pipeline's
+        # handler in _execute_agent_stage() can catch it for dynamic re-dispatch.
+        # Previously the generic `except Exception` below swallowed it, marking
+        # the agent as FAILED instead of triggering the interrupt handler.
+        raise
+
     except Exception as exc:
         completed_at = time.monotonic()
         # R11-FIX: Sanitize exception before logging/storing.

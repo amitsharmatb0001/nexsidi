@@ -2065,9 +2065,12 @@ class PipelineOrchestrator:
                             if isinstance(agent_ctx, dict) and "file_contents" in agent_ctx:
                                 merged = 0
                                 for path, content in patched.items():
-                                    if path in agent_ctx["file_contents"]:
-                                        agent_ctx["file_contents"][path] = content
-                                        merged += 1
+                                    # HIGH-3 FIX: Merge ALL files, not just existing.
+                                    # Previously skipped new files Fixer created
+                                    # (e.g., missing auth/dependencies.py, new migrations).
+                                    # New files never reached Pranav's deployment.
+                                    agent_ctx["file_contents"][path] = content
+                                    merged += 1
                                 if merged:
                                     logger.info(
                                         "fixer_context_merge",
@@ -2773,15 +2776,25 @@ class PipelineOrchestrator:
     async def _check_steering_halt(self, run: PipelineRun) -> bool:
         """Check if a user steering halt request exists for this run.
 
+        CRITICAL-3 FIX: Previously checked if ANY historical halt existed,
+        which meant a resumed pipeline would immediately re-halt because
+        the old halt message was still in history. Now tracks the last
+        processed halt index in run.context so each halt is consumed once.
+
         Returns True if the pipeline should halt at the next safe point.
         """
         try:
             from app.services.steering_service import get_steering_service
             steer_svc = get_steering_service()
             history = await steer_svc.get_history(run.run_id)
-            # Check for any unprocessed halt requests
-            for msg in reversed(history):
-                if msg.get("action") == "halt":
+
+            # Track which halt messages we've already processed
+            last_processed_idx = run.context.get("__processed_halt_idx__", -1)
+
+            for i, msg in enumerate(history):
+                if msg.get("action") == "halt" and i > last_processed_idx:
+                    # Found an unprocessed halt — mark it as consumed
+                    run.context["__processed_halt_idx__"] = i
                     return True
         except Exception:
             pass  # Steering service failure must not halt the pipeline
@@ -3603,9 +3616,16 @@ class PipelineOrchestrator:
         }
 
         # Re-run the target agent
+        # HIGH-6 FIX: Add timeout to prevent infinite hang. Without this,
+        # a hung target agent blocks the pipeline forever (holding locks,
+        # Valkey distributed lock, Celery worker).
         try:
             target_agent = get_agent(interrupt.target_agent)
-            target_result = await target_agent.run(run.run_id, run.context)
+            _interrupt_timeout = getattr(get_settings(), "pipeline_stage_timeout_seconds", 300)
+            target_result = await asyncio.wait_for(
+                target_agent.run(run.run_id, run.context),
+                timeout=float(_interrupt_timeout),
+            )
 
             if target_result.status == AgentStatus.COMPLETED and target_result.output:
                 run.context[interrupt.target_agent] = target_result.output

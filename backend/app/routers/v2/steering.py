@@ -4,6 +4,7 @@ Endpoints for mid-flight user steering during pipeline generation.
 Users can halt, pivot, or send feedback to Tilotma via these endpoints.
 
 Phase 5B: Full implementation with SteeringService integration.
+CRITICAL-4 FIX: Replaced placeholder auth with real CurrentContext dependency.
 """
 
 from __future__ import annotations
@@ -11,8 +12,10 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
+from app.dependencies import CurrentContext
 
 logger = structlog.get_logger(__name__)
 
@@ -39,16 +42,11 @@ class SteerResponse(BaseModel):
     pipeline_status: str | None = None
 
 
-def _get_current_user_id() -> str:
-    """Placeholder — replaced by real auth dependency."""
-    raise HTTPException(status_code=401, detail="Authentication required")
-
-
 @router.post("/pipeline/{run_id}/steer", response_model=SteerResponse)
 async def steer_pipeline(
     run_id: str,
     request: SteerRequest,
-    user_id: str = Depends(_get_current_user_id),
+    ctx: CurrentContext,
 ) -> SteerResponse:
     """Send a steering command to a running pipeline.
 
@@ -63,7 +61,7 @@ async def steer_pipeline(
         service = get_steering_service()
         result = await service.send_user_message(
             run_id=run_id,
-            user_id=user_id,
+            user_id=ctx.user_id,
             message=request.message,
             action=request.action,
         )
@@ -84,7 +82,7 @@ async def steer_pipeline(
 @router.get("/pipeline/{run_id}/steering-history")
 async def get_steering_history(
     run_id: str,
-    user_id: str = Depends(_get_current_user_id),
+    ctx: CurrentContext,
 ) -> dict[str, Any]:
     """Get the steering message history for a pipeline run."""
     try:
