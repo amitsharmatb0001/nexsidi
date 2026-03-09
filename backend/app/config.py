@@ -208,6 +208,10 @@ class Settings(BaseSettings):
 
     enable_batch_quality_gates: bool = False  # Anthropic Batch API for quality gates
 
+    # HIGH-1 FIX: Disable self-coder in v1. Agents modifying their own source
+    # at runtime is appropriate after 10+ successful real-world projects, not v1.
+    enable_self_coder: bool = False
+
     # --- Celery Task Queue ---
     # When use_celery=True, pipeline runs dispatch to Celery workers instead
     # of in-process asyncio.create_task(). Enables horizontal scaling.

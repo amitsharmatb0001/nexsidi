@@ -119,6 +119,7 @@ class PlannerAgent:
         completed_stages: list[str],
         failed_stages: list[str],
         last_result: dict[str, Any] | None = None,
+        failure_history: list[dict[str, Any]] | None = None,
     ) -> PlannerDecision:
         """Decide what stage(s) to run next.
 
@@ -127,6 +128,9 @@ class PlannerAgent:
             completed_stages: Stages already completed successfully.
             failed_stages: Stages that failed.
             last_result: Output from the most recently completed stage.
+            failure_history: HIGH-4 FIX — list of failure dicts with stage,
+                agent, attempt count, and reason.  Allows the planner to
+                reason about *why* a stage failed, not just *that* it failed.
 
         Returns:
             PlannerDecision with next actions.
@@ -233,9 +237,27 @@ class PlannerAgent:
         if api_issues:
             state_summary += f"API contract mismatches: {api_issues}\n"
 
+        # HIGH-4 FIX: Include failure history so the planner can reason about
+        # *why* stages failed, not just *that* they failed.
+        _failure_block = ""
+        if failure_history:
+            _lines = [
+                f"- {f.get('stage', '?')} failed "
+                f"(attempt {f.get('attempt', '?')}): "
+                f"{str(f.get('reason', 'unknown'))[:150]}"
+                for f in failure_history[-5:]  # Last 5 failures max
+            ]
+            _failure_block = (
+                "\nRecent failure history:\n"
+                + "\n".join(_lines) + "\n"
+                "If a stage has failed 2+ times for the same reason, "
+                "investigate the root cause before retrying.\n"
+            )
+
         prompt = (
             "You are a pipeline planner for a code generation system.\n"
             f"{state_summary}\n"
+            f"{_failure_block}"
             "Rules:\n"
             "- testing and security_audit are MANDATORY (never skip)\n"
             "- Stages with satisfied dependencies can run in parallel\n"

@@ -103,6 +103,7 @@ class DeployStatus(str, Enum):
     DEPLOYING = "deploying"
     VERIFYING = "verifying"
     LIVE = "live"
+    SIMULATED = "simulated"  # CRITICAL-1 FIX: distinct from LIVE — URL is invented
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
 
@@ -1246,8 +1247,15 @@ class Pranav:
         # results are actually stored in output["smoke_tests"]. Running them here
         # too was pure waste — the results were logged and discarded.
 
+        _is_sim = deploy_mode == "simulation"
         return DeployResult(
-            status=DeployStatus.LIVE if health_passed else DeployStatus.FAILED,
+            status=(
+                DeployStatus.LIVE
+                if health_passed and not _is_sim
+                else DeployStatus.FAILED
+                if not health_passed and not _is_sim
+                else DeployStatus.SIMULATED  # CRITICAL-1 FIX: never report sim as LIVE
+            ),
             provider=config.provider,
             provider_name=config.provider_name,
             deployment_url=deployment_url,
@@ -1255,7 +1263,7 @@ class Pranav:
             deploy_log=deploy_log,
             health_check_passed=health_passed,
             duration_seconds=elapsed,
-            is_simulation=(deploy_mode == "simulation"),
+            is_simulation=_is_sim,
         )
 
     # ── AI-driven deployment analysis ───────────────────────────────

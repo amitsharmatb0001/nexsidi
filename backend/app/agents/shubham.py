@@ -20,6 +20,7 @@ Security-critical code ALWAYS uses Sonnet 4.6 (AUDIT FIX #17).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import structlog
@@ -834,6 +835,33 @@ SHUBHAM_TOOLS: list[ToolDefinition] = [
             "required": ["focus"],
         },
     ),
+    # 6A: Run pytest inside sandbox container
+    ToolDefinition(
+        name="run_pytest",
+        description=(
+            "Run pytest on the generated backend code inside the sandbox container. "
+            "Returns test output with pass/fail counts. Use this AFTER writing all "
+            "backend code to verify it works. Fix failures and re-run until tests pass."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "test_path": {
+                    "type": "string",
+                    "description": "Path inside sandbox, e.g. 'tests/' or 'tests/test_users.py'",
+                },
+                "sandbox_id": {
+                    "type": "string",
+                    "description": "Docker container ID of the sandbox",
+                },
+                "extra_args": {
+                    "type": "string",
+                    "description": "Additional pytest args, e.g. '-x --tb=short'",
+                },
+            },
+            "required": ["test_path"],
+        },
+    ),
     # I1-FIX: Dynamic agent re-dispatch
     INTERRUPT_TOOL,
     # AGENTIC-FIX: Inter-agent communication + web research
@@ -973,6 +1001,25 @@ class ShubhamToolHandler:
         # I1-FIX: Dynamic agent re-dispatch
         elif tool_name == "request_agent_rerun":
             return self._request_agent_rerun(**tool_input)
+        # 6A: Run pytest inside sandbox container
+        elif tool_name == "run_pytest":
+            sandbox_id = tool_input.get("sandbox_id") or self._pipeline_context.get("sandbox_id", "")
+            if not sandbox_id:
+                return json.dumps({"error": "No sandbox_id available — sandbox may not be running"})
+            test_path = tool_input.get("test_path", "tests/")
+            extra = tool_input.get("extra_args", "-x --tb=short -q")
+            cmd = ["docker", "exec", sandbox_id, "python", "-m", "pytest", test_path] + extra.split()
+            try:
+                from app.engine.execution_engine import _run_subprocess
+                result = await _run_subprocess(cmd, timeout=120)
+                return json.dumps({
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout[-3000:],
+                    "stderr": result.stderr[-1000:],
+                    "passed": result.returncode == 0,
+                })
+            except Exception as exc:
+                return json.dumps({"error": f"pytest execution failed: {str(exc)[:300]}"})
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -1192,7 +1239,15 @@ class ShubhamToolHandler:
                     text=True,
                     timeout=10,
                     cwd=tmpdir,
-                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    # CRITICAL-3 FIX: Sanitised env — never expose production
+                # secrets (API keys, DB creds) to LLM-generated code.
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin"),
+                    "HOME": tmpdir,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONPATH": tmpdir,
+                    "LANG": "en_US.UTF-8",
+                },
                 )
                 output = (result.stdout + result.stderr)[:5120]
                 status = "SUCCESS" if result.returncode == 0 else f"EXIT CODE {result.returncode}"

@@ -35,6 +35,7 @@ Key structure in Valkey:
 
 from __future__ import annotations
 
+import threading as _threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -70,6 +71,56 @@ class AgentBusUnavailable(Exception):
     Callers can catch this to degrade gracefully (e.g., skip inter-agent
     communication and use cached context instead).
     """
+
+
+class AgentDeadlockDetected(Exception):
+    """Raised when ask_agent() would create a circular wait cycle."""
+    pass
+
+
+class _AskTracker:
+    """Tracks active ask_agent relationships to detect deadlock cycles.
+
+    Maintains a directed graph: asking_agent -> target_agent.
+    Before each ask, checks if adding the edge would create a cycle.
+    Thread-safe via a simple lock (low contention -- ask() is rare).
+    """
+
+    def __init__(self) -> None:
+        self._lock = _threading.Lock()
+        self._active: dict[str, str] = {}  # from_agent -> to_agent
+
+    def register_ask(self, from_agent: str, to_agent: str) -> None:
+        """Register an ask. Raises AgentDeadlockDetected if cycle detected."""
+        with self._lock:
+            visited: set[str] = {from_agent}
+            current = to_agent
+            while current in self._active:
+                if current in visited:
+                    cycle = self._build_cycle_path(from_agent, to_agent)
+                    raise AgentDeadlockDetected(
+                        f"Deadlock detected: {' -> '.join(cycle)}"
+                    )
+                visited.add(current)
+                current = self._active[current]
+            self._active[from_agent] = to_agent
+
+    def release_ask(self, from_agent: str) -> None:
+        """Release an active ask (call in finally block)."""
+        with self._lock:
+            self._active.pop(from_agent, None)
+
+    def _build_cycle_path(self, from_a: str, to_a: str) -> list[str]:
+        path = [from_a, to_a]
+        current = to_a
+        while self._active.get(current) != from_a:
+            current = self._active[current]
+            path.append(current)
+        path.append(from_a)
+        return path
+
+
+_ask_tracker = _AskTracker()
 
 
 # ── Phase 1A: Agent Group Definitions ────────────────────────────────
@@ -323,67 +374,86 @@ class AgentMessageBus:
             timeout=timeout,
         )
 
+        # Deadlock prevention: register this ask and check for cycles
+        # before blocking on BLPOP. If A is waiting on B and B tries to
+        # ask A, the tracker detects the cycle and raises immediately.
+        try:
+            _ask_tracker.register_ask(from_agent, to_agent)
+        except AgentDeadlockDetected as exc:
+            self._logger.error(
+                "agent_deadlock_detected",
+                from_agent=from_agent,
+                to_agent=to_agent,
+                pipeline_run_id=pipeline_run_id,
+                message_id=message_id,
+                error=str(exc),
+            )
+            raise
+
         # BLPOP blocks until answer() pushes to the answer_key List, or timeout fires.
         # This replaces the old 0.5s polling loop — O(1) server-side wakeup, zero idle
         # round-trips.  BLPOP returns (key, value) on success or None on timeout.
         # timeout must be an integer for Valkey; we round up to not lose precision.
         blpop_timeout = max(1, int(timeout))
         try:
-            blpop_result = await self._redis.blpop(answer_key, timeout=blpop_timeout)
-        except Exception as exc:
-            if _is_connection_error(exc):
-                self._logger.warning(
-                    "agent_bus_unavailable_during_blpop",
-                    message_id=message_id,
-                    error=str(exc),
-                )
-                raise AgentBusUnavailable(
-                    f"Valkey unavailable while waiting for answer to {message_id}: {exc}"
-                ) from exc
-            raise
-
-        if blpop_result is None:
-            # AUDIT-T2-9: Check for late answer before declaring timeout.
-            # If answer arrived just after BLPOP expired, recover it to avoid
-            # duplicate/stale answers sitting in Valkey for the next retry.
             try:
-                late = await self._redis.lpop(answer_key)
-                if late:
-                    self._logger.info("ask_late_answer_recovered", message_id=message_id)
-                    _late_text = late.decode("utf-8") if isinstance(late, bytes) else late
-                    return self._decrypt_field(_late_text, pipeline_run_id)
-                await self._redis.hset(msg_key, "status", "timed_out")
-            except Exception:
-                pass  # Best-effort status update; TTL will clean up regardless.
+                blpop_result = await self._redis.blpop(answer_key, timeout=blpop_timeout)
+            except Exception as exc:
+                if _is_connection_error(exc):
+                    self._logger.warning(
+                        "agent_bus_unavailable_during_blpop",
+                        message_id=message_id,
+                        error=str(exc),
+                    )
+                    raise AgentBusUnavailable(
+                        f"Valkey unavailable while waiting for answer to {message_id}: {exc}"
+                    ) from exc
+                raise
 
-            self._logger.warning(
-                "agent_question_timed_out",
+            if blpop_result is None:
+                # AUDIT-T2-9: Check for late answer before declaring timeout.
+                # If answer arrived just after BLPOP expired, recover it to avoid
+                # duplicate/stale answers sitting in Valkey for the next retry.
+                try:
+                    late = await self._redis.lpop(answer_key)
+                    if late:
+                        self._logger.info("ask_late_answer_recovered", message_id=message_id)
+                        _late_text = late.decode("utf-8") if isinstance(late, bytes) else late
+                        return self._decrypt_field(_late_text, pipeline_run_id)
+                    await self._redis.hset(msg_key, "status", "timed_out")
+                except Exception:
+                    pass  # Best-effort status update; TTL will clean up regardless.
+
+                self._logger.warning(
+                    "agent_question_timed_out",
+                    message_id=message_id,
+                    from_agent=from_agent,
+                    to_agent=to_agent,
+                    pipeline_run_id=pipeline_run_id,
+                    timeout_seconds=timeout,
+                )
+                raise AgentMessageTimeout(
+                    f"No answer from agent '{to_agent}' within {timeout}s "
+                    f"(message_id={message_id}, pipeline={pipeline_run_id})"
+                )
+
+            # blpop_result is a (key_bytes, value_bytes) tuple
+            _, raw_answer = blpop_result
+            answer_text = (
+                raw_answer.decode("utf-8") if isinstance(raw_answer, bytes) else raw_answer
+            )
+            # Phase 1A: Decrypt the answer payload
+            answer_text = self._decrypt_field(answer_text, pipeline_run_id)
+            self._logger.info(
+                "agent_question_answered",
                 message_id=message_id,
                 from_agent=from_agent,
                 to_agent=to_agent,
                 pipeline_run_id=pipeline_run_id,
-                timeout_seconds=timeout,
             )
-            raise AgentMessageTimeout(
-                f"No answer from agent '{to_agent}' within {timeout}s "
-                f"(message_id={message_id}, pipeline={pipeline_run_id})"
-            )
-
-        # blpop_result is a (key_bytes, value_bytes) tuple
-        _, raw_answer = blpop_result
-        answer_text = (
-            raw_answer.decode("utf-8") if isinstance(raw_answer, bytes) else raw_answer
-        )
-        # Phase 1A: Decrypt the answer payload
-        answer_text = self._decrypt_field(answer_text, pipeline_run_id)
-        self._logger.info(
-            "agent_question_answered",
-            message_id=message_id,
-            from_agent=from_agent,
-            to_agent=to_agent,
-            pipeline_run_id=pipeline_run_id,
-        )
-        return answer_text
+            return answer_text
+        finally:
+            _ask_tracker.release_ask(from_agent)
 
     async def answer(
         self,

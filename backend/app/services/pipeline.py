@@ -2229,6 +2229,22 @@ class PipelineOrchestrator:
         if run.current_stage == PipelineStage.COMPLETED and run.status == PipelineRunStatus.RUNNING:
             run.status = PipelineRunStatus.COMPLETED
 
+        # CRITICAL-1 FIX: Surface simulation warnings in delivery context so
+        # the customer-facing output never hides the fact that deployment was faked.
+        _pranav_ctx = run.context.get("pranav", {})
+        if isinstance(_pranav_ctx, dict) and (
+            _pranav_ctx.get("is_simulation")
+            or _pranav_ctx.get("is_simulation_deploy")
+            or str(_pranav_ctx.get("status", "")).lower() == "simulated"
+        ):
+            run.context.setdefault("__delivery_warnings__", [])
+            _sim_warn = (
+                "DEPLOYMENT WAS SIMULATED — the URL provided is not real. "
+                "Configure RAILWAY_TOKEN or VERCEL_TOKEN for real deployment."
+            )
+            if _sim_warn not in run.context["__delivery_warnings__"]:
+                run.context["__delivery_warnings__"].append(_sim_warn)
+
         # Final persist
         await self._persist_run(run)
 
@@ -2674,6 +2690,11 @@ class PipelineOrchestrator:
                     completed_stages=state["completed_stages"],
                     failed_stages=state["failed_stages"],
                     last_result=last_output,
+                    # HIGH-4 FIX: Pass failure history so planner
+                    # can reason about *why* stages failed.
+                    failure_history=run.context.get(
+                        "__failure_history__", []
+                    ),
                 )
             except Exception as exc:
                 # P1-2: Escalate to ERROR + notify user (old code: silent warning).
@@ -3406,6 +3427,17 @@ class PipelineOrchestrator:
             agent_tel["error_types"][err_type] = (
                 agent_tel["error_types"].get(err_type, 0) + 1
             )
+            # HIGH-4 FIX: Record structured failure history so the planner can
+            # reason about *why* a stage failed, not just *that* it failed.
+            from datetime import timezone as _tz
+            _failures = run.context.setdefault("__failure_history__", [])
+            _failures.append({
+                "stage": stage.value if hasattr(stage, "value") else str(stage),
+                "agent": agent_name,
+                "attempt": agent_tel["failures"],
+                "reason": str(result.error or "unknown")[:300],
+                "timestamp": datetime.now(_tz.utc).isoformat(),
+            })
         agent_tel["total_tokens"] += (
             getattr(result, "input_tokens", 0) + getattr(result, "output_tokens", 0)
         )

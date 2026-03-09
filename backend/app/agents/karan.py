@@ -15,6 +15,7 @@ Also runs SOLO during security_audit and compliance_check stages.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -346,6 +347,69 @@ class KaranToolHandler:
             return self._list_files()
         elif tool_name == "run_security_scan":
             return await self._run_security_scan(tool_input["tool"])
+        # 6C: Live security probes against sandbox API endpoints
+        elif tool_name == "run_spot_security":
+            import httpx
+            sandbox_url = tool_input.get("sandbox_url", "").rstrip("/")
+            endpoints = tool_input.get("endpoints", [])
+            findings = []
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+                for ep in endpoints[:10]:  # Max 10 endpoints
+                    method = ep.get("method", "GET").upper()
+                    path = ep.get("path", "/")
+                    auth_required = ep.get("auth_required", False)
+                    url = f"{sandbox_url}{path}"
+                    ep_findings = []
+
+                    # Test 1: SQL injection probe
+                    sqli_url = f"{url}?id=' OR 1=1 --"
+                    try:
+                        resp = await client.request(method, sqli_url)
+                        if resp.status_code == 500:
+                            ep_findings.append({"test": "sql_injection", "severity": "critical", "detail": f"500 on SQLi probe: {sqli_url}"})
+                        else:
+                            ep_findings.append({"test": "sql_injection", "severity": "pass", "detail": f"Returned {resp.status_code}"})
+                    except Exception as exc:
+                        ep_findings.append({"test": "sql_injection", "severity": "error", "detail": str(exc)[:100]})
+
+                    # Test 2: XSS probe (POST only)
+                    if method in ("POST", "PUT", "PATCH"):
+                        try:
+                            resp = await client.request(method, url, json={"name": "<script>alert(1)</script>"})
+                            body = resp.text
+                            if "<script>alert(1)</script>" in body:
+                                ep_findings.append({"test": "xss_reflection", "severity": "critical", "detail": "Script tag reflected in response"})
+                            else:
+                                ep_findings.append({"test": "xss_reflection", "severity": "pass", "detail": "No XSS reflection"})
+                        except Exception as exc:
+                            ep_findings.append({"test": "xss_reflection", "severity": "error", "detail": str(exc)[:100]})
+
+                    # Test 3: Auth bypass (if auth required)
+                    if auth_required:
+                        try:
+                            resp = await client.request(method, url)  # No auth header
+                            if resp.status_code == 200:
+                                ep_findings.append({"test": "auth_bypass", "severity": "critical", "detail": "200 without auth token"})
+                            elif resp.status_code in (401, 403):
+                                ep_findings.append({"test": "auth_bypass", "severity": "pass", "detail": f"Correctly returned {resp.status_code}"})
+                            else:
+                                ep_findings.append({"test": "auth_bypass", "severity": "warning", "detail": f"Unexpected {resp.status_code} without auth"})
+                        except Exception as exc:
+                            ep_findings.append({"test": "auth_bypass", "severity": "error", "detail": str(exc)[:100]})
+
+                    # Test 4: Security headers
+                    try:
+                        resp = await client.get(url)
+                        headers = resp.headers
+                        for hdr in ["x-content-type-options", "x-frame-options"]:
+                            if hdr not in headers:
+                                ep_findings.append({"test": "security_headers", "severity": "warning", "detail": f"Missing {hdr}"})
+                    except Exception:
+                        pass
+
+                    findings.append({"endpoint": f"{method} {path}", "findings": ep_findings})
+
+            return json.dumps({"security_scan": findings, "total_endpoints": len(findings)})
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -674,6 +738,38 @@ class Karan:
                     },
                 },
                 "required": ["tool"],
+            },
+        ))
+
+        # 6C: Live security probes against sandbox API endpoints
+        self.register_tool(ToolDefinition(
+            name="run_spot_security",
+            description=(
+                "Run live security tests against sandbox API endpoints: "
+                "SQL injection probes, XSS probes, auth bypass attempts, and security header checks. "
+                "Use this to independently verify endpoint security — do NOT rely only on static analysis."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "sandbox_url": {
+                        "type": "string",
+                        "description": "Base URL of the sandbox (e.g., http://localhost:8000)",
+                    },
+                    "endpoints": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "method": {"type": "string"},
+                                "path": {"type": "string"},
+                                "auth_required": {"type": "boolean"},
+                            },
+                            "required": ["method", "path"],
+                        },
+                    },
+                },
+                "required": ["sandbox_url", "endpoints"],
             },
         ))
 

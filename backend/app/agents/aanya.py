@@ -20,6 +20,7 @@ files written by Shubham via the read_file and ask_backend tools.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import structlog
@@ -262,6 +263,44 @@ AANYA_TOOLS = [
             "required": ["focus"],
         },
     ),
+    # 6B: Run frontend tests inside sandbox container
+    ToolDefinition(
+        name="run_frontend_test",
+        description=(
+            "Run vitest/jest on the generated frontend code inside the sandbox. "
+            "Use AFTER generating all frontend code. Fix failures and re-run."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "sandbox_id": {
+                    "type": "string",
+                    "description": "Docker container ID of the sandbox",
+                },
+                "test_command": {
+                    "type": "string",
+                    "description": "Test command, e.g. 'npx vitest run --reporter=verbose'",
+                },
+            },
+            "required": ["sandbox_id"],
+        },
+    ),
+    ToolDefinition(
+        name="run_type_check",
+        description=(
+            "Run TypeScript type-checking (tsc --noEmit) on the generated frontend code."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "sandbox_id": {
+                    "type": "string",
+                    "description": "Docker container ID of the sandbox",
+                },
+            },
+            "required": ["sandbox_id"],
+        },
+    ),
     # I1-FIX: Dynamic agent re-dispatch
     INTERRUPT_TOOL,
     # AGENTIC-FIX: Inter-agent communication + web research
@@ -390,6 +429,41 @@ class AanyaToolHandler:
         # I1-FIX: Dynamic agent re-dispatch
         elif tool_name == "request_agent_rerun":
             return self._request_agent_rerun(**tool_input)
+        # 6B: Run frontend tests inside sandbox container
+        elif tool_name == "run_frontend_test":
+            sandbox_id = tool_input.get("sandbox_id") or self._pipeline_context.get("sandbox_id", "")
+            if not sandbox_id:
+                return json.dumps({"error": "No sandbox_id available"})
+            test_cmd = tool_input.get("test_command", "npx vitest run --reporter=verbose 2>&1 || npm test -- --watchAll=false 2>&1")
+            cmd = ["docker", "exec", sandbox_id, "sh", "-c", test_cmd]
+            try:
+                from app.engine.execution_engine import _run_subprocess
+                result = await _run_subprocess(cmd, timeout=120)
+                return json.dumps({
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout[-3000:],
+                    "stderr": result.stderr[-1000:],
+                    "passed": result.returncode == 0,
+                })
+            except Exception as exc:
+                return json.dumps({"error": f"Frontend test failed: {str(exc)[:300]}"})
+        # 6B: Run TypeScript type-checking inside sandbox
+        elif tool_name == "run_type_check":
+            sandbox_id = tool_input.get("sandbox_id") or self._pipeline_context.get("sandbox_id", "")
+            if not sandbox_id:
+                return json.dumps({"error": "No sandbox_id available"})
+            cmd = ["docker", "exec", sandbox_id, "npx", "tsc", "--noEmit"]
+            try:
+                from app.engine.execution_engine import _run_subprocess
+                result = await _run_subprocess(cmd, timeout=60)
+                return json.dumps({
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout[-3000:],
+                    "stderr": result.stderr[-1000:],
+                    "passed": result.returncode == 0,
+                })
+            except Exception as exc:
+                return json.dumps({"error": f"Type check failed: {str(exc)[:300]}"})
         else:
             return f"Unknown tool: {tool_name}"
 

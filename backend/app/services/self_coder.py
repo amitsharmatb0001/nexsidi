@@ -148,6 +148,60 @@ _PROTECTED_CODE_PATTERNS: tuple[re.Pattern[str], ...] = (
 # ── END IMMUTABLE SAFETY PROTOCOL ────────────────────────────────────
 
 
+# ── Fuzzy Find-and-Replace Helper ────────────────────────────────────
+
+
+def _find_and_replace(current: str, old_code: str, new_code: str) -> str | None:
+    """3-tier matching: exact → normalized → fuzzy. Returns patched code or None.
+
+    Tier 1: Exact substring match (existing behavior).
+    Tier 2: Normalized match — strip trailing whitespace per line.
+    Tier 3: Fuzzy match — difflib SequenceMatcher ≥ 0.85 ratio.
+    """
+    # Tier 1: Exact match (existing behavior — fastest)
+    if old_code in current:
+        return current.replace(old_code, new_code, 1)
+
+    # Tier 2: Normalized match (handles trailing whitespace / line ending diffs)
+    def _normalize(s: str) -> str:
+        return "\n".join(line.rstrip() for line in s.splitlines())
+
+    norm_current = _normalize(current)
+    norm_old = _normalize(old_code)
+    if norm_old and norm_old in norm_current:
+        start = norm_current.index(norm_old)
+        line_start = norm_current[:start].count("\n")
+        old_line_count = norm_old.count("\n") + 1
+        original_lines = current.splitlines(keepends=True)
+        prefix = "".join(original_lines[:line_start])
+        suffix = "".join(original_lines[line_start + old_line_count:])
+        return prefix + new_code + suffix
+
+    # Tier 3: Fuzzy match (handles minor reformatting / indentation shifts)
+    import difflib
+    current_lines = current.splitlines(keepends=True)
+    old_lines = old_code.splitlines()
+    if not old_lines:
+        return None
+    best_ratio, best_start, best_end = 0.0, 0, 0
+    window_min = max(1, len(old_lines) - 2)
+    window_max = len(old_lines) + 3
+    for i in range(len(current_lines)):
+        for j in range(i + window_min, min(i + window_max, len(current_lines) + 1)):
+            candidate = "".join(current_lines[i:j])
+            ratio = difflib.SequenceMatcher(
+                None, _normalize(candidate), norm_old,
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_start, best_end = ratio, i, j
+    if best_ratio >= 0.85:
+        prefix = "".join(current_lines[:best_start])
+        suffix = "".join(current_lines[best_end:])
+        return prefix + new_code + suffix
+
+    return None  # No match found at any tier
+
+
 # ── ChangeProposal Dataclass ─────────────────────────────────────────
 
 
@@ -527,7 +581,8 @@ class SelfCoder:
                 errors.append(f"Cannot read file: {exc}")
                 return errors
 
-            if proposal.old_code not in current:
+            patched = _find_and_replace(current, proposal.old_code, proposal.new_code)
+            if patched is None:
                 errors.append(
                     "old_code not found in current file content. "
                     "Ensure the exact text (including whitespace) matches."
@@ -550,9 +605,8 @@ class SelfCoder:
                     errors.append(ast_err)
             elif proposal.change_type == "edit" and not errors:
                 # Validate the file AFTER the edit would be applied
+                # (patched was already computed by _find_and_replace above)
                 try:
-                    current = resolved.read_text(encoding="utf-8")
-                    patched = current.replace(proposal.old_code, proposal.new_code, 1)
                     ast_err = self._ast_check(patched, proposal.file_path)
                     if ast_err:
                         errors.append(f"Patched file fails AST: {ast_err}")
@@ -638,15 +692,14 @@ class SelfCoder:
                 current = resolved.read_text(encoding="utf-8")
                 proposal._old_file_content = current
 
-                if proposal.old_code and proposal.old_code not in current:
-                    proposal.status = "rejected"
-                    return {
-                        "success": False,
-                        "error": "old_code no longer found in file (concurrent modification?)",
-                    }
-
                 if proposal.old_code:
-                    patched = current.replace(proposal.old_code, proposal.new_code, 1)
+                    patched = _find_and_replace(current, proposal.old_code, proposal.new_code)
+                    if patched is None:
+                        proposal.status = "rejected"
+                        return {
+                            "success": False,
+                            "error": "old_code no longer found in file (concurrent modification?)",
+                        }
                 else:
                     # Append mode (old_code is empty for add_tool / modify_prompt appends)
                     patched = current + "\n" + proposal.new_code

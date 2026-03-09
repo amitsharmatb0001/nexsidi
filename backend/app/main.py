@@ -101,6 +101,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ) from exc
         logger.warning("revocation_store_deferred", error=_sanitize_error(exc))
 
+    # HIGH-2 FIX: General Valkey health check — fail-fast in production instead
+    # of surfacing a confusing connection error deep inside the first pipeline run.
+    try:
+        from app.services.valkey_pool import get_valkey_client
+        _valkey = await get_valkey_client()
+        await _valkey.ping()
+        logger.info("valkey_health_check_passed")
+    except Exception as _valkey_exc:
+        if settings.is_production:
+            raise RuntimeError(
+                "Valkey/Redis is required but not reachable. "
+                f"Set REDIS_URL or provision Cloud Memorystore. Error: {_valkey_exc}"
+            )
+        logger.error(
+            "valkey_health_check_failed",
+            error=str(_valkey_exc)[:200] if hasattr(_valkey_exc, '__str__') else "unknown",
+            hint="Valkey unavailable — pipeline runs, message bus, and context engine will fail.",
+        )
+
+    # CRITICAL-1 FIX: Warn at startup if no deployment provider is configured.
+    # All pipelines will run in simulation mode and deliver fake URLs.
+    import os as _os
+    if settings.is_production and not any([
+        _os.environ.get("RAILWAY_TOKEN"),
+        _os.environ.get("VERCEL_TOKEN"),
+        settings.railway_token,
+        settings.vercel_token,
+    ]):
+        logger.warning(
+            "no_deployment_provider_configured",
+            hint=(
+                "No RAILWAY_TOKEN or VERCEL_TOKEN configured. "
+                "All deployments will run in simulation mode."
+            ),
+        )
+
     # WORKER-PROD-FIX: Production requires an external worker (async or Celery).
     # In-process execution (asyncio.create_task) shares crash domain with API.
     _has_external_worker = (

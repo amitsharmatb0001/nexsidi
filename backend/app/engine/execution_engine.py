@@ -46,6 +46,47 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+# ── Async subprocess helper ──────────────────────────────────────────
+
+
+async def _run_subprocess(
+    cmd: list[str],
+    *,
+    timeout: float = 120,
+    cwd: str | None = None,
+    env: dict | None = None,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run subprocess via OS-level process spawn — zero thread-pool workers consumed.
+
+    Drop-in replacement for ``asyncio.to_thread(subprocess.run, ...)``.
+    Returns the same ``CompletedProcess`` so downstream ``.returncode``,
+    ``.stdout``, ``.stderr`` access is unchanged.
+    """
+    merged_env = {**os.environ, **(env or {})} if env else None
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+        cwd=cwd,
+        env=merged_env,
+    )
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    return subprocess.CompletedProcess(
+        cmd,
+        proc.returncode,
+        stdout=stdout_bytes.decode(errors="replace") if stdout_bytes else "",
+        stderr=stderr_bytes.decode(errors="replace") if stderr_bytes else "",
+    )
+
+
 # ── FIX A: Docker availability check ─────────────────────────────────
 # SANDBOX-FIX A: Cache Docker availability to avoid repeated subprocess
 # calls, but with a 60-second TTL so that Docker becoming available AFTER
@@ -524,11 +565,8 @@ class ExecutionEngine:
                 sandbox_id=state.sandbox_id,
                 temp_dir=temp_dir,
             )
-            proc = await asyncio.to_thread(
-                subprocess.run,
+            proc = await _run_subprocess(
                 ["docker", "compose", "-f", compose_path, "build", "--no-cache"],
-                capture_output=True,
-                text=True,
                 timeout=self._config.build_timeout,
             )
             state.build_logs = proc.stdout + proc.stderr
@@ -644,11 +682,8 @@ class ExecutionEngine:
 
             # SANDBOX-FIX C (step 2): docker compose up -d
             logger.info("sandbox_docker_up_start", sandbox_id=state.sandbox_id)
-            proc = await asyncio.to_thread(
-                subprocess.run,
+            proc = await _run_subprocess(
                 ["docker", "compose", "-f", compose_path, "up", "-d"],
-                capture_output=True,
-                text=True,
                 timeout=self._config.start_timeout,
             )
 
@@ -666,14 +701,11 @@ class ExecutionEngine:
             # SANDBOX-FIX C (step 3): Extract mapped host port for sandbox-backend
             # (docker compose maps "0:8000" → random host port)
             try:
-                port_proc = await asyncio.to_thread(
-                    subprocess.run,
+                port_proc = await _run_subprocess(
                     [
                         "docker", "compose", "-f", compose_path,
                         "port", "sandbox-backend", "8000",
                     ],
-                    capture_output=True,
-                    text=True,
                     timeout=10,
                 )
                 if port_proc.returncode == 0 and port_proc.stdout.strip():
@@ -786,15 +818,12 @@ class ExecutionEngine:
                 return True  # Nothing to migrate if compose wasn't built
 
             # Step 1: alembic upgrade head
-            alembic_proc = await asyncio.to_thread(
-                subprocess.run,
+            alembic_proc = await _run_subprocess(
                 [
                     "docker", "compose", "-f", compose_path,
                     "exec", "-T", "sandbox-backend",
                     "alembic", "upgrade", "head",
                 ],
-                capture_output=True,
-                text=True,
                 timeout=timeout_seconds,
             )
 
@@ -808,15 +837,12 @@ class ExecutionEngine:
                 return False
 
             # Step 2: seed data (optional — script may not exist)
-            seed_proc = await asyncio.to_thread(
-                subprocess.run,
+            seed_proc = await _run_subprocess(
                 [
                     "docker", "compose", "-f", compose_path,
                     "exec", "-T", "sandbox-backend",
                     "python", "scripts/seed.py",
                 ],
-                capture_output=True,
-                text=True,
                 timeout=timeout_seconds,
             )
 
@@ -1102,14 +1128,11 @@ class ExecutionEngine:
             # Discover the frontend's randomly mapped host port
             frontend_port = 3000  # fallback
             try:
-                fp_proc = await asyncio.to_thread(
-                    subprocess.run,
+                fp_proc = await _run_subprocess(
                     [
                         "docker", "compose", "-f", compose_path,
                         "port", "sandbox-frontend", "3000",
                     ],
-                    capture_output=True,
-                    text=True,
                     timeout=10,
                 )
                 if fp_proc.returncode == 0 and fp_proc.stdout.strip():
@@ -1120,17 +1143,13 @@ class ExecutionEngine:
 
             frontend_url = f"http://localhost:{frontend_port}"
 
-            proc = await asyncio.to_thread(
-                subprocess.run,
+            proc = await _run_subprocess(
                 [
                     "npx", "playwright", "test", "playwright_tests/",
                     "--reporter=json",
                 ],
-                capture_output=True,
-                text=True,
                 timeout=timeout_seconds,
                 env={
-                    **os.environ,
                     "BASE_URL": frontend_url,
                     "PLAYWRIGHT_BASE_URL": frontend_url,
                 },
@@ -1269,12 +1288,11 @@ class ExecutionEngine:
         # Check 1: Verify each expected table exists via information_schema
         for table_name in expected_tables:
             try:
-                result = await asyncio.to_thread(
-                    subprocess.run,
+                result = await _run_subprocess(
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-db",
                      "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
                      f"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='{table_name}')"],
-                    capture_output=True, text=True, timeout=10,
+                    timeout=10,
                 )
                 exists = result.stdout.strip() == "t"
                 checks.append({
@@ -1291,12 +1309,11 @@ class ExecutionEngine:
 
         # Check 2: Verify foreign key constraints exist
         try:
-            fk_result = await asyncio.to_thread(
-                subprocess.run,
+            fk_result = await _run_subprocess(
                 ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-db",
                  "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
                  "SELECT count(*) FROM information_schema.table_constraints WHERE constraint_type='FOREIGN KEY'"],
-                capture_output=True, text=True, timeout=10,
+                timeout=10,
             )
             fk_count = int(fk_result.stdout.strip() or "0")
             checks.append({
@@ -1314,12 +1331,11 @@ class ExecutionEngine:
         # Check 3: Verify seed data exists (at least 1 row in first table)
         if expected_tables:
             try:
-                seed_result = await asyncio.to_thread(
-                    subprocess.run,
+                seed_result = await _run_subprocess(
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-db",
                      "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
                      f'SELECT count(*) FROM "{expected_tables[0]}"'],
-                    capture_output=True, text=True, timeout=10,
+                    timeout=10,
                 )
                 row_count = int(seed_result.stdout.strip() or "0")
                 checks.append({
@@ -1371,11 +1387,10 @@ class ExecutionEngine:
 
         # Backend: pip install --dry-run
         try:
-            pip_proc = await asyncio.to_thread(
-                subprocess.run,
+            pip_proc = await _run_subprocess(
                 ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
                  "pip", "install", "-r", "requirements.txt", "--dry-run"],
-                capture_output=True, text=True, timeout=timeout_seconds,
+                timeout=timeout_seconds,
             )
             results["backend"] = {
                 "passed": pip_proc.returncode == 0,
@@ -1386,11 +1401,10 @@ class ExecutionEngine:
 
         # Frontend: npm install --dry-run
         try:
-            npm_proc = await asyncio.to_thread(
-                subprocess.run,
+            npm_proc = await _run_subprocess(
                 ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-frontend",
                  "npm", "install", "--dry-run"],
-                capture_output=True, text=True, timeout=timeout_seconds,
+                timeout=timeout_seconds,
             )
             results["frontend"] = {
                 "passed": npm_proc.returncode == 0,
@@ -1647,11 +1661,10 @@ class ExecutionEngine:
         # 1. Bandit (Python security scanner)
         if "bandit" in requested:
             try:
-                bandit_proc = await asyncio.to_thread(
-                    subprocess.run,
+                bandit_proc = await _run_subprocess(
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
                      "python", "-m", "bandit", "-r", ".", "-f", "json", "-q"],
-                    capture_output=True, text=True, timeout=timeout_seconds,
+                    timeout=timeout_seconds,
                 )
                 try:
                     bandit_results = json.loads(bandit_proc.stdout)
@@ -1678,11 +1691,10 @@ class ExecutionEngine:
         # 2. Safety (dependency vulnerability check)
         if "safety" in requested:
             try:
-                safety_proc = await asyncio.to_thread(
-                    subprocess.run,
+                safety_proc = await _run_subprocess(
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
                      "python", "-m", "safety", "check", "--json"],
-                    capture_output=True, text=True, timeout=timeout_seconds,
+                    timeout=timeout_seconds,
                 )
                 try:
                     safety_results = json.loads(safety_proc.stdout)
@@ -1700,11 +1712,10 @@ class ExecutionEngine:
         # 3. npm audit (JS dependency check)
         if "npm_audit" in requested:
             try:
-                npm_proc = await asyncio.to_thread(
-                    subprocess.run,
+                npm_proc = await _run_subprocess(
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-frontend",
                      "npm", "audit", "--json"],
-                    capture_output=True, text=True, timeout=timeout_seconds,
+                    timeout=timeout_seconds,
                 )
                 try:
                     npm_results = json.loads(npm_proc.stdout)
@@ -1723,11 +1734,10 @@ class ExecutionEngine:
         # 4. Semgrep (D4-FIX: multi-language static analysis with OWASP/CWE rules)
         if "semgrep" in requested:
             try:
-                semgrep_proc = await asyncio.to_thread(
-                    subprocess.run,
+                semgrep_proc = await _run_subprocess(
                     ["docker", "compose", "-f", compose_path, "exec", "-T", "sandbox-backend",
                      "semgrep", "--config", "auto", "--json", "--quiet", "."],
-                    capture_output=True, text=True, timeout=timeout_seconds,
+                    timeout=timeout_seconds,
                 )
                 try:
                     semgrep_results = json.loads(semgrep_proc.stdout)
@@ -1775,14 +1785,11 @@ class ExecutionEngine:
         try:
             if _check_docker_available() and state.temp_dir and os.path.isfile(compose_path):
                 # SANDBOX-FIX D (step 1): docker compose down --volumes --remove-orphans
-                proc = await asyncio.to_thread(
-                    subprocess.run,
+                proc = await _run_subprocess(
                     [
                         "docker", "compose", "-f", compose_path,
                         "down", "--volumes", "--remove-orphans",
                     ],
-                    capture_output=True,
-                    text=True,
                     timeout=60,
                 )
                 if proc.returncode != 0:

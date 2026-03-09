@@ -161,6 +161,70 @@ ASSIGN_PRIORITY_TOOL = ToolDefinition(
     },
 )
 
+SUBMIT_DECISION_TOOL = ToolDefinition(
+    name="submit_decision",
+    description=(
+        "Submit your GO/NO-GO decision for this pipeline run. "
+        "This is the ONLY way to finalize your review. You MUST call this tool."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "decision": {
+                "type": "string",
+                "enum": ["APPROVE", "REJECT"],
+                "description": "Your final decision: APPROVE to proceed to deployment, REJECT to send back for fixes.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence level 0.0-1.0 in your decision.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Brief explanation of why you made this decision.",
+            },
+            "conditions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional conditions that must be met (for conditional approvals).",
+            },
+        },
+        "required": ["decision", "confidence", "reasoning"],
+    },
+)
+
+RUN_SPOT_CHECK_TOOL = ToolDefinition(
+    name="run_spot_check",
+    description=(
+        "Independently test 2-3 random API endpoints from the contract. "
+        "Returns actual HTTP status codes and response bodies. "
+        "Use this to verify endpoints yourself — do NOT rely solely on Aarav's reports."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "sandbox_url": {
+                "type": "string",
+                "description": "The sandbox base URL (e.g., http://localhost:8000)",
+            },
+            "endpoints": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
+                        "path": {"type": "string"},
+                        "body": {"type": "object"},
+                    },
+                    "required": ["method", "path"],
+                },
+                "description": "List of endpoints to test.",
+            },
+        },
+        "required": ["sandbox_url", "endpoints"],
+    },
+)
+
 
 # ── Tilotma Tool Handler ─────────────────────────────────────────
 
@@ -199,6 +263,10 @@ class TilotmaToolHandler:
             return self._handle_plan_stages(tool_input)
         elif tool_name == "assign_priority":
             return self._handle_assign_priority(tool_input)
+        elif tool_name == "submit_decision":
+            return self._handle_submit_decision(tool_input)
+        elif tool_name == "run_spot_check":
+            return await self._handle_run_spot_check(tool_input)
         else:
             return f"Unknown tool: {tool_name}"
 
@@ -245,6 +313,45 @@ class TilotmaToolHandler:
             f"Reason: {reason}"
         )
 
+    def _handle_submit_decision(self, tool_input: dict) -> str:
+        """Handle submit_decision tool: return structured decision as JSON."""
+        return json.dumps({
+            "decision": tool_input.get("decision", "REJECT"),
+            "confidence": tool_input.get("confidence", 0.0),
+            "reasoning": tool_input.get("reasoning", ""),
+            "conditions": tool_input.get("conditions", []),
+            "__is_final_decision__": True,
+        })
+
+    async def _handle_run_spot_check(self, tool_input: dict) -> str:
+        """Handle run_spot_check tool: independently test API endpoints."""
+        import httpx
+
+        sandbox_url = tool_input.get("sandbox_url", "").rstrip("/")
+        endpoints = tool_input.get("endpoints", [])
+        results = []
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for ep in endpoints[:5]:  # Max 5 endpoints per spot check
+                method = ep.get("method", "GET").upper()
+                path = ep.get("path", "/")
+                body = ep.get("body")
+                url = f"{sandbox_url}{path}"
+                try:
+                    resp = await client.request(method, url, json=body)
+                    results.append({
+                        "endpoint": f"{method} {path}",
+                        "status": resp.status_code,
+                        "body_preview": resp.text[:500],
+                        "headers": dict(list(resp.headers.items())[:10]),
+                    })
+                except Exception as exc:
+                    results.append({
+                        "endpoint": f"{method} {path}",
+                        "status": None,
+                        "error": str(exc)[:200],
+                    })
+        return json.dumps({"spot_check_results": results, "total": len(results)})
+
 
 # ── Tilotma Agent ─────────────────────────────────────────────────
 
@@ -272,6 +379,8 @@ class Tilotma:
         return [
             PLAN_STAGES_TOOL,
             ASSIGN_PRIORITY_TOOL,
+            SUBMIT_DECISION_TOOL,
+            RUN_SPOT_CHECK_TOOL,
             WEB_SEARCH_TOOL,
             WEB_SCRAPE_TOOL,
             *SELF_CODING_TOOLS,
@@ -654,7 +763,7 @@ class Tilotma:
             )
             confidence = 1.0
         else:
-            # --- AI Review for Nuanced Judgment (with tools) ---
+            # --- AI Review for Nuanced Judgment (with structured tool-based decision) ---
             review_tool_handler = TilotmaToolHandler()
             try:
                 review_response = await call_ai_with_tools(
@@ -664,9 +773,15 @@ class Tilotma:
                         "You are Tilotma, Chief AI Officer at NexSidi, performing FINAL VALIDATION.\n\n"
                         "Review these quality reports and decide: APPROVE or REJECT.\n\n"
                         "You have access to tools:\n"
+                        "- submit_decision: MANDATORY — you MUST call this to finalize your GO/NO-GO decision\n"
+                        "- run_spot_check: Independently test API endpoints (do NOT rely only on Aarav's reports)\n"
                         "- plan_stages: Skip stages that are irrelevant for the next iteration\n"
                         "- assign_priority: Set agent priorities for the next iteration\n"
                         "- web_search / web_scrape: Research best practices if needed\n\n"
+                        "WORKFLOW:\n"
+                        "1. Review the quality reports below\n"
+                        "2. Optionally use run_spot_check to independently verify 2-3 endpoints\n"
+                        "3. MUST call submit_decision with your final APPROVE or REJECT decision\n\n"
                         "APPROVE if:\n"
                         "- All critical checks pass (no critical security issues, no critical logic errors)\n"
                         "- Tests are mostly passing (>80% pass rate is acceptable)\n"
@@ -677,10 +792,8 @@ class Tilotma:
                         "- Core functionality is broken (auth, CRUD, data validation)\n"
                         "- More than 3 high-severity issues across all reports\n"
                         "- Error count is rising (fixer making things worse)\n\n"
-                        "After using any tools you need, respond EXACTLY in this format:\n"
-                        "DECISION: APPROVE or REJECT\n"
-                        "CONFIDENCE: 0.0-1.0\n"
-                        "REASONING: <your detailed reasoning>"
+                        "IMPORTANT: Do NOT just write your decision as text. "
+                        "You MUST call the submit_decision tool to finalize your review."
                     ),
                     task_type="critical_validation",
                     complexity=TaskComplexity.COMPLEX,
@@ -688,35 +801,82 @@ class Tilotma:
                     max_tool_rounds=10,
                 )
 
-                response_text = review_response.content.upper()
-                # P0-3: Structured parsing first, fail-safe string fallback.
-                # Old code: "REJECT the earlier plan. APPROVE this." → parsed as APPROVED.
+                # Extract structured decision from tool results.
+                # The submit_decision tool handler returns JSON with __is_final_decision__=True.
+                # We scan all tool results (stored in review_response) for that marker.
+                final_decision_data = None
+
+                # call_ai_with_tools returns the final AI response. The tool results
+                # are embedded in the conversation messages. We need to check if
+                # submit_decision was called by scanning the response content and
+                # tool handler output. The tool handler returns JSON that gets fed
+                # back to the AI as a tool_result message. We parse the final
+                # response text for any JSON blocks containing __is_final_decision__.
+                # Additionally, the tool handler itself echoed the decision data.
+                _response_text = review_response.content or ""
+
+                # Strategy: Look for the structured decision JSON in the response.
+                # The AI receives the tool result and may echo it or reference it.
+                # We also check the raw response for any JSON with __is_final_decision__.
                 import re as _re
-                decision_match = _re.search(r"DECISION:\s*(APPROVE|REJECT)", response_text)
-                if decision_match:
-                    decision = "approved" if decision_match.group(1) == "APPROVE" else "rejected"
+
+                # Scan for JSON blocks containing the decision marker
+                for json_candidate in _re.finditer(r'\{[^{}]*"__is_final_decision__"[^{}]*\}', _response_text):
+                    try:
+                        parsed_candidate = json.loads(json_candidate.group())
+                        if parsed_candidate.get("__is_final_decision__"):
+                            final_decision_data = parsed_candidate
+                            break
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+                # If not found in response text, check tool_results attribute
+                # (call_ai_with_tools may store tool call results on the response)
+                if final_decision_data is None:
+                    tool_results = getattr(review_response, "tool_results", None) or []
+                    for tr in tool_results:
+                        tr_content = tr if isinstance(tr, str) else str(tr)
+                        if "__is_final_decision__" in tr_content:
+                            try:
+                                parsed_tr = json.loads(tr_content) if isinstance(tr, str) else tr
+                                if isinstance(parsed_tr, dict) and parsed_tr.get("__is_final_decision__"):
+                                    final_decision_data = parsed_tr
+                                    break
+                            except (json.JSONDecodeError, ValueError, TypeError):
+                                pass
+
+                # If still not found, fall back to regex parsing of free text
+                # (backward compat: AI may not have called the tool)
+                if final_decision_data is not None:
+                    # Structured decision from submit_decision tool
+                    raw_decision = final_decision_data.get("decision", "REJECT").upper()
+                    decision = "approved" if raw_decision == "APPROVE" else "rejected"
+                    confidence = float(final_decision_data.get("confidence", 0.5))
+                    reasoning = final_decision_data.get("reasoning", _response_text)
+                    conditions = final_decision_data.get("conditions", [])
+                    if conditions:
+                        reasoning += "\n\nConditions: " + "; ".join(conditions)
+                    logger.info("tilotma_review_structured_decision", decision=decision, confidence=confidence)
                 else:
-                    # Fallback: any REJECT = reject (fail-safe)
-                    reject_count = response_text.count("REJECT")
-                    approve_count = response_text.count("APPROVE")
-                    if reject_count > 0:
-                        decision = "rejected"
-                    elif approve_count > 0:
-                        decision = "approved"
+                    # Fallback: regex parsing (submit_decision tool was never called)
+                    logger.warning("tilotma_review_submit_decision_not_called", hint="AI did not call submit_decision tool")
+                    response_text_upper = _response_text.upper()
+                    decision_match = _re.search(r"DECISION:\s*(APPROVE|REJECT)", response_text_upper)
+                    if decision_match:
+                        decision = "approved" if decision_match.group(1) == "APPROVE" else "rejected"
                     else:
-                        decision = "rejected"  # No clear signal = reject (fail-safe)
+                        # No structured decision AND no regex match = auto-reject (fail-safe)
+                        decision = "rejected"
 
-                # Extract confidence
-                # AUDIT-T2-5: Default to 0.5 (neutral) instead of 0.7 (artificially optimistic)
-                confidence = 0.5
-                for line in review_response.content.split("\n"):
-                    if "CONFIDENCE:" in line.upper():
-                        try:
-                            confidence = float(line.split(":")[-1].strip())
-                        except ValueError:
-                            pass  # Expected: invalid value — fall through to default
-
-                reasoning = review_response.content
+                    # AUDIT-T2-5: Default to 0.0 when tool was not called (less trustworthy)
+                    confidence = 0.0
+                    for line in _response_text.split("\n"):
+                        if "CONFIDENCE:" in line.upper():
+                            try:
+                                confidence = float(line.split(":")[-1].strip())
+                            except ValueError:
+                                pass
+                    reasoning = _response_text
 
             except Exception as exc:
                 from app.services.ai_router import _sanitize_error

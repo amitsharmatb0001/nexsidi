@@ -906,6 +906,16 @@ async def handle_web_tool(tool_name: str, tool_input: dict[str, Any]) -> str | N
             return _json.dumps({"error": f"Failed to ask {to_agent}: {str(exc)[:200]}"})
 
     # ── Self-Coding Tools ───────────────────────────────────────────
+    # HIGH-1 FIX: Gate all self-coding tools behind feature flag.
+    # Agents modifying their own source at runtime is v3+ territory.
+    if tool_name.startswith("self_"):
+        from app.config import get_settings as _get_settings
+        if not _get_settings().enable_self_coder:
+            return _json.dumps({
+                "error": "Self-coding is disabled in this environment. "
+                         "Set ENABLE_SELF_CODER=true to enable."
+            })
+
     if tool_name == "self_read_source":
         from app.services.self_coder import get_self_coder
         sc = get_self_coder()
@@ -1186,6 +1196,74 @@ class Observation:
     override_result: str | None = None  # Replace tool result with this
 
 
+async def _summarize_dropped_messages(messages: list) -> str:
+    """Extract key decisions/outputs from messages about to be dropped.
+
+    Uses a compact bullet-list extraction first, then optionally summarises
+    via a cheap model.  Falls back to the bullet list if the AI call fails.
+
+    Accepts both plain dicts and AIMessage dataclass objects.
+    """
+    from app.services.ai_router import ToolUseBlock as _TUB
+
+    summary_parts: list[str] = []
+    for msg in messages:
+        role = getattr(msg, "role", None) or (msg.get("role", "") if isinstance(msg, dict) else "")
+        content = getattr(msg, "content", None)
+        if content is None and isinstance(msg, dict):
+            content = msg.get("content", "")
+
+        if role == "assistant":
+            # AIMessage: content is list[ContentBlock] with ToolUseBlock entries
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, _TUB):
+                        summary_parts.append(f"Called: {block.name}")
+            # Dict-style: tool_calls list
+            elif isinstance(msg, dict):
+                for tc in msg.get("tool_calls", []):
+                    fn = tc.get("function", {})
+                    summary_parts.append(f"Called: {fn.get('name', '?')}")
+        elif role == "user":
+            # User messages often contain ToolResultBlock content
+            if isinstance(content, list):
+                for block in content:
+                    block_content = getattr(block, "content", "")
+                    if block_content:
+                        summary_parts.append(f"Result: {str(block_content)[:200]}")
+            elif isinstance(content, str) and content:
+                summary_parts.append(f"Result: {content[:200]}")
+        elif role == "tool":
+            content_str = str(content or "")[:200]
+            if content_str:
+                summary_parts.append(f"Result: {content_str}")
+
+    if not summary_parts:
+        return f"[{len(messages)} messages omitted — no substantive content]"
+
+    summary_prompt = (
+        "Summarize these agent actions and results in 3-5 bullet points. "
+        "Focus on: decisions made, files created/modified, errors encountered, "
+        "key outputs. Be extremely concise.\n\n" + "\n".join(summary_parts[:30])
+    )
+    try:
+        from app.services.ai_router import get_ai_router
+        _router = get_ai_router()
+        resp = await _router.call(
+            prompt=summary_prompt,
+            task_type="general",
+            max_tokens=300,
+        )
+        return f"[Summary of {len(messages)} earlier messages:\n{resp.text}\n]"
+    except Exception:
+        # Fallback: return the compact bullet list directly (no AI needed)
+        return (
+            f"[Summary of {len(messages)} earlier actions:\n"
+            + "\n".join(summary_parts[:10])
+            + "\n]"
+        )
+
+
 async def call_ai_with_tools(
     agent: Any,
     messages: list[dict[str, str]],
@@ -1238,8 +1316,8 @@ async def call_ai_with_tools(
     # Old approach: f'[tool_use id="{id}" name="{name}"]' (fragile string parsing)
     # New approach: ToolUseBlock(id=id, name=name, input=input) (typed, Anthropic-native)
     # AUDIT-FIX: Moved constant out of loop body (was redefined every iteration).
-    _MAX_HISTORY_MESSAGES = 13  # 1 initial + 6 rounds × 2
-    _KEEP_ROUNDS = 6  # 6 rounds = 12 messages
+    _MAX_HISTORY_MESSAGES = 40  # 1 initial + ~15 rounds × 2 + buffer
+    _KEEP_ROUNDS = 15  # 15 rounds = 30 messages
 
     rounds = 0
     # CHANGE-16: Stall detection — track tool call fingerprints to detect
@@ -1444,16 +1522,15 @@ async def call_ai_with_tools(
             # R36-FIX: Guard against empty tail after truncation.
             if not tail:
                 tail = ai_messages[-2:]
-            # P2-1: Insert a context bridge so the AI knows history was dropped.
-            dropped_count = len(ai_messages) - 1 - len(tail)
-            if dropped_count > 0:
+            # P2-1: Insert a smart summary of dropped messages so the AI
+            # retains awareness of key decisions/actions from earlier rounds.
+            _dropped = ai_messages[1:len(ai_messages) - len(tail)]
+            if _dropped:
                 from app.services.ai_router import AIMessage
+                _summary = await _summarize_dropped_messages(_dropped)
                 summary_msg = AIMessage(
                     role="user",
-                    content=(
-                        f"[Context: {dropped_count} earlier tool interactions omitted "
-                        "for brevity. Key actions were taken above.]"
-                    ),
+                    content=_summary,
                 )
                 ai_messages = [first_msg, summary_msg] + tail
             else:
