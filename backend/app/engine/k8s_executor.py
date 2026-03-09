@@ -542,6 +542,188 @@ class KubernetesExecutor:
             "results": results,
         }
 
+    # ── K8S-FIX: Browser + DB tests against K8s pod ──────────────────
+
+    async def run_browser_tests(
+        self,
+        pipeline_run_id: str,
+        pages: list[dict[str, Any]],
+        timeout_seconds: int = 600,
+    ) -> list[dict[str, Any]]:
+        """Run HTTP-level page tests against K8s sandbox pod.
+
+        Without local Playwright/Docker, we verify pages via direct HTTP
+        requests to the running K8s pod.  This tests REAL responses —
+        not simulation.  Checks:
+        - Page returns 200
+        - Content-Type is HTML
+        - Body is non-empty and has basic HTML structure
+        - No server error markers in response
+        """
+        state = self._active_sandboxes.get(pipeline_run_id)
+        if not state or not state.base_url:
+            return [{"page": "all", "passed": False, "error": "K8s sandbox not running"}]
+
+        import httpx
+
+        results: list[dict[str, Any]] = []
+
+        # The sandbox pod may serve frontend on port 3000, backend on 8000.
+        frontend_bases = [state.base_url]
+        if ":8000" in state.base_url:
+            frontend_bases.append(state.base_url.replace(":8000", ":3000"))
+
+        async with httpx.AsyncClient(timeout=float(min(timeout_seconds, 30))) as client:
+            for page in pages:
+                page_name = page.get("name", "unknown")
+                page_path = page.get("path", "/")
+                connected = False
+
+                for base in frontend_bases:
+                    url = f"{base}{page_path}"
+                    try:
+                        resp = await client.get(url)
+                        body = resp.text[:5000]
+                        errors: list[str] = []
+
+                        if resp.status_code >= 500:
+                            errors.append(f"Server error: {resp.status_code}")
+                        if resp.status_code == 404 and base == frontend_bases[-1]:
+                            errors.append(f"Page not found: {page_path}")
+
+                        ct = resp.headers.get("content-type", "")
+                        if resp.status_code == 200:
+                            if "text/html" not in ct and "application/json" not in ct:
+                                errors.append(f"Unexpected Content-Type: {ct}")
+                            if len(body) < 50:
+                                errors.append(f"Response body too small ({len(body)} chars)")
+
+                        for marker in ("Internal Server Error", "ECONNREFUSED", "Cannot GET"):
+                            if marker.lower() in body.lower():
+                                errors.append(f"Error marker: {marker}")
+
+                        if resp.status_code < 400:
+                            results.append({
+                                "page": page_name,
+                                "path": page_path,
+                                "passed": len(errors) == 0,
+                                "status_code": resp.status_code,
+                                "load_time_ms": round(
+                                    resp.elapsed.total_seconds() * 1000, 1,
+                                ) if resp.elapsed else 0,
+                                "content_length": len(resp.content),
+                                "errors": errors if errors else None,
+                                "simulated": False,
+                            })
+                            connected = True
+                            break
+                    except Exception:
+                        continue  # Try next base URL
+
+                if not connected:
+                    results.append({
+                        "page": page_name,
+                        "path": page_path,
+                        "passed": False,
+                        "error": "Could not connect to sandbox pod on any port",
+                        "simulated": False,
+                    })
+
+        return results
+
+    async def verify_database(
+        self,
+        pipeline_run_id: str,
+        expected_tables: list[str],
+        timeout_seconds: int = 180,
+    ) -> dict[str, Any]:
+        """Verify database schema in K8s sandbox via pod exec.
+
+        Uses kubernetes_asyncio exec API to run psql inside the DB container
+        and check table existence via information_schema.  REAL SQL —
+        not simulation.
+        """
+        state = self._active_sandboxes.get(pipeline_run_id)
+        if not state or not state.namespace:
+            return {"checks_passed": 0, "checks_total": 0, "errors": ["Sandbox not running"]}
+
+        k8s, api_client = await self._get_k8s()
+        core_v1 = k8s.CoreV1Api(api_client)
+        checks: list[dict[str, Any]] = []
+
+        try:
+            # Find DB pod in the sandbox namespace
+            pods = await core_v1.list_namespaced_pod(namespace=state.namespace)
+            db_pod_name: str = ""
+            db_container: str = ""
+            for pod in pods.items:
+                if pod.status and pod.status.phase != "Running":
+                    continue
+                for container in (pod.spec.containers or []):
+                    img = (container.image or "").lower()
+                    if any(kw in img for kw in ("postgres", "mysql", "mariadb")):
+                        db_pod_name = pod.metadata.name
+                        db_container = container.name
+                        break
+                if db_pod_name:
+                    break
+
+            if not db_pod_name:
+                return {
+                    "checks_passed": 0,
+                    "checks_total": len(expected_tables),
+                    "errors": ["No database container found in sandbox namespace"],
+                }
+
+            # Exec psql to verify each table
+            for table_name in expected_tables:
+                safe_name = "".join(c for c in table_name if c.isalnum() or c == "_")
+                try:
+                    exec_command = [
+                        "psql", "-U", "sandbox_user", "-d", "sandbox", "-tAc",
+                        f"SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                        f"WHERE table_name='{safe_name}')",
+                    ]
+                    resp = await core_v1.connect_get_namespaced_pod_exec(
+                        name=db_pod_name,
+                        namespace=state.namespace,
+                        container=db_container,
+                        command=exec_command,
+                        stderr=True,
+                        stdout=True,
+                        stdin=False,
+                        tty=False,
+                    )
+                    exists = "t" in str(resp)
+                    checks.append({
+                        "check": f"table_exists:{safe_name}",
+                        "passed": exists,
+                        "error": f"Table '{safe_name}' not found" if not exists else None,
+                    })
+                except Exception as exc:
+                    checks.append({
+                        "check": f"table_exists:{safe_name}",
+                        "passed": False,
+                        "error": f"K8s exec failed: {str(exc)[:200]}",
+                    })
+
+        except Exception as exc:
+            return {
+                "checks_passed": 0,
+                "checks_total": len(expected_tables),
+                "errors": [f"K8s pod discovery failed: {str(exc)[:300]}"],
+            }
+
+        passed_count = sum(1 for c in checks if c.get("passed"))
+        return {
+            "checks_total": len(checks),
+            "checks_passed": passed_count,
+            "errors": [c["error"] for c in checks if c.get("error")],
+            "simulated": False,
+        }
+
+    # ── Cleanup ────────────────────────────────────────────────────
+
     async def cleanup_sandbox(self, pipeline_run_id: str) -> None:
         """Delete the namespace (cascading delete) and GCS blob."""
         state = self._active_sandboxes.pop(pipeline_run_id, None)

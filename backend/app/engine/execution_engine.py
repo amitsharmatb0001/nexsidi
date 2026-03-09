@@ -1886,10 +1886,50 @@ def _extract_cwe_from_semgrep(metadata: dict[str, Any]) -> str | None:
 # ── Singleton ───────────────────────────────────────────────────────
 
 _engine: ExecutionEngine | None = None
+_k8s_executor: Any | None = None
 
 
-def get_execution_engine(config: SandboxConfig | None = None) -> ExecutionEngine:
-    """Get or create the execution engine singleton."""
+def get_execution_engine(config: SandboxConfig | None = None) -> Any:
+    """Get the configured execution engine (Docker or Kubernetes).
+
+    K8S-FIX: Now respects ``executor_type`` setting AND auto-detects.
+    When ``executor_type="kubernetes"`` or when Docker is unavailable
+    but a GKE cluster is configured, returns KubernetesExecutor.
+
+    Auto-detection logic:
+    1. If executor_type == "kubernetes" → always K8s
+    2. If executor_type == "docker" AND Docker available → Docker
+    3. If executor_type == "docker" AND Docker unavailable AND
+       gke_cluster_name configured → K8s (auto-failover)
+    4. If executor_type == "docker" AND Docker unavailable AND
+       no gke_cluster_name → Docker (will use simulation)
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    executor_type = getattr(settings, "executor_type", "docker")
+
+    # Auto-detect: if Docker is not available but K8s cluster IS configured,
+    # automatically switch to Kubernetes instead of falling to simulation.
+    if executor_type == "docker" and not _check_docker_available():
+        gke_name = getattr(settings, "gke_cluster_name", "")
+        if gke_name:
+            executor_type = "kubernetes"
+            logger.info(
+                "executor_auto_detected",
+                executor_type="kubernetes",
+                reason=f"Docker unavailable, GKE cluster '{gke_name}' configured "
+                       "— routing to Kubernetes executor instead of simulation",
+            )
+
+    if executor_type == "kubernetes":
+        global _k8s_executor
+        if _k8s_executor is None:
+            from app.engine.k8s_executor import KubernetesExecutor
+
+            _k8s_executor = KubernetesExecutor()
+        return _k8s_executor
+
     global _engine
     if _engine is None:
         _engine = ExecutionEngine(config)
@@ -1899,16 +1939,7 @@ def get_execution_engine(config: SandboxConfig | None = None) -> ExecutionEngine
 def get_executor(config: SandboxConfig | None = None) -> Any:
     """Factory: return the configured executor (Docker or Kubernetes).
 
-    I6-FIX: When ``executor_type="kubernetes"`` in settings, returns a
-    ``KubernetesExecutor`` for true process isolation via ephemeral K8s
-    namespaces.  Default ``"docker"`` returns the existing ExecutionEngine.
+    I6-FIX / K8S-FIX: Now delegates to get_execution_engine() which
+    handles auto-detection. Kept for backward compat.
     """
-    from app.config import get_settings
-
-    settings = get_settings()
-    executor_type = getattr(settings, "executor_type", "docker")
-    if executor_type == "kubernetes":
-        from app.engine.k8s_executor import KubernetesExecutor
-
-        return KubernetesExecutor()
     return get_execution_engine(config)
