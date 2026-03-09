@@ -39,6 +39,14 @@ class PipelineCostLimitError(RuntimeError):
     """Pipeline cost exceeded _HARD_CAP_USD; raised inside ProjectCostTracker.record()."""
 
 
+# TRUNCATION-FIX: Raised when AI response is cut off by token limit.
+# Truncated code is worse than no code — silently returning incomplete output
+# causes downstream agents to process broken files, generate incorrect tests,
+# and ultimately deliver non-functional apps to customers.
+class AIResponseTruncatedError(RuntimeError):
+    """AI response was truncated (stop_reason=max_tokens). Caller should retry with higher max_tokens."""
+
+
 # F6-FIX: Module-level registry mapping run_id → ProjectCostTracker.
 # Lives here (not pipeline.py) so AIRouter.call() can do pre-flight cost checks
 # without circular imports.
@@ -838,7 +846,28 @@ class AIRouter:
                     output_tokens=response.output_tokens,
                     request_id=request_id,
                     attempt=attempt + 1,
+                    was_truncated=response.was_truncated,
                 )
+
+                # TRUNCATION-FIX: FAIL on truncated responses instead of silently
+                # returning incomplete code. Truncated code/JSON causes downstream
+                # agents to process broken files and deliver non-functional apps.
+                if response.was_truncated:
+                    logger.error(
+                        "ai_response_truncated",
+                        model=spec.display_name,
+                        output_tokens=response.output_tokens,
+                        request_id=request_id,
+                        task_type=request.task_type,
+                        hint="Response was cut off by token limit. Increase max_tokens "
+                             "or split the request into smaller parts.",
+                    )
+                    raise AIResponseTruncatedError(
+                        f"AI response truncated (stop_reason=max_tokens) from "
+                        f"{spec.display_name} after {response.output_tokens} output tokens. "
+                        f"Task type: {request.task_type}. Increase max_tokens or split the request."
+                    )
+
                 return response
 
             except httpx.HTTPStatusError as exc:

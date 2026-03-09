@@ -690,13 +690,17 @@ class Pranav:
 
             # Step 3: Deploy frontend (simulation or real)
             if is_sim:
-                # Simulation: generate a plausible frontend URL
-                frontend_url = backend_url.replace("api.", "app.").replace(
-                    "-backend", ""
+                # SIMULATION-FIX: Do NOT generate fake frontend URLs.
+                # A fake URL that looks real but doesn't exist is worse than no URL.
+                # Previously generated plausible-looking URLs like "app.nexsidi.com:3000"
+                # that were completely non-functional. Now we set frontend_url to empty
+                # and log a clear WARNING so the delivery pipeline surfaces it.
+                frontend_url = ""
+                logger.warning(
+                    "frontend_deploy_skipped_simulation",
+                    reason="Backend deployment was simulated — frontend deployment also skipped. "
+                           "No real URL exists. Configure RAILWAY_TOKEN or VERCEL_TOKEN for real deployment.",
                 )
-                if frontend_url == backend_url:
-                    frontend_url = backend_url.rstrip("/") + ":3000"
-                logger.info("frontend_deploy_simulated", url=frontend_url)
             else:
                 # Real deploy: Vercel-style frontend deployment
                 frontend_config = DeployConfig(

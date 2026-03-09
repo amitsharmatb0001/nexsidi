@@ -640,15 +640,31 @@ class Aarav:
 
             elapsed = (time.monotonic() - phase_start) * 1000
 
-            # Handle skipped results (Docker unavailable returns passed=None, skipped=True)
+            # FAKE-KILL: Docker unavailable = HARD FAIL, not silent skip.
+            # Previously returned TestStatus.SKIPPED which let the pipeline
+            # report SUCCESS without ever running browser tests. Now it's a
+            # clear FAILURE so the pipeline knows tests did NOT pass.
             skipped = [r for r in browser_results if r.get("skipped", False)]
             if skipped and len(skipped) == len(browser_results):
                 return TestPhaseResult(
                     phase=TestPhase.BROWSER_TEST,
-                    status=TestStatus.SKIPPED,
+                    status=TestStatus.FAILED,
                     duration_ms=elapsed,
                     tests_total=len(browser_results),
-                    output=f"Browser tests skipped ({len(skipped)} pages — Docker unavailable)",
+                    tests_failed=len(browser_results),
+                    output=(
+                        f"FAILED: Browser tests could not run ({len(skipped)} pages) — "
+                        "Docker/Playwright unavailable. This is a HARD FAILURE, not a skip. "
+                        "Ensure Docker is running and Playwright is installed in the sandbox."
+                    ),
+                    errors=[{
+                        "type": "infrastructure",
+                        "details": (
+                            "Docker/Playwright unavailable — cannot execute browser tests. "
+                            "All pages marked as FAILED (not skipped). Fix Docker setup or "
+                            "configure the GKE sandbox with Playwright support."
+                        ),
+                    }],
                 )
 
             passed = sum(1 for r in browser_results if r.get("passed") is True)

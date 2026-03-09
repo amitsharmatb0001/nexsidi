@@ -1589,7 +1589,17 @@ class Aanya:
             "- **list_files()** — see all files written so far",
             "- **ask_backend(question, context?)** — ask Shubham about API contracts",
             "- **ask_architect(question, context?)** — ask Vikram about design decisions",
-            "- **task_complete(summary)** — signal completion (call LAST when all files written)",
+            "- **run_frontend_test(sandbox_id, test_command)** — run vitest/jest inside the sandbox",
+            "- **run_type_check(sandbox_id)** — run tsc --noEmit to check TypeScript types",
+            "- **task_complete(summary)** — signal completion (call LAST when all files written AND tested)",
+            "",
+            "## MANDATORY: Run Tests Before Completion",
+            "After writing ALL frontend files, you MUST:",
+            "1. Call `run_type_check` to verify TypeScript types compile cleanly. Fix any type errors.",
+            "2. Call `run_frontend_test` with the appropriate test command (e.g. 'npx vitest run --reporter=verbose').",
+            "3. If tests fail, FIX the code and re-run. Repeat until tests pass.",
+            "4. You are FORBIDDEN from calling `task_complete` until BOTH type-check and tests pass.",
+            "5. A `task_complete` without preceding successful test runs is a FAILURE.",
             "",
         ])
 
