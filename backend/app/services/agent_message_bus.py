@@ -35,7 +35,6 @@ Key structure in Valkey:
 
 from __future__ import annotations
 
-import threading as _threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any

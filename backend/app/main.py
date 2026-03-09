@@ -183,6 +183,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 hint="LangGraph graph could not compile — pipeline may fall back to legacy.",
             )
 
+    # EVENT-LOOP FIX: Probe Docker availability ONCE at startup.
+    # Populates the cache so all subsequent sync reads in
+    # get_execution_engine() / build_sandbox() see the correct value.
+    try:
+        from app.engine.execution_engine import init_docker_detection
+        _docker_ok = await init_docker_detection()
+        logger.info("docker_detection_complete", docker_available=_docker_ok)
+    except Exception as exc:
+        logger.warning("docker_detection_failed", error=_sanitize_error(exc))
+
     # AI Router (lazy-init, just ensure it's importable)
     _ = get_ai_router()
     logger.info("ai_router_ready")

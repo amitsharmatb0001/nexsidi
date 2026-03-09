@@ -644,7 +644,25 @@ async def run_agent(
         # the agent as FAILED instead of triggering the interrupt handler.
         raise
 
+    except KeyboardInterrupt:
+        # Never swallow keyboard interrupt — allow clean shutdown.
+        raise
+
     except Exception as exc:
+        # DEADLOCK FIX: If an agent hits a deadlock, re-raise so the pipeline
+        # can skip the ask or route differently — don't mark the whole agent FAILED.
+        try:
+            from app.services.agent_message_bus import AgentDeadlockDetected
+            if isinstance(exc, AgentDeadlockDetected):
+                logger.warning(
+                    "agent_deadlock_propagated",
+                    agent=agent.name,
+                    pipeline_run_id=pipeline_run_id,
+                    error=str(exc)[:300],
+                )
+                raise
+        except ImportError:
+            pass  # agent_message_bus not available — continue to failure handling
         completed_at = time.monotonic()
         # R11-FIX: Sanitize exception before logging/storing.
         # httpx.HTTPStatusError can contain full request headers

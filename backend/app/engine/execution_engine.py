@@ -103,6 +103,11 @@ _DOCKER_CACHE_TTL = 60  # seconds — re-probe Docker at most once per minute
 import threading as _threading
 _docker_cache_lock = _threading.Lock()
 
+# CONCURRENCY FIX: Limit concurrent Docker builds to prevent CPU starvation.
+# Without this, N simultaneous pipeline runs = N docker-compose builds = OOM.
+# For MVP (2-3 users): 3 concurrent builds is plenty.
+_BUILD_SEMAPHORE = asyncio.Semaphore(3)
+
 
 def _check_docker_available() -> bool:
     """Check whether Docker is available (sync, cached).
@@ -519,7 +524,10 @@ class ExecutionEngine:
                     return False
 
             # SANDBOX-FIX B (step 1): Check Docker availability
-            if not _check_docker_available():
+            # EVENT-LOOP FIX: Use the async probe (populates cache + non-blocking).
+            # The sync _check_docker_available() only reads cache — on first call
+            # it always returns False because nobody populated the cache yet.
+            if not await _check_docker_available_async():
                 from app.config import get_settings
 
                 settings = get_settings()
@@ -586,15 +594,19 @@ class ExecutionEngine:
                 json.dump(SECCOMP_PROFILE, fh, indent=2)
 
             # SANDBOX-FIX B (step 4): Run docker compose build --no-cache
+            # CONCURRENCY FIX: Acquire build semaphore to prevent CPU starvation.
+            # Without this, N concurrent pipeline runs all building Docker images
+            # simultaneously will OOM-kill the host. Semaphore limits to 3.
             logger.info(
                 "sandbox_docker_build_start",
                 sandbox_id=state.sandbox_id,
                 temp_dir=temp_dir,
             )
-            proc = await _run_subprocess(
-                ["docker", "compose", "-f", compose_path, "build", "--no-cache"],
-                timeout=self._config.build_timeout,
-            )
+            async with _BUILD_SEMAPHORE:
+                proc = await _run_subprocess(
+                    ["docker", "compose", "-f", compose_path, "build", "--no-cache"],
+                    timeout=self._config.build_timeout,
+                )
             state.build_logs = proc.stdout + proc.stderr
 
             # Directive 5: Stream build output to Live AI Studio terminal
@@ -673,8 +685,8 @@ class ExecutionEngine:
         try:
             # SANDBOX-FIX C: Real docker-compose up implementation.
 
-            # Step 1: Check Docker availability
-            if not _check_docker_available():
+            # Step 1: Check Docker availability (async — non-blocking probe)
+            if not await _check_docker_available_async():
                 from app.config import get_settings
 
                 settings = get_settings()
@@ -1907,6 +1919,25 @@ def _extract_cwe_from_semgrep(metadata: dict[str, Any]) -> str | None:
         if first.startswith("CWE-"):
             return first.split(":")[0].strip()
     return None
+
+
+# ── Startup Probe ────────────────────────────────────────────────────
+
+
+async def init_docker_detection() -> bool:
+    """Probe Docker availability at startup and populate the cache.
+
+    EVENT-LOOP FIX: The sync _check_docker_available() only reads cache.
+    Without this startup call, the cache is always empty → Docker is never
+    detected → get_execution_engine() auto-switches to K8s even when Docker
+    IS available.  Call this in main.py lifespan BEFORE any pipeline runs.
+
+    Returns:
+        True if Docker is available, False otherwise.
+    """
+    available = await _check_docker_available_async()
+    logger.info("docker_detection_startup_probe", docker_available=available)
+    return available
 
 
 # ── Singleton ───────────────────────────────────────────────────────
