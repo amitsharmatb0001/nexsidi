@@ -87,6 +87,25 @@ class MistakeMemory:
         # Returns prompt section or empty string
     """
 
+    # V5-FIX (MEDIUM-7): Agent → language mapping for cross-agent filtering.
+    # Prevents Shubham's Python lessons leaking into Aanya's TypeScript context
+    # (e.g., ``if value is not None`` → ``if (value !== None)`` in TS).
+    _AGENT_LANGUAGE: dict[str, str] = {
+        "shubham": "python",
+        "aanya": "typescript",
+        "karan": "python",        # security tools are Python-based
+        "navya": "python",
+        "deepika": "python",
+        "aarav": "python",        # test runner
+        "fixer": "polyglot",      # fixer works with both languages
+        "vikram": "architecture",  # language-agnostic
+        "dhruv": "sql",
+        "vanya": "design",
+        "pranav": "devops",
+        "docs_agent": "markdown",
+        "git_agent": "devops",
+    }
+
     def record_failure(
         self,
         agent_name: str,
@@ -109,6 +128,8 @@ class MistakeMemory:
             "timestamp": time.time(),
             # FIX-48: 90-day expiry — prevents unbounded ChromaDB growth
             "expiry_timestamp": time.time() + (90 * 24 * 3600),
+            # V5-FIX (MEDIUM-7): Language tag for cross-agent filtering
+            "language": self._AGENT_LANGUAGE.get(agent_name, "unknown"),
         }
         if context:
             # Store serializable context fields
@@ -185,6 +206,8 @@ class MistakeMemory:
             "outcome": "resolved",  # V5-FIX: Distinguishes from failures
             "timestamp": time.time(),
             "expiry_timestamp": time.time() + (90 * 24 * 3600),
+            # V5-FIX (MEDIUM-7): Language tag for cross-agent filtering
+            "language": self._AGENT_LANGUAGE.get(agent_name, "unknown"),
         }
         if context:
             for k, v in context.items():
@@ -347,15 +370,29 @@ class MistakeMemory:
         input_context: str,
         exclude_agent: str = "",
         n_results: int = 3,
+        requesting_agent: str = "",
     ) -> list[dict[str, Any]]:
-        """CHANGE-15: Query shared lessons from ALL agents."""
+        """CHANGE-15: Query shared lessons from ALL agents.
+
+        V5-FIX (MEDIUM-7): Filter by compatible language to prevent
+        cross-language contamination (Python lessons → TypeScript agents).
+        "polyglot" agents (fixer) and "architecture" agents (vikram)
+        receive lessons from all languages.
+        """
+        # V5-FIX (MEDIUM-7): Determine compatible languages for the requesting agent
+        req_lang = self._AGENT_LANGUAGE.get(requesting_agent, "unknown")
+        # polyglot/architecture/unknown agents see everything; others only see same language
+        _universal = {"polyglot", "architecture", "unknown"}
+        filter_language = req_lang not in _universal
+
         chroma = _get_chroma()
         if chroma:
             try:
                 shared_coll = chroma.get_or_create_collection("mistakes_shared")
                 results = shared_coll.query(
                     query_texts=[f"{task_type}: {input_context[:500]}"],
-                    n_results=n_results,
+                    # Fetch extra to compensate for post-filtering
+                    n_results=n_results * 3 if filter_language else n_results,
                 )
                 if results and results.get("metadatas"):
                     mistakes = []
@@ -370,6 +407,12 @@ class MistakeMemory:
                             m for m in mistakes
                             if m.get("agent_name") != exclude_agent
                         ]
+                    # V5-FIX (MEDIUM-7): Language filter
+                    if filter_language:
+                        mistakes = [
+                            m for m in mistakes
+                            if m.get("language", "unknown") in (req_lang, "polyglot", "architecture", "unknown")
+                        ]
                     return mistakes[:n_results]
             except Exception:
                 pass  # Non-critical — error logged upstream or handled by caller
@@ -380,6 +423,7 @@ class MistakeMemory:
             e for e in entries
             if e.get("task_type") == task_type
             and e.get("agent_name") != exclude_agent
+            and (not filter_language or e.get("language", "unknown") in (req_lang, "polyglot", "architecture", "unknown"))
         ]
         return matched[-n_results:]
 
@@ -400,7 +444,11 @@ class MistakeMemory:
         mistakes = self.query_similar_mistakes(agent_name, task_type, context)
         successes = self._query_successes(agent_name, task_type, context)
         # CHANGE-15: Cross-agent shared lessons
-        shared = self._query_shared_mistakes(task_type, context, exclude_agent=agent_name)
+        # V5-FIX (MEDIUM-7): Pass requesting_agent for language filtering
+        shared = self._query_shared_mistakes(
+            task_type, context, exclude_agent=agent_name,
+            requesting_agent=agent_name,
+        )
 
         if not mistakes and not successes and not shared:
             return ""

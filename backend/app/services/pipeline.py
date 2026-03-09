@@ -184,9 +184,14 @@ _AGENT_CONTEXT_DEPS: dict[str, list[str]] = {
     "aarav":      ["vikram", "shubham", "aanya", "dhruv"],
     # FIX-37: attack_tester needs context from all code generators + security audit
     "attack_tester": ["vikram", "shubham", "aanya", "karan"],
-    # BLOCKER-3 FIX: Fixer needs post_deploy_verify context so it can see
-    # live deployment failures (status codes, error bodies) — not just test results.
-    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika", "attack_tester", "post_deploy_verify"],
+    # Fixer needs post_deploy_verify context so it can see live deployment
+    # failures (status codes, error bodies) — not just test results.
+    # V5-FIX (HIGH-8): Removed "attack_tester" from fixer deps.  The fixer's
+    # _collect_errors() only reads karan/navya/deepika/aarav output.  Including
+    # attack_tester in deps exposes raw attack payloads (SQL injection strings,
+    # XSS probes) to the fixer's LLM, which may attempt superficial "fixes"
+    # (adding comments, not parameterized queries) and label them as resolved.
+    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika", "post_deploy_verify"],
     "pranav":     ["vikram", "shubham", "aanya"],
     # HIGH-2 FIX: GitAgent needs architecture contract + code outputs for repo creation
     "git_agent":  ["vikram", "shubham", "aanya", "docs_agent"],

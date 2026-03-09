@@ -2140,19 +2140,61 @@ def select_model_for_generation(estimated_lines: int, task_type: str = "general"
 # ── Cost Tracking ──────────────────────────────────────────────────
 
 
-# Approximate cost per 1K tokens (input/output) by model tier
-# Prices in USD, updated for 2025 pricing
-_COST_PER_1K_TOKENS: dict[str, dict[str, float]] = {
-    "gemini-flash": {"input": 0.00015, "output": 0.0006},
-    "haiku": {"input": 0.00025, "output": 0.00125},
-    "gemini-pro": {"input": 0.00125, "output": 0.005},
-    "gemini-3-flash": {"input": 0.0002, "output": 0.0008},
-    "sonnet-4.5": {"input": 0.003, "output": 0.015},
-    "sonnet": {"input": 0.003, "output": 0.015},
-    "gemini-3.1-flash-lite": {"input": 0.0002, "output": 0.0008},
-    "gemini-3.1-pro": {"input": 0.00175, "output": 0.007},
-    "opus": {"input": 0.015, "output": 0.075},
+# V5-FIX (CRITICAL-1): Derive per-1K pricing from cost_service's
+# authoritative per-million pricing — single source of truth.
+# Previously this was a hardcoded dict that used OLD Haiku 3 pricing
+# ($0.25/$1.25 per M) for Haiku 4.5 (actual: $0.80/$4.00 per M),
+# under-reporting Haiku costs by 3.2×.  By deriving from cost_service,
+# pricing stays consistent across the real-time tracker (here) and
+# the post-run cost report (cost_service.calculate_pipeline_cost).
+
+# Mapping: ai_router alias → cost_service model key
+_ALIAS_TO_COST_KEY: dict[str, str] = {
+    "gemini-flash":         "gemini-2.5-flash",
+    "haiku":                "claude-haiku-4-5",
+    "gemini-pro":           "gemini-2.5-pro",
+    "gemini-3-flash":       "gemini-3-flash-preview",
+    "sonnet-4.5":           "claude-sonnet-4-5",
+    "sonnet":               "claude-sonnet-4-6",
+    "gemini-3.1-flash-lite": "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro":       "gemini-3.1-pro-preview",
+    "opus":                 "claude-opus-4-6",
 }
+
+
+def _build_cost_per_1k_tokens() -> dict[str, dict[str, float]]:
+    """Derive per-1K-token pricing from cost_service per-million table."""
+    try:
+        from app.services.cost_service import _ALL_PRICING
+    except ImportError:
+        logger.warning("cost_service_unavailable_using_fallback_pricing")
+        # Hardcoded fallback (should never happen in production)
+        return {
+            "gemini-flash": {"input": 0.00015, "output": 0.0006},
+            "haiku": {"input": 0.0008, "output": 0.004},
+            "gemini-pro": {"input": 0.00125, "output": 0.005},
+            "gemini-3-flash": {"input": 0.0002, "output": 0.0008},
+            "sonnet-4.5": {"input": 0.003, "output": 0.015},
+            "sonnet": {"input": 0.003, "output": 0.015},
+            "gemini-3.1-flash-lite": {"input": 0.0002, "output": 0.0008},
+            "gemini-3.1-pro": {"input": 0.00175, "output": 0.007},
+            "opus": {"input": 0.015, "output": 0.075},
+        }
+
+    table: dict[str, dict[str, float]] = {}
+    for alias, cs_key in _ALIAS_TO_COST_KEY.items():
+        per_m = _ALL_PRICING.get(cs_key)
+        if per_m:
+            table[alias] = {
+                "input": per_m["input"] / 1000,
+                "output": per_m["output"] / 1000,
+            }
+        else:
+            logger.warning("cost_derivation_miss", alias=alias, cost_key=cs_key)
+    return table
+
+
+_COST_PER_1K_TOKENS: dict[str, dict[str, float]] = _build_cost_per_1k_tokens()
 
 
 @dataclass
