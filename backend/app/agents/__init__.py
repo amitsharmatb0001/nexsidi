@@ -45,7 +45,9 @@ def register_all_agents() -> int:
         "app.agents.pranav",
         "app.agents.docs_agent",
         "app.agents.git_agent",
-        "app.agents.whatsapp_agent",
+        # MVP-FIX: WhatsApp agent disabled — not needed for internal use.
+        # Behind ENABLE_WHATSAPP feature flag anyway.  Re-enable for B2C.
+        # "app.agents.whatsapp_agent",
         # V5-FIX (DISCONNECT-2): support_agent is registered but never wired
         # into any pipeline stage.  No stage produces "support_requests" context.
         # It wastes import time + LLM context.  Re-enable when support ticket
