@@ -153,20 +153,10 @@ class PlannerAgent:
                 reasoning="No eligible stages (may be stuck due to failures).",
             )
 
-        # For simple cases (1-2 eligible), skip AI call
-        if len(eligible) <= 2:
-            actions = [
-                PlannedAction(stage=s, priority="required", reason="dependencies satisfied")
-                for s in eligible
-            ]
-            can_parallel = len(actions) > 1 and self._can_parallelize(eligible)
-            return PlannerDecision(
-                next_actions=actions,
-                reasoning=f"Dependencies satisfied for: {', '.join(eligible)}",
-                can_parallelize=can_parallel,
-            )
-
-        # Complex case: ask AI to prioritize
+        # HIGH-1 FIX: Always call AI — even for 1-2 eligible stages.
+        # The planner must consider failure history, project context, and
+        # cost/time budgets to decide WHAT to run and HOW (parallel vs serial).
+        # Hardcoded "required" priorities bypass all intelligence.
         return await self._ai_plan(
             eligible, project_state, completed_stages, last_result,
         )

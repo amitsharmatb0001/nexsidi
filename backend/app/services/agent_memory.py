@@ -27,15 +27,40 @@ _FALLBACK_STORE: dict[str, list[dict[str, Any]]] = {}
 
 
 def _get_chroma():
-    """Lazy-initialize ChromaDB client (shared with mistake_memory)."""
+    """Lazy-initialize ChromaDB client (shared with mistake_memory).
+
+    BLOCKER-2 FIX: Uses PersistentClient in production/staging so agent
+    knowledge survives process restarts.  Ephemeral Client only in dev.
+    """
     global _chroma_client
     if _chroma_client is not None:
         return _chroma_client
     try:
         import chromadb
-        _chroma_client = chromadb.Client()
+
+        from app.config import get_settings
+        settings = get_settings()
+
+        if settings.environment in ("production", "staging"):
+            import os
+            persist_dir = os.environ.get(
+                "CHROMADB_PERSIST_DIR",
+                "/data/chromadb",
+            )
+            os.makedirs(persist_dir, exist_ok=True)
+            _chroma_client = chromadb.PersistentClient(path=persist_dir)
+            logger.info(
+                "chromadb_persistent_client_initialized",
+                persist_dir=persist_dir,
+                environment=settings.environment,
+            )
+        else:
+            _chroma_client = chromadb.Client()
+            logger.info("chromadb_ephemeral_client_initialized")
+
         return _chroma_client
-    except (ImportError, Exception):
+    except (ImportError, Exception) as exc:
+        logger.warning("chromadb_init_failed", error=str(exc)[:200])
         return None
 
 

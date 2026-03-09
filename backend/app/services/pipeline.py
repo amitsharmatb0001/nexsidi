@@ -184,8 +184,12 @@ _AGENT_CONTEXT_DEPS: dict[str, list[str]] = {
     "aarav":      ["vikram", "shubham", "aanya", "dhruv"],
     # FIX-37: attack_tester needs context from all code generators + security audit
     "attack_tester": ["vikram", "shubham", "aanya", "karan"],
-    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika", "attack_tester"],
+    # BLOCKER-3 FIX: Fixer needs post_deploy_verify context so it can see
+    # live deployment failures (status codes, error bodies) — not just test results.
+    "fixer":      ["vikram", "shubham", "aanya", "aarav", "karan", "navya", "deepika", "attack_tester", "post_deploy_verify"],
     "pranav":     ["vikram", "shubham", "aanya"],
+    # HIGH-2 FIX: GitAgent needs architecture contract + code outputs for repo creation
+    "git_agent":  ["vikram", "shubham", "aanya", "docs_agent"],
     # FIX-37: Tilotma review must see attack_tester results for GO/NO-GO decision
     "tilotma_review": ["vikram", "shubham", "aanya", "aarav", "attack_tester", "karan", "navya", "deepika"],
 }

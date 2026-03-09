@@ -326,6 +326,16 @@ async def documentation_node(state: PipelineState) -> PipelineState:
     return await _run_agent_node(state, "docs_agent", "documentation")
 
 
+async def git_operations_node(state: PipelineState) -> PipelineState:
+    """GitAgent: Create repo, push code, open PR.
+
+    HIGH-2 FIX: GitAgent was registered (git_agent.py) and imported via
+    agents/__init__.py but never wired into the pipeline graph.  Without
+    this node, generated code was never pushed to a repository.
+    """
+    return await _run_agent_node(state, "git_agent", "git_operations")
+
+
 async def delivery_node(state: PipelineState) -> PipelineState:
     """Assemble delivery package (ZIP with code, reports, config)."""
     # Delivery is handled by the existing delivery engine
@@ -380,12 +390,28 @@ def route_frontend_or_skip(state: PipelineState) -> str:
 
 
 def route_after_tilotma_review(state: PipelineState) -> str:
-    """Tilotma GO/NO-GO: approve → deploy, reject → fix."""
+    """Tilotma GO/NO-GO: approve → deploy, reject → fix.
+
+    HIGH-6 FIX: Normalize verdict string robustly.  Tilotma might return
+    "NO GO", "No-Go", "NOGO", "no_go", "REJECT", "rejected", "fail", etc.
+    We normalize to a canonical form before matching against the rejection set.
+    """
     context = state.get("context", {})
     tilotma_output = context.get("tilotma", {})
 
-    verdict = tilotma_output.get("verdict", "GO")
-    if isinstance(verdict, str) and verdict.upper() in ("NO-GO", "NOGO", "NO_GO", "REJECT"):
+    raw_verdict = tilotma_output.get("verdict", "GO")
+    if not isinstance(raw_verdict, str):
+        raw_verdict = str(raw_verdict)
+
+    # Normalize: uppercase, replace spaces/underscores with hyphens, strip
+    normalized = raw_verdict.upper().strip().replace(" ", "-").replace("_", "-")
+
+    _REJECTION_VERDICTS = {
+        "NO-GO", "NOGO", "NO--GO", "REJECT", "REJECTED",
+        "FAIL", "FAILED", "BLOCK", "BLOCKED",
+    }
+
+    if normalized in _REJECTION_VERDICTS:
         return "fixing"
     return "checkpoint_testing"
 
@@ -416,7 +442,12 @@ def route_after_testing(state: PipelineState) -> str:
 
 
 def route_after_post_deploy(state: PipelineState) -> str:
-    """Route after post-deployment verification: critical failures → fixing, else → delivery."""
+    """Route after post-deployment verification: critical failures → fixing, else → delivery.
+
+    HIGH-7 FIX: Increment fix_retest_cycle BEFORE routing to fixing.
+    Without this, the counter never advances and the 3-cycle safety cap
+    never triggers → infinite fix loop on persistent post-deploy failures.
+    """
     context = state.get("context", {})
     verify_output = context.get("post_deploy_verify", {})
 
@@ -426,6 +457,12 @@ def route_after_post_deploy(state: PipelineState) -> str:
         if fix_cycle >= 3:
             logger.warning("post_deploy_fix_limit", extra={"cycle": fix_cycle})
             return "documentation"  # Proceed with warning after 3 cycles
+        # Increment BEFORE routing to fixing — this is what was missing
+        state["fix_retest_cycle"] = fix_cycle + 1
+        logger.info(
+            "post_deploy_fix_cycle_incremented",
+            extra={"cycle": fix_cycle + 1, "critical_failures": critical_failures},
+        )
         return "fixing"
     return "documentation"
 
@@ -441,14 +478,14 @@ def build_pipeline_graph() -> StateGraph:
         → backend_build → [frontend_build] → quality_review
         → testing → security_audit → compliance → tilotma_review
         → [fixing loop] → checkpoint_testing → deployment
-        → post_deploy_verify → delivery → END
+        → post_deploy_verify → documentation → git_operations → delivery → END
 
     Conditional edges:
         challenge → architecture (retry, max 2) or database_or_skip
         testing → fixing (if failures) or security_audit
         tilotma_review → fixing (reject) or checkpoint_testing (approve)
         fixing → quality_review (MODERATE/STRUCTURAL) or testing (TRIVIAL)
-        post_deploy_verify → fixing (critical) or delivery
+        post_deploy_verify → fixing (critical) or documentation
     """
     graph = StateGraph(PipelineState)
 
@@ -472,6 +509,7 @@ def build_pipeline_graph() -> StateGraph:
     graph.add_node("deployment", deployment_node)
     graph.add_node("post_deploy_verify", post_deploy_verify_node)
     graph.add_node("documentation", documentation_node)  # AUDIT-B1-FIX
+    graph.add_node("git_operations", git_operations_node)  # HIGH-2 FIX
     graph.add_node("delivery", delivery_node)
 
     # ── Set entry point ──
@@ -581,8 +619,9 @@ def build_pipeline_graph() -> StateGraph:
         },
     )
 
-    # Documentation → Delivery → END
-    graph.add_edge("documentation", "delivery")  # AUDIT-B1-FIX
+    # Documentation → Git Operations → Delivery → END
+    graph.add_edge("documentation", "git_operations")  # HIGH-2 FIX: was documentation→delivery
+    graph.add_edge("git_operations", "delivery")
     graph.add_edge("delivery", END)
 
     return graph

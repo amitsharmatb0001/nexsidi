@@ -12,10 +12,23 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 # Pricing per million tokens (as of 2026-03) — USD
+# HIGH-5 FIX: Model keys must match the model_id strings from ai_router.py.
+# The router stores model_used = model_id (e.g. "claude-sonnet-4-6-20250514"),
+# NOT the short alias.  We map both full IDs and short aliases so lookups
+# work regardless of which string lands in pipeline.steps.model_used.
 _ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
-    "claude-opus-4-6": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
-    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
-    "claude-haiku-4-6": {"input": 0.8, "output": 4.0, "cache_read": 0.08, "cache_write": 1.0},
+    # Opus 4.6
+    "claude-opus-4-6-20250514":    {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
+    "claude-opus-4-6":             {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_write": 18.75},
+    # Sonnet 4.6
+    "claude-sonnet-4-6-20250514":  {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+    "claude-sonnet-4-6":           {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+    # Sonnet 4.5
+    "claude-sonnet-4-5-20241022":  {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+    "claude-sonnet-4-5":           {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
+    # Haiku 4.5
+    "claude-haiku-4-5-20251001":   {"input": 0.8, "output": 4.0, "cache_read": 0.08, "cache_write": 1.0},
+    "claude-haiku-4-5":            {"input": 0.8, "output": 4.0, "cache_read": 0.08, "cache_write": 1.0},
 }
 _GEMINI_PRICING: dict[str, dict[str, float]] = {
     "gemini-2.5-flash": {"input": 0.15, "output": 0.6, "cache_read": 0.0, "cache_write": 0.0},
