@@ -697,16 +697,31 @@ class AIRouter:
         # Anthropic circuit was open, the call would fail, record another
         # CB failure (extending the open period), and never fall back to
         # an available provider. Same pattern as R20-FIX for security tasks.
+        #
+        # V5-FIX (CLAUDE-BLOCK): When mode="gemini", reject any model_override
+        # pointing to an Anthropic provider model. This closes the leak path
+        # where explicit model_override="sonnet" could bypass the mode filter
+        # and route to Claude even when enable_claude=False.
         if request.model_override and request.model_override in MODELS:
             override_spec = MODELS[request.model_override]
-            if await self._circuits[override_spec.provider].is_available():
+            if mode == "gemini" and override_spec.provider == Provider.ANTHROPIC:
+                logger.warning(
+                    "claude_model_override_blocked",
+                    model=request.model_override,
+                    mode=mode,
+                    msg="Claude model requested via model_override but mode is 'gemini'. "
+                        "Falling back to mode-appropriate model. Set enable_claude=True to use Claude.",
+                )
+                # Fall through to complexity routing (step 3) which uses gemini-only map
+            elif await self._circuits[override_spec.provider].is_available():
                 return override_spec
-            logger.warning(
-                "model_override_circuit_open",
-                model=request.model_override,
-                provider=override_spec.provider.value,
-            )
-            return await self._find_available_model(request.model_override)
+            else:
+                logger.warning(
+                    "model_override_circuit_open",
+                    model=request.model_override,
+                    provider=override_spec.provider.value,
+                )
+                return await self._find_available_model(request.model_override)
 
         # 2. Security override — mode-appropriate security model
         # R20-FIX: Check circuit breaker BEFORE returning security model.
@@ -825,6 +840,21 @@ class AIRouter:
                     2000,  # minimum estimate
                 )
                 tracker.estimate_and_check(spec.display_name, estimated_input_tokens=est_input)
+
+        # V5-FIX (CLAUDE-BLOCK): Defense-in-depth — hard block Claude dispatch
+        # in gemini mode. Even if select_model() somehow returns an Anthropic
+        # model (bug, race condition, future code change), this prevents the
+        # actual API call from happening.
+        if spec.provider == Provider.ANTHROPIC and get_ai_mode() == "gemini":
+            logger.error(
+                "claude_dispatch_blocked",
+                model=spec.display_name,
+                mode="gemini",
+                msg="Anthropic model reached call() dispatch in gemini mode. "
+                    "This should not happen — select_model() should have blocked it. "
+                    "Falling back to gemini-pro.",
+            )
+            spec = MODELS.get("gemini-pro", MODELS["gemini-flash"])
 
         logger.info(
             "ai_call_start",
@@ -1752,12 +1782,21 @@ class AIRouter:
     def _build_google_body(
         self, spec: ModelSpec, request: AIRequest, cached_content: str | None = None,
     ) -> dict[str, Any]:
-        """Build Google Generative Language API request body."""
+        """Build Google Generative Language API request body.
+
+        V5-FIX (HIGH-12): Gemini API only supports "user" and "model" roles in
+        contents — NOT "system". System prompts MUST use the top-level
+        ``systemInstruction`` field. This method correctly:
+        1. Skips role="system" messages (line below)
+        2. Uses ``systemInstruction`` for ``request.system_prompt`` (see below)
+        3. When cachedContent is active, injects system prompt as leading
+           user preamble (Gemini forbids systemInstruction alongside cachedContent)
+        """
         contents: list[dict[str, Any]] = []
 
         for msg in request.messages:
             if msg.role == "system":
-                continue
+                continue  # HIGH-12: Gemini doesn't support system role in contents
             role = "user" if msg.role == "user" else "model"
             # PHASE-5: Flatten structured content to text for Google API
             text = self._flatten_content_to_text(msg.content)

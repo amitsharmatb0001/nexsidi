@@ -72,8 +72,9 @@ async def set_tenant_context(session: AsyncSession, ctx: TenantContext) -> None:
 
 _ALLOWED_ROLES = frozenset({
     "org_admin", "admin", "developer", "viewer", "member", "billing",
-    "super_admin",  # H8-FIX: required for require_admin dependency
-    "api_key",      # API-key authenticated requests (see services/api_key_auth.py)
+    "super_admin",      # H8-FIX: required for require_admin dependency
+    "api_key",          # API-key authenticated requests (see services/api_key_auth.py)
+    "pipeline_service", # V5-FIX (HIGH-4): scoped role for pipeline persistence
 })
 
 

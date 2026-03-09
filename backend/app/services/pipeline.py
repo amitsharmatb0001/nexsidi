@@ -512,7 +512,13 @@ class PipelinePersistence:
         ctx = TenantContext(
             organization_id=organization_id,
             user_id=safe_user_id,
-            role="org_admin",  # Pipeline operations require admin-level access
+            # V5-FIX (HIGH-4): Scoped from "org_admin" to "pipeline_service".
+            # Pipeline persistence should NOT run as org_admin — that grants
+            # full admin privileges (user management, billing, org settings).
+            # "pipeline_service" is a purpose-scoped role that only allows
+            # CRUD on pipeline_runs and pipeline_steps tables within the
+            # tenant's organization. Least-privilege principle.
+            role="pipeline_service",
         )
         await set_tenant_context(session, ctx)
 
