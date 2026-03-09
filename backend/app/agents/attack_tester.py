@@ -594,42 +594,106 @@ class AttackTester:
         """Execute with timing, logging, and error handling."""
         return await run_agent(self, pipeline_run_id, context)
 
-    async def _run_basic_checks(self, deployment_url: str) -> list[dict]:  # ATTACK-FIX
-        """Run basic HTTP-based security probes against a deployed URL.  # ATTACK-FIX
+    async def _run_basic_checks(
+        self,
+        deployment_url: str,
+        endpoints: list[dict[str, Any]] | None = None,
+    ) -> list[dict]:
+        """Run basic HTTP-based security probes against a deployed URL.
+
+        MEDIUM-1 FIX: Probes actual endpoints from the Vikram contract instead
+        of hardcoded /api/test and /api/admin (which almost always return 404,
+        producing false negatives). Falls back to /api/health, /api/docs if no
+        contract endpoints are available.
 
         Probes: SQL injection, XSS reflection, auth bypass (no Authorization header).
-        Each probe uses a 5-second timeout and is wrapped in try/except.  # ATTACK-FIX
+        Each probe uses a 5-second timeout and is wrapped in try/except.
         """
-        findings: list[dict] = []  # ATTACK-FIX
-        url = deployment_url.rstrip("/")  # ATTACK-FIX
-        async with httpx.AsyncClient(timeout=5.0) as client:  # ATTACK-FIX
-            # SQL injection probe  # ATTACK-FIX
-            try:
-                sqli_payload = "1' OR '1'='1"  # ATTACK-FIX
-                resp = await client.get(
-                    f"{url}/api/test",
-                    params={"id": sqli_payload},
-                )
-                if resp.status_code == 200 and len(resp.text) > 100:  # ATTACK-FIX
-                    findings.append({"type": "sql_injection", "flagged": True, "status": resp.status_code, "details": "Probe returned 200 with substantial data"})  # ATTACK-FIX
-            except Exception as exc:  # ATTACK-FIX
-                findings.append({"type": "sql_injection", "flagged": False, "details": str(exc)[:80]})  # ATTACK-FIX
-            # XSS probe  # ATTACK-FIX
-            try:
-                xss_payload = "<script>alert(1)</script>"  # ATTACK-FIX
-                resp = await client.get(f"{url}/api/test", params={"q": xss_payload})  # ATTACK-FIX
-                if "<script>" in resp.text:  # ATTACK-FIX
-                    findings.append({"type": "xss", "flagged": True, "status": resp.status_code, "details": "Response body reflects <script> tag"})  # ATTACK-FIX
-            except Exception as exc:  # ATTACK-FIX
-                findings.append({"type": "xss", "flagged": False, "details": str(exc)[:80]})  # ATTACK-FIX
-            # Auth bypass probe - no Authorization header  # ATTACK-FIX
-            try:
-                resp = await client.get(f"{url}/api/admin")  # ATTACK-FIX
-                if resp.status_code == 200:  # ATTACK-FIX
-                    findings.append({"type": "auth_bypass", "flagged": True, "status": 200, "details": "Admin endpoint returned 200 without auth"})  # ATTACK-FIX
-            except Exception as exc:  # ATTACK-FIX
-                findings.append({"type": "auth_bypass", "flagged": False, "details": str(exc)[:80]})  # ATTACK-FIX
-        return findings  # ATTACK-FIX
+        findings: list[dict] = []
+        url = deployment_url.rstrip("/")
+
+        # Derive real probe targets from contract endpoints
+        query_paths: list[str] = []  # Endpoints that accept query params (GET)
+        auth_paths: list[str] = []   # Endpoints that require auth
+
+        for ep in (endpoints or []):
+            path = ep.get("path", "")
+            method = ep.get("method", "GET").upper()
+            if not path:
+                continue
+            if method == "GET":
+                query_paths.append(path)
+            if ep.get("auth_required", False) or "admin" in path.lower():
+                auth_paths.append(path)
+
+        # Fallback: common real endpoints if contract is empty
+        if not query_paths:
+            query_paths = ["/api/health", "/api/docs", "/api/v1/status"]
+        if not auth_paths:
+            auth_paths = ["/api/admin", "/api/users/me", "/api/dashboard"]
+
+        # Limit probes to avoid being slow
+        query_paths = query_paths[:5]
+        auth_paths = auth_paths[:3]
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # SQL injection probe — test against real query-accepting endpoints
+            sqli_payload = "1' OR '1'='1"
+            for path in query_paths:
+                try:
+                    resp = await client.get(
+                        f"{url}{path}",
+                        params={"id": sqli_payload, "q": sqli_payload},
+                    )
+                    # A 200 with substantial body AFTER injecting SQL is suspicious
+                    if resp.status_code == 200 and len(resp.text) > 100:
+                        findings.append({
+                            "type": "sql_injection", "flagged": True,
+                            "status": resp.status_code, "endpoint": path,
+                            "details": f"Probe returned 200 with {len(resp.text)} bytes on {path}",
+                        })
+                        break  # One finding is enough
+                except Exception as exc:
+                    findings.append({
+                        "type": "sql_injection", "flagged": False,
+                        "endpoint": path, "details": str(exc)[:80],
+                    })
+
+            # XSS probe — test against real endpoints
+            xss_payload = "<script>alert(1)</script>"
+            for path in query_paths:
+                try:
+                    resp = await client.get(f"{url}{path}", params={"q": xss_payload})
+                    if "<script>" in resp.text:
+                        findings.append({
+                            "type": "xss", "flagged": True,
+                            "status": resp.status_code, "endpoint": path,
+                            "details": f"Response body reflects <script> tag on {path}",
+                        })
+                        break
+                except Exception as exc:
+                    findings.append({
+                        "type": "xss", "flagged": False,
+                        "endpoint": path, "details": str(exc)[:80],
+                    })
+
+            # Auth bypass probe — hit auth-required endpoints WITHOUT auth header
+            for path in auth_paths:
+                try:
+                    resp = await client.get(f"{url}{path}")
+                    if resp.status_code == 200:
+                        findings.append({
+                            "type": "auth_bypass", "flagged": True,
+                            "status": 200, "endpoint": path,
+                            "details": f"Auth-required endpoint {path} returned 200 without auth",
+                        })
+                except Exception as exc:
+                    findings.append({
+                        "type": "auth_bypass", "flagged": False,
+                        "endpoint": path, "details": str(exc)[:80],
+                    })
+
+        return findings
 
     async def _execute_payloads(
         self,
@@ -927,7 +991,7 @@ class AttackTester:
             real_check_findings: list[dict] = []
             if deployment_url:
                 try:
-                    real_check_findings = await self._run_basic_checks(deployment_url)
+                    real_check_findings = await self._run_basic_checks(deployment_url, endpoints)
                 except Exception as _chk_exc:
                     logger.debug("basic_checks_failed", url=deployment_url[:100], error=str(_chk_exc)[:200])
 

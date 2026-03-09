@@ -924,11 +924,11 @@ class ShubhamToolHandler:
         return self._summary
 
     def observe(self, tool_name: str, result: str) -> "Observation":
-        """PHASE-G: System evaluates tool result autonomously.
+        """Deterministic verification gate on tool results.
 
-        This is the key agentic mechanism: the system (not the LLM) decides
-        whether a tool result is acceptable and can escalate to a more
-        expensive model if quality is dropping.
+        Checks if a tool result indicates failure (rejections, errors) and
+        triggers model escalation when repeated failures occur. This is a
+        heuristic gate — not an AI-driven observation loop.
 
         PHASE-I: Feeds pass/fail into AdaptiveComplexity for cross-goal
         model escalation (cheap → expensive only when needed).
